@@ -240,8 +240,22 @@ cargo test --workspace
 | **A1** | 回环框架骨架 | [T02](docs/reference/tickets/T02-loopback-skeleton.md) | `rc-loopback`，假后端跑通 Q1–Q6 指标 | 无 |
 | **A2** | CLI 入口 | [T07](docs/reference/tickets/T07-cli.md) | `rc-cli loopback/probe`，可执行验收 | A1 |
 
-**A 阶段的验收：** `cargo run -p rc-cli -- loopback --static-content` 能输出符合 schema 的报告，
-且 `static_content` 时 `fps.encoded == 0`。
+**A 阶段出口指标（全部可在假后端上验证）：**
+
+| 指标 | 门槛 |
+|---|---|
+| 报告 JSON 字段完整度 | 与 `impl/40-diagnostics.md` §4 schema 逐字段一致 |
+| `static_content` 时 `fps.encoded` | **== 0**（Q5） |
+| `convergence_ms` | **≤1000**（Q1/Q4） |
+| 任意队列深度 | **≤2**（Q3） |
+| `seed` 固定后重跑 | 结果完全一致 |
+| 报告中的一致性不变式 | 全部成立 |
+
+```bash
+cargo run -p rc-cli -- loopback --static-content --duration 30s --report /tmp/a.json
+jq '.fps.encoded' /tmp/a.json          # 必须为 0
+jq '.gate.passed' /tmp/a.json          # 必须 true
+```
 
 > **为什么先做这个**：没有它，后面所有延迟数字都无法验证，只能靠猜。
 > 它是「让 AI 能自己判断改得对不对」的关键设施。
@@ -254,8 +268,29 @@ cargo test --workspace
 | **B2** | 解码与呈现 | [T05](docs/reference/tickets/T05-decode-render.md)（**需改 macOS 版**） | `rc-decode` + `rc-render` | B1 |
 | **B3** | **M1 Gate 端到端串联** | [T08](docs/reference/tickets/T08-m1-pipeline.md)（**需改 macOS 版**） | `rc-pipeline`，跑出真实延迟 | B1, B2 |
 
-**B3 是硬门槛。** 必须达到：1080p60 回环延迟 P50 ≤18ms、`convergence_ms ≤1000`、
-`static` 时编码帧数为 0、队列深度 ≤2。**不通过不进入阶段 C。**
+**B1 出口指标（先于 B2，因为它是产品成立的前提）：**
+
+| 指标 | 门槛 | 不达标怎么办 |
+|---|---|---|
+| VideoToolbox 单帧编码 P50 | **≤5ms** | 5–8ms 可重分配预算；>8ms 必须调整目标 |
+| 采集 1080p60 帧率 | ≥58 | 检查 `SCStream` 配置 |
+| 零拷贝验证 | 无 CPU 往返 | GPU 采样器确认 |
+| `RealTime=true` 已生效 | 是 | 验证延迟分布 |
+
+**B3 是硬门槛**，必须全部通过才进入阶段 C：
+
+| 指标 | 门槛 |
+|---|---|
+| 端到端延迟 P50（1080p60，回环，不含网络） | **≤18ms** |
+| 端到端延迟 P99 | ≤35ms |
+| Displayed FPS | **≥58** |
+| 静态画面 CPU（单核） | **≤8%** |
+| 拖动窗口时 FPS | ≥55 |
+| `unfinished` 帧数 | == 0 |
+| `convergence_ms` | ≤1000 |
+| `static` 时编码帧数 | == 0 |
+| 队列深度 | ≤2 |
+| `--encoder-slowdown 2.0` 时延迟 | 不增长 |
 
 ### 阶段 C：网络与输入
 
@@ -263,6 +298,15 @@ cargo test --workspace
 |---|---|---|---|
 | C1 | QUIC 传输 | [T09](docs/reference/tickets/T09-net-quic.md) | 可与 B 并行（无平台依赖） |
 | C2 | 输入通道 | [T10](docs/reference/tickets/T10-input-channel.md) | C1 |
+
+**C 阶段出口指标：**
+
+| 指标 | 门槛 |
+|---|---|
+| 输入延迟（点击→对端响应） | **≤ RTT + 5ms** |
+| 100KB 帧分片重组 | 逐字节一致 |
+| 3% 丢包下重组成功率 | >95%（FEC 生效） |
+| `DEFAULT_MAX_CONCURRENT_FRAMES` | **== 2** |
 
 ### 阶段 D：Windows 支持（P1，延后）
 
@@ -272,6 +316,9 @@ cargo test --workspace
 | D2 | NVENC 编码 | [T04](docs/reference/tickets/T04-encode-nvenc.md) | D1 |
 | D3 | Windows 输入 | [T10](docs/reference/tickets/T10-input-channel.md)（Windows 部分） | C1 |
 
+**D 阶段出口指标：** Windows 平台达到与 B3 同等的延迟与帧率（NVENC 单帧 P50 ≤6ms）。
+弱网表现见 §9.1 的 3% 丢包场景。
+
 ### 阶段 E：Linux（P2，暂不做）
 
 [T11](docs/reference/tickets/T11-capture-linux.md) — 归档待命。
@@ -280,6 +327,16 @@ cargo test --workspace
 
 软件编码兜底 [T06](docs/reference/tickets/T06-encode-software.md)（CI 无 GPU 时需要）、
 服务端、打包、自动更新。详见 [`reference/design/06-milestones.md`](docs/reference/design/06-milestones.md) 的 M5/M6。
+
+**F 阶段（发布前）出口指标：**
+
+| 指标 | 门槛 |
+|---|---|
+| 画面冻结（>500ms） | 30 分钟会话内 **0 次** |
+| 8 小时长跑 | 无崩溃、内存增长 <5% |
+| 点击连接到出画面 | <800ms |
+| 盲测优于 RustDesk | **≥70% 选 RC**（5 人 × 3 场景） |
+| 4K 局域网 | FPS ≥45、P50 ≤60ms |
 
 ---
 
@@ -310,6 +367,51 @@ $ cargo test --workspace
 ### 实现说明（关键决策 1-3 句）
 ### 未完成 / 已知问题（若无则写「无」）
 ```
+
+### 9.1 产品级验收指标（SLO 矩阵）
+
+**这一节是产品能否成立的判据。** 上面的 D1–D9 是「代码质量」，这一节是「产品能力」。
+
+权威定义见 [`reference/design/01-overview.md`](docs/reference/design/01-overview.md) §4；此处为必须随身携带的摘要。
+
+| 场景 | 分辨率 | Displayed FPS | 延迟 P50 | 延迟 P99 | 画质策略 |
+|---|---|---|---|---|---|
+| **局域网千兆/有线** | 1080p60 | **60** | **≤25ms** | **≤40ms** | 高质量 |
+| 同城 Wi-Fi 6（RTT 20ms） | 1080p60 | ≥50 | ≤50ms | ≤80ms | 平衡 |
+| 跨地域（RTT 80ms, 1% 丢包） | 1080p60 | ≥40 | ≤110ms | ≤180ms | 平衡 |
+| 弱网（RTT 80ms, **3% 丢包**） | 1080p | ≥30 | ≤150ms | ≤250ms | 降质保帧 |
+| 4K 局域网 | 3840×2160 | ≥45 | ≤60ms | ≤100ms | 高质量 |
+| **静态画面** | — | — | — | — | **CPU ≤8% 单核** |
+
+#### 附加质量标准（不可协商）
+
+| 指标 | 门槛 | 为什么关键 |
+|---|---|---|
+| 画面冻结（>500ms 无更新） | 30 分钟会话内 **0 次** | 用户抱怨「卡」的主要来源 |
+| `Displayed FPS` 与 `Encoded FPS` 差值 | **<5%** | 差值大 = 帧在半路被丢，编码再快也没用 |
+| 会话中断（非网络原因） | <0.5% | 稳定性 |
+| 8 小时会话内存增长 | <5% | 长会话可用性 |
+| 点击连接到出画面 | <800ms | 启动速度感知 |
+| 主观盲测优于 RustDesk | **≥70% 选 RC** | 最终判据（5 人 × 3 场景） |
+
+#### 各阶段负责验证哪些指标
+
+**不要把全部指标堆到 M1——M1 只验证「本机能测的部分」。**
+
+| 阶段 | 验证指标 | 本阶段不测 |
+|---|---|---|
+| **A**（T02/T07） | 报告 schema 完整、`static` 时编码帧数 ==0、`convergence_ms ≤1000`、队列 ≤2 | 真实延迟（假后端） |
+| **B3**（T08） | 局域网 1080p60：**P50 ≤18ms（回环）、P99 ≤35ms、Displayed FPS ≥58、静态 CPU ≤8%、拖动 FPS ≥55** | 网络相关指标 |
+| **C**（T09/T10） | 输入延迟 ≤ RTT+5ms | 弱网（需损伤注入） |
+| **D**（M2/M3） | 3% 丢包：无冻结、FPS ≥30；连接迁移不断流 | 4K |
+| **E**（M4） | 4K：FPS ≥45、P50 ≤60ms；跨平台互连 | — |
+| **发布前** | 盲测 ≥70%、8h 长跑、冻结 0 次 | — |
+
+#### 当前唯一未验证的前提
+
+**VideoToolbox 在 `RealTime=true` 下的单帧编码耗时从未实测**（见 §13）。它决定 §3.1 的 5ms 编码预算是否成立，进而决定整张 SLO 表是否可行。
+
+**B1 完成后第一件事：测这个数字并更新 §12。超标则先停下重新评估，不要继续往下做。**
 
 ---
 

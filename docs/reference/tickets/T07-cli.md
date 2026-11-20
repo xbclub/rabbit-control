@@ -233,6 +233,42 @@ echo "exit=$?"
 - [ ] 无参数运行打印用法，exit 0
 - [ ] 非法参数 exit 2（clap 默认）或 1，且打印错误
 
+### 报告 schema 数值校验（可 jq 断言）
+
+```bash
+cargo run -p rc-cli -- loopback --static-content --duration 30s --report /tmp/t07.json
+
+# 1. 必含字段（缺一判失败）
+jq -e '.config and .latency_ms and .fps and .frames and .breakdown_ms and .gate' /tmp/t07.json
+
+# 2. Q5：静止画面零编码
+jq '.fps.encoded' /tmp/t07.json            # 必须 == 0
+
+# 3. Q3：队列深度
+jq '.max_queue_depth_seen' /tmp/t07.json   # 必须 <= 2
+
+# 4. Q1/Q4：收敛时间
+jq '.convergence_ms' /tmp/t07.json         # 必须 <= 1000
+
+# 5. 一致性不变式
+jq -e '.frames.captured == (.frames.encoded + .frames.dropped_repeat
+       + .frames.dropped_stale + .frames.dropped_budget
+       + .frames.dropped_superseded)' /tmp/t07.json
+```
+
+| 指标 | 门槛 | 来源 |
+|---|---|---|
+| 报告必含字段 | 6 个顶层键齐全 | `impl/40-diagnostics.md` §4 |
+| `fps.encoded`（`--static-content`） | **== 0** | Q5 |
+| `max_queue_depth_seen` | **≤2** | Q3 |
+| `convergence_ms` | **≤1000** | Q1 / Q4 |
+| 一致性不变式 | 成立 | §4.3 |
+| 退出码语义 | 0 / 1 / 2 正确 | 本文「退出码约定」 |
+
+### 性能
+
+- [ ] `probe` 在 <500ms 内返回
+
 ## 参考实现
 
 | 读这个 | 学什么 |
