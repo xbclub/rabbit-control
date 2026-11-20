@@ -1,0 +1,12 @@
+[package]
+name = "rc-trace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "帧时间线埋点与诊断报告。让『这帧为什么没到』可回答。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+
+[dev-dependencies]

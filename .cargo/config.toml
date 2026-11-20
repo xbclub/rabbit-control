@@ -1,0 +1,31 @@
+# M0 工程提速配置。修改前请读 docs/07-engineering-velocity.md
+#
+# 链接器加速：安装对应工具后取消注释。
+# macOS:   brew install llvm   （提供 lld）
+# Linux:   apt install mold / dnf install mold
+# Windows: rustup component add llvm-tools （或 VS 自带 lld-link）
+#
+# 注意：链接器只影响 `cargo build`，对 `cargo check`（内循环）无加速效果。
+# 内循环请一律用 `cargo check -p <crate>`。
+
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# [target.x86_64-pc-windows-msvc]
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[build]
+jobs = -1
+incremental = true
+
+# 减少开发期无用输出
+[term]
+verbose = false
+color = "auto"
+
+[net]
+# 网络不稳定时增加重试，避免 CI 因拉取 crates 失败而红
+retry = 3

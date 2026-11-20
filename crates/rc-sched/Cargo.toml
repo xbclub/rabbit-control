@@ -1,0 +1,13 @@
+[package]
+name = "rc-sched"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "deadline-aware 帧调度器。本项目对抗『帧率上限高但实际低』的核心组件。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+thiserror = "1"
+
+[dev-dependencies]

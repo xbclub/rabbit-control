@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rc-types",
+    "crates/rc-diff",
+    "crates/rc-sched",
+    "crates/rc-fec",
+    "crates/rc-proto",
+    "crates/rc-trace",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+# ─────────────────────────────────────────────────────────────
+# 编译速度配置：这是 M0 的核心交付物，不要随意改动。
+# 修改前请阅读 docs/07-engineering-velocity.md 与 docs/impl/60-acceptance.md
+# ─────────────────────────────────────────────────────────────
+
+[profile.dev]
+opt-level = 0
+debug = 1          # 只保留行号（backtrace 可用）。debug=2 会让 target/ 涨到 20-40GB
+incremental = true
+
+# 依赖只编译一次、以优化级别编译：运行快 10-50x，且之后不再重编
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 0
+debug = 1
+
+# 需要逐变量调试时才用：cargo build --profile dev-debug
+[profile.dev-debug]
+inherits = "dev"
+debug = 2
+
+[profile.bench]
+inherits = "release"
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"

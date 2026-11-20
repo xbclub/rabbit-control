@@ -1,0 +1,18 @@
+# 编译产物
+/target
+**/*.rs.bk
+
+# 测试与诊断输出
+junit.xml
+*.profraw
+*.profdata
+/tmp/*.json
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 本地环境
+.env

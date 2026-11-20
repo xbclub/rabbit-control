@@ -1,0 +1,12 @@
+[package]
+name = "rc-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "媒体包头的手写二进制编解码。逐字节规格见 docs/impl/10-wire-format.md"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+
+[dev-dependencies]

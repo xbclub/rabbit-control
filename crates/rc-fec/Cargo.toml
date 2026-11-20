@@ -1,0 +1,12 @@
+[package]
+name = "rc-fec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "XOR 块 FEC + 自适应冗余率。纯算法，无网络依赖，100% 可单测。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+
+[dev-dependencies]

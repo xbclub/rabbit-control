@@ -1,0 +1,24 @@
+[profile.default]
+# 并发按核数
+test-threads = "num-cpus"
+# 单个测试超过 60s 视为卡死
+slow-timeout = { period = "60s", terminate-after = 2 }
+# 失败立即停止（内循环时更快看到问题）
+fail-fast = false
+# 输出格式：CI 用 libtest-json 更易解析
+status-level = "pass"
+final-status-level = "fail"
+
+[profile.default.junit]
+path = "junit.xml"
+
+# 慢测试分组（未来回环测试会用到）
+[[profile.default.overrides]]
+filter = "test(slow_)"
+threads-required = 2
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+# CI 上禁用 fail-fast 之外的差异：并发数由机器决定
+[profile.ci]
+retries = 0
+fail-fast = true

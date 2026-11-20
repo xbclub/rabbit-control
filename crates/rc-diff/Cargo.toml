@@ -1,0 +1,12 @@
+[package]
+name = "rc-diff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "脏区检测与重复帧判定。纯算法，无平台依赖，100% 可单测。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+
+[dev-dependencies]
