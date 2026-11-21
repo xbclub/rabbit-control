@@ -1,0 +1,10 @@
+[package]
+name = "rc-capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "采集抽象层：CaptureBackend trait、CapturedFrame 与假后端（平台无关）。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }

@@ -1,0 +1,11 @@
+[package]
+name = "rc-encode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "编码抽象层：Encoder trait、EncodedFrame/EncoderCaps 与假编码器（平台无关）。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+rc-capture = { path = "../rc-capture" }

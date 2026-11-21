@@ -1,0 +1,21 @@
+[package]
+name = "rc-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl 诊断 CLI：回环测试、后端探测与版本信息。"
+build = "build.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rc-types = { path = "../rc-types" }
+rc-loopback = { path = "../rc-loopback" }
+rc-pipeline = { path = "../rc-pipeline" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rc-capture-macos = { path = "../rc-capture-macos" }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"

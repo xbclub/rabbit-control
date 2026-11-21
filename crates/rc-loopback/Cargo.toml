@@ -1,0 +1,19 @@
+[package]
+name = "rc-loopback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "回环测试框架：单进程跑通 采集→编码→解码→呈现，并注入网络损伤。M1 Gate 的测量基础。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+rc-diff = { path = "../rc-diff" }
+rc-sched = { path = "../rc-sched" }
+rc-trace = { path = "../rc-trace" }
+rc-capture = { path = "../rc-capture" }
+rc-encode = { path = "../rc-encode" }
+rc-pipeline = { path = "../rc-pipeline" }
+rand = "0.8"
+
+[dev-dependencies]

@@ -1,0 +1,11 @@
+[package]
+name = "rc-decode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "解码抽象层：Decoder trait 与假实现（平台无关）。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+rc-capture = { path = "../rc-capture" }

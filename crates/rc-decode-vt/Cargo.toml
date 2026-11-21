@@ -1,0 +1,28 @@
+[package]
+name = "rc-decode-vt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl 的 VideoToolbox 硬件 H.264 解码后端（T05 / 契约 D1–D5 解码侧）。"
+
+# 与 rc-encode-vt 相同的跨平台策略：rc-types / rc-decode / rc-encode / rc-capture
+# 是纯 Rust（Annex-B → AVCC 转换、SPS 解析、邮箱等纯逻辑的单测在任何目标上
+# 都能跑）；只有 objc2 系绑定 gate 在 macOS 上，workspace 在任何平台
+# `cargo build` 都不会因链接框架失败。
+[dependencies]
+rc-capture = { path = "../rc-capture" }
+rc-decode = { path = "../rc-decode" }
+rc-encode = { path = "../rc-encode" }
+rc-types = { path = "../rc-types" }
+
+# 版本线与 rc-encode-vt 严格一致（objc2 生态 0.6 / 绑定 0.3），
+# 两条平台 crate 共享同一批编译产物。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", features = ["CFDictionary", "CFNumber", "CFString"] }
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+
+# 真机测试用 rc-encode-vt 先编码再解码（编码侧对照实现）。
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+rc-encode-vt = { path = "../rc-encode-vt" }

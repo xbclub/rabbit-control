@@ -1,0 +1,12 @@
+[package]
+name = "rc-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "呈现抽象层：Renderer trait（平台无关）。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+rc-capture = { path = "../rc-capture" }
+rc-decode = { path = "../rc-decode" }

@@ -1,0 +1,117 @@
+[package]
+name = "rc-render-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl macOS 呈现后端：CAMetalLayer + CVMetalTextureCache 零拷贝 Metal 渲染（T05 D1/D2/D6/D7/D8）。"
+
+# rc-render（Renderer trait）/ rc-decode（DecodedFrame）/ rc-capture（FrameTexture）/
+# rc-types 是纯 Rust，跨平台可编译；Metal 实现本体 gate 在 macOS 上，
+# 非 macOS 目标编译为空壳。
+[dependencies]
+rc-capture = { path = "../rc-capture" }
+rc-decode = { path = "../rc-decode" }
+rc-render = { path = "../rc-render" }
+rc-types = { path = "../rc-types" }
+
+# 版本线与 rc-capture-macos / rc-encode-vt 严格一致：objc2 0.6 生态、
+# 平台绑定统一 0.3（objc2-metal 0.3.2 已在 workspace Cargo.lock 中）。
+[target.'cfg(target_os = "macos")'.dependencies]
+# present 完成回调（释放 CVMetalTexture 包装与 retain 的 CVPixelBuffer）。
+block2 = "0.6"
+# CAMetalLayer（离屏 present、displaySyncEnabled 关 vsync）。
+objc2 = "0.6"
+# CGSize（drawableSize，物理像素）与 CF 类型；CFCGTypes 提供 CGSize，
+# CFNumber 提供 CFBoolean（测试缓冲的 Metal 兼容属性字典用）。
+objc2-core-foundation = { version = "0.3", features = [
+    "CFBase",
+    "CFDate",
+    "CFDictionary",
+    "CFNumber",
+    "CFCGTypes",
+] }
+# CVMetalTextureCache（D1 零拷贝：CVPixelBuffer → MTLTexture，禁止 CPU 回读）。
+# objc2 / objc2-metal 两个 feature 打开 create / create_texture_from_image /
+# CVMetalTextureGetTexture 包装（绑定层按这些 feature 门控）。
+objc2-core-video = { version = "0.3", default-features = false, features = [
+    "std",
+    "CVBase",
+    "CVReturn",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVMetalTexture",
+    "CVMetalTextureCache",
+    "objc2",
+    "objc2-metal",
+] }
+# NSString（shader 源码/函数名）与 NSError（管线创建失败信息）。
+objc2-foundation = { version = "0.3", features = ["NSString", "NSError"] }
+# Metal 设备/命令队列/渲染管线（D1 采样 CVMetalTexture、D8 commit 后打点）。
+objc2-metal = { version = "0.3", default-features = false, features = [
+    "std",
+    "MTLTypes",
+    "MTLPixelFormat",
+    "MTLDevice",
+    "MTLDrawable",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLRenderPass",
+    "MTLRenderPipeline",
+    "MTLRenderCommandEncoder",
+    "MTLLibrary",
+    "MTLTexture",
+    "MTLResource",
+    "block2",
+] }
+# CAMetalLayer（含 CAMetalDrawable 协议；displaySyncEnabled = false 等价 Present(0)）。
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+    "std",
+    "CABase",
+    "CALayer",
+    "CAMetalLayer",
+    "objc2-core-foundation",
+    "objc2-metal",
+] }
+# NSWindow / NSView（`window-bench` feature：真实窗口基准，见 ffi::window_bench
+# 与 tests/window_present.rs——NSWindow 是 MainThreadOnly，测试目标用
+# harness = false 让 fn main 落在主线程上）。
+objc2-app-kit = { version = "0.3", default-features = false, optional = true, features = [
+    "std",
+    "NSApplication",
+    "NSWindow",
+    "NSView",
+    "NSResponder",
+    "NSGraphics",
+    # NSScreen::mainScreen（幕布窗口铺满主屏，tests/curtain.rs）。
+    "NSScreen",
+    # NSView::setLayer（挂 CAMetalLayer 到 contentView）需要。
+    "objc2-quartz-core",
+] }
+
+[features]
+# 真实窗口基准（完整 present 路径计时 + 60fps×60s soak）：非默认开启，
+# 因为它需要窗口服务器（GUI 会话）。运行方式见 tests/window_present.rs。
+window-bench = ["dep:objc2-app-kit"]
+
+# 60fps × 60s soak 测试的 unfinished == 0 验收（TraceCollector）。
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+rc-trace = { path = "../rc-trace" }
+
+# 真实窗口基准（NSWindow 是 MainThreadOnly：harness = false 的 fn main
+# 才在主线程上，libtest 的测试体永远不在）。required-features 让默认
+# 构建完全跳过本目标；显式 --features window-bench 才编译。
+# 运行：cargo test -p rc-render-macos --features window-bench --test window_present --release -- --run
+[[test]]
+name = "window_present"
+harness = false
+required-features = ["window-bench"]
+
+# 隐私幕布（M1 Gate 真机终验的测试内容源）：全屏低熵动画 / 纯黑静止，
+# 供 `rc-cli loopback --backend real` 采集。运行方式见 tests/curtain.rs 文档。
+[[test]]
+name = "curtain"
+harness = false
+required-features = ["window-bench"]

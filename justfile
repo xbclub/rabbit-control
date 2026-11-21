@@ -68,3 +68,21 @@ crates:
     @find crates -maxdepth 2 -name Cargo.toml | sed 's|/Cargo.toml||' | while read d; do \
         printf "%-32s %s\n" "$(basename $d)" "$(wc -l < $d/src/lib.rs 2>/dev/null || echo 0) 行"; \
     done
+
+# ── macOS 固定签名真机测试（RabbitControl Dev 证书）────────────
+
+# 检查 macOS 开发证书与 App 签名需求
+dev-cert:
+    ./scripts/macos-dev-run.sh check-cert
+
+# 用已授权的固定签名 App 探测 macOS 权限与硬件后端
+dev-probe:
+    ./scripts/macos-dev-run.sh cli -- probe --json
+
+# 用已授权的固定签名 App 运行 rc-cli（示例：just dev-cli --release -- loopback --backend real --duration 15s）
+dev-cli *args:
+    ./scripts/macos-dev-run.sh cli {{args}}
+
+# 用已授权的固定签名 App 运行指定 crate 的真机测试（示例：just dev-test rc-capture-macos -- --ignored --nocapture）
+dev-test crate *args:
+    ./scripts/macos-dev-run.sh test {{crate}} {{args}}

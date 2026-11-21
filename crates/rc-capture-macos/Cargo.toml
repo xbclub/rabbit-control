@@ -1,0 +1,31 @@
+[package]
+name = "rc-capture-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl macOS 采集后端：ScreenCaptureKit（T12）。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+
+# 平台依赖全部 gate 在 macOS 上：crate 主体在非 macOS 目标上编译为空壳，
+# workspace 在任何平台 `cargo build` 都不会因链接 macOS 框架而失败。
+[target.'cfg(target_os = "macos")'.dependencies]
+rc-capture = { path = "../rc-capture" }
+
+# objc2 生态统一使用 0.3.x 绑定线（与 objc2 0.6 / block2 0.6 / dispatch2 0.3 配套）。
+# 任务卡原始写的 objc2-screen-capture-kit = "0.1" 已不存在（0.0.0 占位之后直接是
+# 0.2/0.3），按卡上「版本对不上就选当前可用的最新兼容版」取 0.3.2。
+# 额外补充卡上清单没有列出的直接依赖：block2（completion block）、dispatch2（帧回调
+# 队列）、objc2-core-foundation（CGRect/CFNumber/CFString）—— 它们是
+# objc2-screen-capture-kit 0.3 API 签名的一部分，必须作为直接依赖出现在这里。
+block2 = "0.6"
+core-graphics = "0.24"
+dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", features = ["CFArray", "CFCGTypes", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"

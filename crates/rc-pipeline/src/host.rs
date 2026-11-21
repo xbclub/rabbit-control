@@ -1,0 +1,627 @@
+//! 被控端管线：采集线程 → 调度 → 编码线程 → 分片。
+//!
+//! 按 T08 数据流图逐段接线，红线对应：
+//! - P1：`next_frame` 返回 `None` 时 `tick` 返回 `Ok(None)`，不 sleep 不空转；
+//! - P2：`on_encoded` 在**所有**路径调用（含编码失败）——完成通道里
+//!   `Err` 与 `Ok` 都先释放调度器在途槽位再记结局；
+//! - P3：每次 `on_captured` 之后检查 `needs_keyframe` 与 `take_keyframe_request`；
+//! - P4：调度丢弃的帧当场写结局；
+//! - P5：`capture_ts` 用帧自带的 `timestamp`（内容变化时刻），`now_us` 与之同基准。
+//!
+//! # 线程模型（契约 C8：采集独立线程）
+//! - **采集线程**持有 `CaptureBackend`，帧经 `sync_channel(1)` 交给调用方
+//!   线程——通道容量就是 Q3 的队列上限之一（交接 1 + 调度在途 1 ≤ 2），
+//!   满了采集线程阻塞（背压，不是丢弃也不是无界积压）。
+//! - **编码线程**持有 `Encoder`，异步提交、异步完成。这是 `Budget` 语义
+//!   成立的前提：编码进行中（槽位占用）时新帧到达，调度器才会做出
+//!   「挤出最旧」的决策。同步编码下在途恒 ≤1，Budget 永不触发。
+//! - `tick` 在调用方线程汇聚：先收编码完成（打点/分片/Sent），再收采集
+//!   帧（diff/调度/提交）。
+//!
+//! # 时间模型
+//! 管线是计时员：`EncodeDone` / `Sent` 在操作返回后读会话时钟
+//! （[`HostPipeline::set_clock`]），不信任后端内部时钟。未注入时钟时
+//! 退化为 `now_us`（分段退化为 0，诚实可解释）。
+
+use crate::{select_all, DiffMode, PipelineConfig};
+use rc_capture::{CaptureBackend, CapturedFrame, FrameTexture};
+use rc_diff::{DiffResult, TileDiff};
+use rc_proto::{split_frame, MediaHeader, MAX_PAYLOAD};
+use rc_sched::{Decision, DropReason, Scheduler, SchedulerConfig, SchedulerStats};
+use rc_trace::{Mark, Outcome, TraceCollector};
+use rc_types::{Error, FrameKind, Result, Timestamp};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+
+/// 采集线程 → 调用方线程的消息。
+enum CapMsg {
+    Frame(Box<CapturedFrame>),
+    Invalidated(rc_capture::InvalidationReason),
+}
+
+/// 调用方线程 → 采集线程的命令。
+enum CapCmd {
+    Rebuild,
+}
+
+/// 提交给编码线程的一个编码请求。
+struct EncodeReq {
+    seq: rc_types::FrameSeq,
+    frame: CapturedFrame,
+    force_idr: bool,
+    deadline: Timestamp,
+}
+
+/// 编码线程 → 调用方线程的完成事件。
+enum EncodeDone {
+    Ok {
+        seq: rc_types::FrameSeq,
+        capture_ts: Timestamp,
+        frame: rc_encode::EncodedFrame,
+    },
+    Err {
+        seq: rc_types::FrameSeq,
+        err: Error,
+    },
+}
+
+/// 被控端管线。
+pub struct HostPipeline {
+    cfg: PipelineConfig,
+    trace: TraceCollector,
+    diff: TileDiff,
+    sched: Scheduler,
+    /// 采集线程的收件/发件端与停机标志。
+    cap_rx: Receiver<CapMsg>,
+    cap_cmd: SyncSender<CapCmd>,
+    cap_stop: Arc<AtomicBool>,
+    /// 采集交接通道空位 / 停机唤醒信号（替代背压 `sleep(1ms)` 轮询）。
+    cap_space: Arc<(Mutex<u64>, Condvar)>,
+    cap_handle: Option<std::thread::JoinHandle<()>>,
+    /// 编码线程的收件/发件端与停机标志。
+    enc_req: SyncSender<Mutex<Option<EncodeReq>>>,
+    enc_done: Receiver<EncodeDone>,
+    enc_stop: Arc<AtomicBool>,
+    enc_handle: Option<std::thread::JoinHandle<()>>,
+    /// 会话时钟（见模块文档）。
+    clock: Option<Arc<dyn Fn() -> u32 + Send + Sync>>,
+    /// 下一帧应编成 IDR（丢帧恢复 / 控制端请求）。粘住直到真正编出 IDR。
+    pending_idr: bool,
+    /// 是否还没编出过任何帧（首帧强制 IDR）。
+    no_idr_yet: bool,
+    /// FEC 组号（每帧 +1，回绕）。
+    fec_group: u16,
+    /// 假采集的墙钟节流（见 `pace_capture`）。
+    pace_capture: bool,
+    /// 首次采集的墙钟时刻。会话时钟的零点必须锚在这里：平台时间戳
+    /// （FakeBackend 网格 / SCK 的 PTS−首PTS）都以首次采集为零，
+    /// 锚在别处（如首个数据报产出）会把管线延迟整体吃进零点偏移。
+    first_capture: Option<std::time::Instant>,
+    /// 事件唤醒信号（采集帧到达或编码完成时递增并 notify），消除调用方轮询 sleep 延迟。
+    wake: Arc<(Mutex<u64>, Condvar)>,
+    /// 最近一次 `tick()` 开始前观测到的事件代次（防丢失唤醒）。
+    last_wake_gen: u64,
+}
+
+fn signal_wake(wake: &(Mutex<u64>, Condvar)) {
+    let (lock, cv) = wake;
+    if let Ok(mut g) = lock.lock() {
+        *g = g.wrapping_add(1);
+        cv.notify_one();
+    }
+}
+
+impl HostPipeline {
+    /// 用工厂后端创建（auto 模式：真后端失败降级假后端）。
+    pub fn new(cfg: PipelineConfig) -> Result<Self> {
+        cfg.validate()?;
+        let (capture, encoder, _decoder, _renderer, labels) = select_all(&cfg)?;
+        eprintln!(
+            "rc-pipeline: host backends capture={} encoder={}",
+            labels.capture, labels.encoder
+        );
+        Self::with_backends(cfg, capture, encoder)
+    }
+
+    /// 注入指定后端（测试 / 会话层显式控制）。
+    ///
+    /// `pace_capture == true` 时采集线程按 `1/fps` 节流假采集（假后端
+    /// 瞬时出帧，不节流会把逻辑时间戳跑到墙钟前面）；真实采集的
+    /// `next_frame` 自带阻塞语义，不额外节流。
+    pub fn with_backends(
+        cfg: PipelineConfig,
+        capture: Box<dyn CaptureBackend>,
+        encoder: Box<dyn rc_encode::Encoder>,
+    ) -> Result<Self> {
+        Self::with_backends_paced(cfg, capture, encoder, false)
+    }
+
+    /// 同 [`with_backends`]，但允许对假采集启用墙钟节流。
+    pub fn with_backends_paced(
+        cfg: PipelineConfig,
+        mut capture: Box<dyn CaptureBackend>,
+        encoder: Box<dyn rc_encode::Encoder>,
+        pace_capture: bool,
+    ) -> Result<Self> {
+        cfg.validate()?;
+        let sched_cfg = SchedulerConfig {
+            // 铁律 1（Q3）：编码在途上限。真机数据（1080p60，SCK 源 ~70fps 供给）：
+            // - =1：P50 13.87ms 更低，但 60s 长测里预算丢帧 842 次，displayed
+            //   掉到 56.7fps < 58（帧率下限是硬门槛，短测 6s 看不出）；
+            // - =2：P50 14.27ms / P99 28.28ms / 72.3fps / 0 预算丢帧 ——
+            //   双达标且帧率有余量。VT 是异步会话，在途 2 能重叠提交/完成
+            //   开销（假串行编码器的「在途 2 = 白等一个周期」不适用于它）。
+            // 总深度 = 交接 1 + 在途 2；各队列均 ≤2（Q3 按队列计）。
+            max_in_flight: 2,
+            target_latency_us: cfg.target_latency_us,
+            ..SchedulerConfig::default()
+        };
+        let sched = Scheduler::new(sched_cfg)
+            .map_err(|e| Error::InvalidConfig(format!("scheduler config: {e}")))?;
+
+        // ── 采集线程 ──────────────────────────────────────────
+        // 通道容量 1 = Q3 的交接队列；满则采集阻塞（背压）。
+        // 交接 1 + 调度在途 2：各队列均 ≤2（Q3 按队列计，见 sched_cfg 注释）。
+        let wake = Arc::new((Mutex::new(0u64), Condvar::new()));
+        let cap_wake = Arc::clone(&wake);
+        let enc_wake = Arc::clone(&wake);
+        let cap_space = Arc::new((Mutex::new(0u64), Condvar::new()));
+        let cap_space_tx = Arc::clone(&cap_space);
+        let (cap_tx, cap_rx) = sync_channel::<CapMsg>(1);
+        let (cmd_tx, cmd_rx) = sync_channel::<CapCmd>(1);
+        let cap_stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&cap_stop);
+        let fps = cfg.fps;
+        let pace = pace_capture;
+        let cap_handle = std::thread::Builder::new()
+            .name("rc-host-capture".into())
+            .spawn(move || {
+                let timeout = Duration::from_millis(16); // C10
+                let interval = Duration::from_micros(u64::from(1_000_000u32 / fps.max(1)));
+                let mut next_emit = std::time::Instant::now();
+                while !stop_flag.load(Ordering::Acquire) {
+                    // 处理重建命令（非阻塞；无命令继续采集）。
+                    if let Ok(CapCmd::Rebuild) = cmd_rx.try_recv() {
+                        if let Err(e) = capture.rebuild() {
+                            let _ = cap_tx
+                                .send(CapMsg::Invalidated(rc_capture::InvalidationReason::Unknown));
+                            signal_wake(&cap_wake);
+                            let _ = e;
+                        }
+                        continue;
+                    }
+                    match capture.next_frame(timeout) {
+                        Ok(Some(frame)) => {
+                            // 背压发送：快路径无锁 try_send；满时通过 Condvar 等待调用方
+                            // 消费通知（微秒级唤醒，5ms 兜底查停机），消除 sleep(1ms) 在
+                            // macOS 定时器合并下实睡 2-4ms 抬高 diff 延迟。
+                            match cap_tx.try_send(CapMsg::Frame(Box::new(frame))) {
+                                Ok(()) => signal_wake(&cap_wake),
+                                Err(TrySendError::Full(mut back)) => loop {
+                                    if stop_flag.load(Ordering::Acquire) {
+                                        return; // 停机：丢弃在制帧
+                                    }
+                                    // 先读代次再复试 try_send，杜绝 try_send→wait 间丢唤醒。
+                                    let seen_gen = cap_space_tx.0.lock().map(|g| *g).unwrap_or(0);
+                                    match cap_tx.try_send(back) {
+                                        Ok(()) => {
+                                            signal_wake(&cap_wake);
+                                            break;
+                                        }
+                                        Err(TrySendError::Full(b)) => back = b,
+                                        Err(TrySendError::Disconnected(_)) => return,
+                                    }
+                                    let (lock, cv) = &*cap_space_tx;
+                                    if let Ok(guard) = lock.lock() {
+                                        if *guard == seen_gen && !stop_flag.load(Ordering::Acquire)
+                                        {
+                                            let _ =
+                                                cv.wait_timeout(guard, Duration::from_millis(5));
+                                        }
+                                    }
+                                },
+                                Err(TrySendError::Disconnected(_)) => return,
+                            }
+                            if pace {
+                                next_emit += interval;
+                                let n = std::time::Instant::now();
+                                if next_emit > n {
+                                    std::thread::sleep(next_emit - n);
+                                } else {
+                                    next_emit = n;
+                                }
+                            }
+                        }
+                        Ok(None) => { /* C1/P1：无变化，继续循环 */ }
+                        Err(e) => {
+                            let recoverable = !e.is_fatal();
+                            let reason = if recoverable {
+                                rc_capture::InvalidationReason::AccessLost
+                            } else {
+                                rc_capture::InvalidationReason::Unknown
+                            };
+                            let _ = cap_tx.send(CapMsg::Invalidated(reason));
+                            signal_wake(&cap_wake);
+                            if !recoverable {
+                                return;
+                            }
+                            // 可恢复：等待调用方发 Rebuild。
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+            })
+            .map_err(|e| Error::InvalidConfig(format!("spawn capture thread: {e}")))?;
+
+        // ── 编码线程 ──────────────────────────────────────────
+        // 请求通道容量 = max_in_flight(2) + 孤儿余量(2)：调度器驱逐在途帧
+        // 时只释放自己的槽位，受害帧的编码请求仍占物理槽位直到完成。
+        // 余量不足会让后续合法提交 try_send 假满（受害帧完成时由
+        // `on_encoded == false` 识别并丢弃产出）。
+        let (req_tx, req_rx) = sync_channel::<Mutex<Option<EncodeReq>>>(4);
+        let (done_tx, done_rx) = sync_channel::<EncodeDone>(8);
+        let enc_stop = Arc::new(AtomicBool::new(false));
+        let enc_flag = Arc::clone(&enc_stop);
+        let mut encoder = encoder;
+        let enc_handle = std::thread::Builder::new()
+            .name("rc-host-encode".into())
+            .spawn(move || {
+                while !enc_flag.load(Ordering::Relaxed) {
+                    match req_rx.recv_timeout(Duration::from_millis(5)) {
+                        Ok(slot) => {
+                            let req = slot.lock().expect("req lock").take();
+                            if let Some(r) = req {
+                                let out = encoder.encode(&r.frame, r.force_idr, r.deadline);
+                                let msg = match out {
+                                    Ok(f) => EncodeDone::Ok {
+                                        seq: r.seq,
+                                        capture_ts: r.frame.timestamp,
+                                        frame: f,
+                                    },
+                                    Err(e) => EncodeDone::Err { seq: r.seq, err: e },
+                                };
+                                if done_tx.send(msg).is_err() {
+                                    return;
+                                }
+                                signal_wake(&enc_wake);
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                // 停机前排空已提交的请求（P2：每帧都要有结局）。
+                while let Ok(slot) = req_rx.try_recv() {
+                    if let Some(r) = slot.lock().expect("req lock").take() {
+                        let out = encoder.encode(&r.frame, r.force_idr, r.deadline);
+                        let msg = match out {
+                            Ok(f) => EncodeDone::Ok {
+                                seq: r.seq,
+                                capture_ts: r.frame.timestamp,
+                                frame: f,
+                            },
+                            Err(e) => EncodeDone::Err { seq: r.seq, err: e },
+                        };
+                        if done_tx.send(msg).is_err() {
+                            break;
+                        }
+                        signal_wake(&enc_wake);
+                    }
+                }
+            })
+            .map_err(|e| Error::InvalidConfig(format!("spawn encode thread: {e}")))?;
+
+        Ok(Self {
+            diff: TileDiff::with_defaults(),
+            trace: TraceCollector::new(cfg.trace_capacity),
+            sched,
+            cfg,
+            cap_rx,
+            cap_cmd: cmd_tx,
+            cap_stop,
+            cap_space,
+            cap_handle: Some(cap_handle),
+            enc_req: req_tx,
+            enc_done: done_rx,
+            enc_stop,
+            enc_handle: Some(enc_handle),
+            clock: None,
+            pending_idr: false,
+            no_idr_yet: true,
+            fec_group: 0,
+            pace_capture: pace,
+            first_capture: None,
+            wake,
+            last_wake_gen: 0,
+        })
+    }
+
+    /// 注入会话时钟（微秒，与帧 `timestamp` 同基准）。见模块文档。
+    pub fn set_clock(&mut self, clock: Arc<dyn Fn() -> u32 + Send + Sync>) {
+        self.clock = Some(clock);
+    }
+
+    /// 读会话时钟；未注入时退化为 `now_us`。
+    fn now(&self, fallback_us: u32) -> Timestamp {
+        Timestamp(self.clock.as_ref().map_or(fallback_us, |c| c()))
+    }
+
+    /// 阻塞等待采集新帧或编码完成事件（最长 `timeout`）。
+    ///
+    /// 采用代次计数器避免丢失唤醒：若在上一轮 [`Self::tick`] 开头之后已有新事件
+    /// 到达，本调用立即返回而不睡眠；无事件时由 Condvar 零自旋挂起并在事件抵达后
+    /// 微秒级唤醒，替代 `sleep(1ms)` 轮询以消除 macOS 定时器合并带来的数毫秒延迟。
+    pub fn wait_event(&self, timeout: Duration) {
+        let (lock, cv) = &*self.wake;
+        if let Ok(guard) = lock.lock() {
+            if *guard == self.last_wake_gen {
+                let _ = cv.wait_timeout(guard, timeout);
+            }
+        }
+    }
+
+    /// 跑一次迭代：收编码完成 → 收采集帧 → 调度提交。
+    /// 返回 `Ok(Some(datagrams))` 表示有帧完成编码、应发送；
+    /// `Ok(None)` 表示本次无产出（无帧 / 全部被丢弃）。
+    pub fn tick(&mut self, now_us: u32) -> Result<Option<Vec<Vec<u8>>>> {
+        if let Ok(g) = self.wake.0.lock() {
+            self.last_wake_gen = *g;
+        }
+        let mut out = Vec::new();
+
+        // ── 1. 编码完成（先收完成：槽位尽早释放给新帧）─────────
+        while let Ok(done) = self.enc_done.try_recv() {
+            match done {
+                EncodeDone::Ok {
+                    seq,
+                    capture_ts,
+                    frame,
+                } => {
+                    // 调度器裁决先行：false = 该帧在提交后被驱逐（Budget），
+                    // 产出不得进入发送路径——否则「调度器已丢弃的帧被偷偷
+                    // 上屏」，Q3 的丢帧语义就名存实亡。
+                    if !self.sched.on_encoded(seq, now_us) {
+                        if let Some(f) = self.trace.get_mut(seq) {
+                            f.finish(Outcome::DroppedBudget);
+                        }
+                        continue;
+                    }
+                    let encode_done_ts = self.now(now_us);
+                    if frame.is_keyframe {
+                        self.no_idr_yet = false;
+                        self.pending_idr = false;
+                    }
+                    let datagrams = split_frame(
+                        seq,
+                        frame.kind,
+                        capture_ts,
+                        encode_done_ts,
+                        self.fec_group,
+                        &frame.data,
+                        MAX_PAYLOAD,
+                    );
+                    self.fec_group = self.fec_group.wrapping_add(1);
+                    let sent_at = self.now(now_us);
+                    if let Some(f) = self.trace.get_mut(seq) {
+                        f.mark(Mark::EncodeDone, encode_done_ts);
+                        f.mark(Mark::Sent, sent_at);
+                    }
+                    out.extend(datagrams);
+                }
+                EncodeDone::Err { seq, err } => {
+                    // P2：Err 路径同样先释放槽位（P7：不终止管线）。
+                    self.sched.on_encoded(seq, now_us);
+                    if let Some(f) = self.trace.get_mut(seq) {
+                        f.finish(Outcome::DecodeError);
+                    }
+                    if err.is_fatal() {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        // ── 2. 采集帧（消费当前交接槽并立刻唤醒背压中的采集线程）────────
+        // 交接通道容量为 1：每轮处理 1 帧后返回 `Some`，调用方立刻进入下一轮
+        // 用最新 `now_us` 先收 `enc_done` 再收下一帧，既保持微秒级交接又防止无节流
+        // 假采集在 `Condvar` 瞬时唤醒下把单次 `tick` 锁死在循环内。
+        let mut saw_frame = false;
+        while let Ok(msg) = self.cap_rx.try_recv() {
+            // 通道已腾出空位，立即唤醒背压等待中的采集线程。
+            signal_wake(&self.cap_space);
+            match msg {
+                CapMsg::Invalidated(reason) => {
+                    if reason.is_recoverable() {
+                        let _ = self.cap_cmd.try_send(CapCmd::Rebuild);
+                    } else {
+                        return Err(Error::Capture {
+                            recoverable: false,
+                            msg: format!("fatal invalidation: {reason:?}"),
+                        });
+                    }
+                }
+                CapMsg::Frame(frame) => {
+                    saw_frame = true;
+                    if let Some(dgs) = self.process_frame(*frame, now_us)? {
+                        out.extend(dgs);
+                    }
+                    break;
+                }
+            }
+        }
+
+        Ok(if out.is_empty() && !saw_frame {
+            None
+        } else {
+            Some(out)
+        })
+    }
+
+    /// 控制端请求关键帧（经会话层转发）。
+    pub fn request_idr(&mut self) {
+        self.pending_idr = true;
+    }
+
+    /// 帧时间线（本端半场：Captured→Sent + 调度丢弃结局）。
+    pub fn trace(&self) -> &TraceCollector {
+        &self.trace
+    }
+
+    /// 调度器统计。
+    pub fn sched_stats(&self) -> SchedulerStats {
+        self.sched.stats()
+    }
+
+    /// 当前在途帧数（Q3/L9 观测用：会话层逐 tick 采样取最大值）。
+    pub fn in_flight_len(&self) -> usize {
+        self.sched.in_flight_len()
+    }
+
+    /// 是否仍有已提交未完成的编码（会话收尾排空用）。
+    pub fn has_pending_encodes(&self) -> bool {
+        self.sched.in_flight_len() > 0
+    }
+
+    /// 会话收尾第一步：只停采集线程（不再有新帧进入交接通道）。
+    /// 之后调用方应继续 [`Self::tick`] 到静默（交接通道空、无在途编码），
+    /// 再 [`Self::shutdown`] 停编码线程。**先 shutdown 再 tick 是错的**：
+    /// 交接通道里可能还压着帧，停机后的 tick 会把新编码提交给已退出的
+    /// 编码线程（Disconnected），授权帧凭空消失，账目破洞。
+    pub fn stop_capture(&mut self) {
+        self.cap_stop.store(true, Ordering::Release);
+        signal_wake(&self.cap_space);
+        if let Some(h) = self.cap_handle.take() {
+            let _ = h.join();
+        }
+    }
+
+    /// 会话收尾：停两个线程（编码线程排空已提交请求，完成经
+    /// [`Self::tick`] 收取——调用方应在停机后继续 tick 到
+    /// [`Self::has_pending_encodes`] 为假，保证每帧有结局）。
+    pub fn shutdown(&mut self) {
+        self.cap_stop.store(true, Ordering::Release);
+        signal_wake(&self.cap_space);
+        self.enc_stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.cap_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.enc_handle.take() {
+            let _ = h.join();
+        }
+    }
+
+    /// 处理一帧采集数据：diff → 调度 →（Encode 决策时）提交编码线程。
+    fn process_frame(&mut self, frame: CapturedFrame, now_us: u32) -> Result<Option<Vec<Vec<u8>>>> {
+        if self.first_capture.is_none() {
+            self.first_capture = Some(std::time::Instant::now());
+        }
+        let is_repeat = self.judge_repeat(&frame);
+        let seq = self.sched.alloc_seq();
+        {
+            // 坑 3：Captured 打内容变化时刻，不是采集返回时刻。
+            let f = self.trace.begin(seq);
+            f.mark(Mark::Captured, frame.timestamp);
+            f.mark(Mark::Diffed, Timestamp(now_us));
+        }
+
+        let kind = if self.no_idr_yet || self.pending_idr {
+            FrameKind::Idr
+        } else {
+            FrameKind::P
+        };
+
+        let decision = self
+            .sched
+            .on_captured(seq, kind, is_repeat, frame.timestamp, now_us);
+
+        // P3：每次 on_captured 后检查两个关键帧来源。
+        let mut want_idr = false;
+        if let Decision::Drop { needs_keyframe, .. } = &decision {
+            want_idr = *needs_keyframe;
+        }
+        if want_idr || self.sched.take_keyframe_request() {
+            self.pending_idr = true;
+        }
+
+        match decision {
+            Decision::Drop { reason, .. } => {
+                self.finish_drop(seq, reason);
+                Ok(None)
+            }
+            Decision::Encode { deadline_us, .. } => {
+                if let Some(f) = self.trace.get_mut(seq) {
+                    f.mark(Mark::EncodeStart, Timestamp(now_us));
+                }
+                let req = EncodeReq {
+                    seq,
+                    frame,
+                    force_idr: self.no_idr_yet || self.pending_idr,
+                    deadline: Timestamp(deadline_us),
+                };
+                // 提交（通道容量 2 == 在途上限；满了说明调度器算错了）。
+                let slot = Mutex::new(Some(req));
+                if let Err(e) = self.enc_req.try_send(slot) {
+                    // 不该发生（容量 = 在途上限 + 孤儿余量）。防御性释放并
+                    // 记 Budget 结局；留 stderr 痕迹便于发现账目回归。
+                    // Full/Disconnected 分别指向容量计算错误与编码线程
+                    // 提前退出——修的是根因，不是这里的兜底。
+                    eprintln!("rc-pipeline: encode req rejected ({e:?}) despite scheduler budget");
+                    self.sched.on_encoded(seq, now_us);
+                    if let Some(f) = self.trace.get_mut(seq) {
+                        f.finish(Outcome::DroppedBudget);
+                    }
+                }
+                Ok(None) // 本帧的数据报在完成时（后续 tick）产出
+            }
+        }
+    }
+
+    /// 重复帧判定（见 [`DiffMode`]）。
+    fn judge_repeat(&mut self, frame: &CapturedFrame) -> bool {
+        if frame.is_repeat {
+            return true;
+        }
+        if self.cfg.diff == DiffMode::TileDiff {
+            if let FrameTexture::Cpu(cpu) = &frame.texture {
+                let r: DiffResult = self.diff.update(cpu);
+                return r.is_repeat;
+            }
+        }
+        false
+    }
+
+    fn finish_drop(&mut self, seq: rc_types::FrameSeq, reason: DropReason) {
+        let outcome = match reason {
+            DropReason::Repeat => Outcome::DroppedRepeat,
+            DropReason::Stale => Outcome::DroppedStale,
+            DropReason::Budget => Outcome::DroppedBudget,
+            DropReason::Superseded => Outcome::DroppedSuperseded,
+        };
+        if let Some(f) = self.trace.get_mut(seq) {
+            f.finish(outcome);
+        }
+    }
+
+    /// 假采集节流标志（诊断）。
+    pub fn is_paced(&self) -> bool {
+        self.pace_capture
+    }
+
+    /// 首次采集的墙钟时刻（会话零点锚点，见字段文档）。
+    pub fn first_capture(&self) -> Option<std::time::Instant> {
+        self.first_capture
+    }
+}
+
+impl Drop for HostPipeline {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// 从数据报解析帧头（测试与控制端诊断用）。
+pub fn datagram_header(buf: &[u8]) -> Result<MediaHeader> {
+    let (h, _) = MediaHeader::parse_datagram(buf)?;
+    Ok(h)
+}

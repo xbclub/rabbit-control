@@ -1,0 +1,24 @@
+[package]
+name = "rc-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "M1 端到端管线编排：采集→调度→编码→分片；重组→解码→呈现。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+rc-capture = { path = "../rc-capture" }
+rc-encode = { path = "../rc-encode" }
+rc-decode = { path = "../rc-decode" }
+rc-render = { path = "../rc-render" }
+rc-diff = { path = "../rc-diff" }
+rc-sched = { path = "../rc-sched" }
+rc-proto = { path = "../rc-proto" }
+rc-trace = { path = "../rc-trace" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rc-capture-macos = { path = "../rc-capture-macos" }
+rc-encode-vt = { path = "../rc-encode-vt" }
+rc-decode-vt = { path = "../rc-decode-vt" }
+rc-render-macos = { path = "../rc-render-macos" }

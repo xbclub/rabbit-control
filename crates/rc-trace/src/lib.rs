@@ -284,6 +284,12 @@ impl TraceCollector {
         self.frames.iter().find(|f| f.seq == seq)
     }
 
+    /// 按序号查找（可变）。管线层在 `begin` 之后的各阶段继续打点用；
+    /// **不要**对同一序号调用两次 [`Self::begin`]（那会压入重复条目）。
+    pub fn get_mut(&mut self, seq: FrameSeq) -> Option<&mut FrameTrace> {
+        self.frames.iter_mut().find(|f| f.seq == seq)
+    }
+
     /// 全部帧（按进入顺序）。
     pub fn frames(&self) -> &[FrameTrace] {
         &self.frames

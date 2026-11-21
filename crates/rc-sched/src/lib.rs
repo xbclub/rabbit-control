@@ -118,18 +118,22 @@ pub enum DropReason {
     Repeat,
     /// 已超过 deadline（编码也来不及了）
     Stale,
-    /// 在途队列已满，被新帧挤出
+    /// 在途预算已满，到达帧被拒（不逐出在途帧，见 `on_captured` 的 R1 说明）
     Budget,
     /// 该帧被更新的一帧取代（旧帧已无价值）
     Superseded,
 }
 
 /// 在途帧记录。
+///
+/// 只留完成配对必需的字段：`seq` 用于 [`Self::on_encoded`] 配对释放，
+/// `deadline_us` 用于超期监控。帧类型不放进来——丢弃到达帧（R1）的
+/// 裁决发生在入表之前，在途帧本身无差别（旧「逐出 P 帧」逻辑随
+/// 逐出策略一起删除了）。
 #[derive(Debug, Clone, Copy)]
 struct InFlight {
     seq: FrameSeq,
     deadline_us: u32,
-    kind: FrameKind,
 }
 
 /// 调度器统计。
@@ -232,12 +236,16 @@ impl Scheduler {
     /// # 决策顺序（顺序不可调换）
     /// 1. R3 重复帧 → Drop(Repeat)
     /// 2. R2 超期 → Drop(Stale)
-    /// 3. R1 挤出最旧 → Drop(Budget)，若挤出的是 IDR 则不允许
+    /// 3. R1 预算满 → 丢弃**当前到达帧** Drop(Budget)
     /// 4. 接受 → Encode
     ///
-    /// # 关键约束
-    /// 若在途帧中已有关键帧（尚未编码完成），新的 P 帧**不能**把关键帧挤出，
-    /// 而是把自己挤掉——否则关键帧丢失会导致长时间花屏。
+    /// # R1 为什么丢新帧而不是挤出最旧在途帧（2026-11-21 M1 实测修正）
+    /// 硬件/串行编码器**无法中途取消**在编帧：挤出在途帧 ≠ 省下它的编码
+    /// 工作，只是把已完成的产出扔掉。实测（20ms 编码器 + 16.7ms 到达率）
+    /// 逐出策略进入活锁——每个新到帧驱逐的总是尚未完成的更旧帧，全部
+    /// 在制工作被反复作废，吞吐塌缩、几乎无帧上屏。满员丢新帧则保住
+    /// 全部在制工作：显示率 = 编码器吞吐，延迟有界。在途 IDR 因此天然
+    /// 受保护（永远不会被移出在途表）。
     pub fn on_captured(
         &mut self,
         seq: FrameSeq,
@@ -272,37 +280,19 @@ impl Scheduler {
             };
         }
 
-        // R1: 挤出最旧
+        // R1: 预算满 → 丢弃当前到达帧（见 on_captured 文档的实测修正说明：
+        // 硬件编码无法中途取消，逐出在途帧 = 反复作废在制工作的活锁）。
         if self.in_flight.len() >= self.cfg.max_in_flight {
-            // 找到最旧的**可丢弃**帧
-            let victim = self.in_flight.iter().position(|f| f.kind.is_droppable());
-            match victim {
-                Some(idx) => {
-                    let dropped = self.in_flight.remove(idx);
-                    self.stats.dropped_budget += 1;
-                    self.consecutive_drops += 1;
-                    // 挤出的是 P 帧，调用方需请求关键帧
-                    let _ = dropped;
-                    // 注意：这里不返回，继续处理当前帧
-                }
-                None => {
-                    // 在途全是 IDR，不能挤。丢弃当前帧。
-                    self.stats.dropped_budget += 1;
-                    self.consecutive_drops += 1;
-                    return Decision::Drop {
-                        seq,
-                        reason: DropReason::Superseded,
-                        needs_keyframe: kind.is_droppable(),
-                    };
-                }
-            }
+            self.stats.dropped_budget += 1;
+            self.consecutive_drops += 1;
+            return Decision::Drop {
+                seq,
+                reason: DropReason::Budget,
+                needs_keyframe: !kind.is_droppable(),
+            };
         }
 
-        self.in_flight.push(InFlight {
-            seq,
-            deadline_us,
-            kind,
-        });
+        self.in_flight.push(InFlight { seq, deadline_us });
         self.stats.encoded += 1;
         self.consecutive_drops = 0;
 
@@ -496,9 +486,10 @@ mod tests {
         assert_eq!(s.in_flight_len(), 1);
     }
 
-    /// R1: 在途满时，新帧挤出最旧的
+    /// R1: 在途满时，丢弃**到达帧**而不是逐出在途帧（2026-11-21 修正，
+    /// 见 on_captured 文档：逐出无法取消的物理编码 = 活锁）。
     #[test]
-    fn budget_full_evicts_oldest() {
+    fn budget_full_drops_arrival() {
         let mut s = sched();
         let a = s.alloc_seq();
         let b = s.alloc_seq();
@@ -509,13 +500,13 @@ mod tests {
         assert_eq!(s.in_flight_len(), 2);
 
         let d = s.on_captured(c, FrameKind::P, false, Timestamp(TS0 + 2000), TS0 + 2100);
-        // c 应被接受（挤出 a）
-        assert!(matches!(d, Decision::Encode { seq, .. } if seq == c));
-        assert_eq!(s.in_flight_seqs(), vec![b, c]);
+        // c 应被拒，在途保持 [a, b]
+        assert!(matches!(d, Decision::Drop { seq, reason: DropReason::Budget, .. } if seq == c));
+        assert_eq!(s.in_flight_seqs(), vec![a, b]);
         assert_eq!(s.stats().dropped_budget, 1);
     }
 
-    /// 关键用例：在途含 IDR 时，新 P 帧不能挤掉 IDR
+    /// 关键用例：在途含 IDR 时，IDR 天然受保护（新语义不逐出任何在途帧）
     #[test]
     fn idr_in_flight_is_never_evicted() {
         let mut s = sched();
@@ -527,9 +518,9 @@ mod tests {
         s.on_captured(p, FrameKind::P, false, Timestamp(TS0 + 500), TS0 + 600);
 
         let d = s.on_captured(newp, FrameKind::P, false, Timestamp(TS0 + 1000), TS0 + 1100);
-        // 应挤掉 p（可丢），保留 idr
-        assert!(matches!(d, Decision::Encode { seq, .. } if seq == newp));
-        assert_eq!(s.in_flight_seqs(), vec![idr, newp]);
+        // 预算满：新帧被拒，idr 与 p 都保留
+        assert!(matches!(d, Decision::Drop { seq, reason: DropReason::Budget, .. } if seq == newp));
+        assert_eq!(s.in_flight_seqs(), vec![idr, p]);
     }
 
     /// 在途全是 IDR 时，新帧必须被丢弃
@@ -544,10 +535,11 @@ mod tests {
         s.on_captured(b, FrameKind::Idr, false, Timestamp(TS0 + 200), TS0 + 300);
 
         let d = s.on_captured(c, FrameKind::P, false, Timestamp(TS0 + 400), TS0 + 500);
+        // 新语义：预算满一律丢到达帧（Budget），在途 IDR 无需特判即受保护。
         assert!(matches!(
             d,
             Decision::Drop {
-                reason: DropReason::Superseded,
+                reason: DropReason::Budget,
                 ..
             }
         ));

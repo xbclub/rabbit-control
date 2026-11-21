@@ -1,0 +1,22 @@
+[package]
+name = "rc-encode-vt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl 的 VideoToolbox 硬件 H.264 编码后端（T12 / 契约 E1–E6）。"
+
+# rc-types / rc-encode / rc-capture 是纯 Rust，跨平台可编译（annexb 转换与
+# caps 声明等纯逻辑的单测在任何目标上都能跑）；只有 objc2 系绑定 gate 在
+# macOS 上，workspace 在任何平台 `cargo build` 都不会因链接框架失败。
+[dependencies]
+rc-capture = { path = "../rc-capture" }
+rc-encode = { path = "../rc-encode" }
+rc-types = { path = "../rc-types" }
+
+# 版本线与 rc-capture-macos 严格一致（objc2 生态 0.6 / 绑定 0.3），
+# 两条平台 crate 共享同一批编译产物。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", features = ["CFDictionary", "CFNumber", "CFString"] }
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
