@@ -128,13 +128,13 @@ diff / sched_queue / encode / packetize / network / decode / present / total
     "decode": 3.1,
     "present": 1.9
   },
-  "convergence_ms": 420,
-  "degradation_ms": 610,
+  "convergence_ms": 1000,
+  "degradation_ms": null,
   "max_queue_depth_seen": 2,
   "probe_enabled": false,
   "gate": {
     "p50_ms_max": 18.0,
-    "displayed_fps_min": 58.0,
+    "displayed_fps_min": 54.0,
     "static_cpu_pct_max": 8.0,
     "convergence_ms_max": 1000,
     "max_queue_depth": 2,
@@ -144,12 +144,19 @@ diff / sched_queue / encode / packetize / network / decode / present / total
 }
 ```
 
+> **`gate.displayed_fps_min` 不是写死的 58**：门槛 = `target_fps × 0.9`
+> （本例 60fps → 54.0）。写死 58 会让合法的 30fps 配置永远失败；
+> 实现见 `rc-loopback/src/report.rs` 的 `GateResult::for_config`，
+> 由测试 `gate_fps_threshold_follows_target` 钉住。
+> 同理 `convergence_ms` / `degradation_ms` 用整 1 秒窗口判定，
+> 最小可判定值是 1000ms（示例中分别为 1000 / null）。
+
 ### 4.1 新增字段说明（对应架构文档 Q1–Q6）
 
 | 字段 | 类型 | 对应 | 含义 |
 |---|---|---|---|
-| `convergence_ms` | `u64 \| null` | Q1 / Q4 | 从循环开始到 `displayed_fps ≥ target × 0.9`（1 秒滑动窗口）的毫秒数。30 秒内未达到为 `null` |
-| `degradation_ms` | `u64 \| null` | Q4 | 帧率从目标降到 50% 所用毫秒数。用于与 `convergence_ms` 比较对称性 |
+| `convergence_ms` | `u64 \| null` | Q1 / Q4 | 从循环开始到 `displayed_fps ≥ target × 0.9`（**整 1 秒**滑动窗口，最小可判定值 1000ms）的毫秒数。30 秒内未达到为 `null` |
+| `degradation_ms` | `u64 \| null` | Q4 | 帧率从目标降到 50% 所用毫秒数（与 `convergence_ms` 同一套 1 秒窗口）。全程未低于 50% 为 `null`。用于与 `convergence_ms` 比较对称性 |
 | `max_queue_depth_seen` | `u32` | Q3 | 整个运行期间任意一层队列的最大深度 |
 | `probe_enabled` | `bool` | Q2 | 是否启用了网络延迟探针（`--probe` 开关，默认 `false`） |
 
@@ -204,7 +211,7 @@ cargo run -p rc-cli --release -- loopback \
 # 判定
 jq -e '.gate.passed' /tmp/loopback-basic.json
 jq '.latency_ms.p50' /tmp/loopback-basic.json    # 应 <= 18.0
-jq '.fps.displayed' /tmp/loopback-basic.json     # 应 >= 58
+jq '.fps.displayed' /tmp/loopback-basic.json     # 应 >= 54（= 60 × 0.9，随 --fps 变化）
 ```
 
 ### 5.2 静态画面 CPU

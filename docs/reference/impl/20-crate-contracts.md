@@ -432,7 +432,10 @@ pub struct CapturedFrame {
 
 pub enum FrameTexture {
     Cpu(CpuFrame),                 // 兜底：软件采集
-    #[cfg(windows)] D3D11(windows::Win32::Graphics::Direct3D11::ID3D11Texture2D),
+    // 平台变体只携带不透明句柄：抽象层不引 windows 等平台依赖，
+    // 由各平台 crate 负责句柄 ↔ 原生对象（ID3D11Texture2D* 等）的
+    // 类型还原与引用计数（见 rc-capture crate 文档「纹理载体」）。
+    #[cfg(windows)] D3D11(*mut std::ffi::c_void),   // ID3D11Texture2D* 不透明句柄
     #[cfg(target_os = "macos")] CVPixelBuffer(*mut std::ffi::c_void),
     #[cfg(target_os = "linux")] DmaBuf(DmaBufHandle),
 }
@@ -520,8 +523,14 @@ pub struct NetConfig {
 pub trait Transport: Send {
     /// 发送媒体数据报（不可靠）
     fn send_datagram(&mut self, data: &[u8]) -> Result<()>;
-    /// 发送控制/输入（可靠有序）
+    /// 发送控制消息（可靠有序）
     fn send_reliable(&mut self, data: &[u8]) -> Result<()>;
+    /// 发送输入事件（可靠有序、独立 urgent 流）。语义：输入消息永不排在
+    /// 控制消息之后（控制流被大流量灌满时不受队头阻塞）。
+    /// 默认实现委托 send_reliable，单流实现与测试替身无需适配即可编译。
+    fn send_reliable_urgent(&mut self, data: &[u8]) -> Result<()> {
+        self.send_reliable(data)
+    }
     /// 非阻塞接收。返回所有已就绪消息。
     fn poll(&mut self, timeout: Duration) -> Result<Vec<NetEvent>>;
     /// 网络统计（用于拥塞控制与诊断）
@@ -531,6 +540,7 @@ pub trait Transport: Send {
 pub enum NetEvent {
     Datagram(Vec<u8>),
     Reliable(Vec<u8>),
+    ReliableUrgent(Vec<u8>),         // 输入独立流（不与控制共享队列）
     Connected,
     Disconnected { reason: String },
     PathChanged,                     // 连接迁移
@@ -555,6 +565,7 @@ pub struct NetStats {
 | N3 | pacing 必须实现（不能一轮发完） |
 | N4 | `poll` 不阻塞超过 timeout |
 | N5 | 连接迁移（`PathChanged`）后媒体流不中断 |
+| N6 | 输入走独立 urgent 流（`send_reliable_urgent` → `NetEvent::ReliableUrgent`），不得排在控制消息之后（队头阻塞） |
 
 ### 7.4 `rc-loopback`（M1 的关键设施）
 
@@ -568,28 +579,40 @@ pub struct Loopback {
 pub struct LoopbackConfig {
     pub resolution: Resolution,
     pub fps: u32,
-    pub duration: Duration,
-    pub inject_loss: f32,        // 0.03 = 3%
-    pub inject_rtt_us: u32,      // 单程延迟的一半
-    pub inject_jitter_us: u32,
+    pub inject_loss: f32,        // 0.0–1.0，0.03 = 3%
+    pub inject_rtt_us: u32,      // 往返延迟（微秒），单程 = 该值 / 2
+    pub inject_jitter_us: u32,   // 抖动（微秒）
     pub bandwidth_bps: u64,      // 0 = 不限
-    pub encoder: Option<String>, // None = 自动选择
-    pub trace_capacity: usize,   // 默认 4096
+    pub encoder_slowdown: f32,   // 编码减速倍数，1.0 = 正常；JSON 的 config.encoder 由它派生
+    pub static_content: bool,    // 画面静止（Q5：静止零编码）
+    pub seed: u64,               // 丢包序列随机种子，默认 42（固定后结果可复现）
+    pub trace_capacity: usize,   // 帧时间线容量，默认 4096
+    pub max_queue_depth: usize,  // 接收队列深度硬上限，默认 2（Q3，不要调大）
+    pub probe_enabled: bool,     // 网络延迟探针开关，默认 false（Q2：帧率判定不依赖探针）
 }
 
 pub struct LoopbackReport {
-    pub summary: TraceSummary,      // 来自 rc-trace
-    pub displayed_fps: f64,
+    pub config: LoopbackConfig,     // 本次运行的配置快照
+    pub duration_s: f64,            // 实际运行时长（秒）
+    pub summary: TraceSummary,      // 来自 rc-trace（全量计数器，不受 trace_capacity 截断）
     pub sched_stats: SchedulerStats, // 来自 rc-sched
-    pub capture_frames: u64,        // 采集帧数（应 >> 编码帧数）
-    pub p50_ms: f64,
-    pub p95_ms: f64,
-    pub p99_ms: f64,
-    pub passed: bool,               // 是否满足 Gate
+    pub latency_p50_ms: f64,        // 端到端延迟分位数（毫秒）
+    pub latency_p95_ms: f64,
+    pub latency_p99_ms: f64,
+    pub displayed_fps: f64,         // 实际呈现帧率
+    pub encoded_fps: f64,           // 实际编码帧率
+    pub captured_fps: f64,          // 实际采集帧率（静态场景应 > encoded，见 40-diagnostics.md §4.4）
+    pub breakdown_ms: BreakdownMs,  // 分段延迟：diff/sched_queue/encode/packetize/network/decode/present
+    pub convergence_ms: Option<u64>, // 达到 target × 0.9 的时刻；None = 未达到
+    pub degradation_ms: Option<u64>, // 帧率跌破 50% 的时刻；None = 全程未低于
+    pub max_queue_depth_seen: u32,  // 运行期间观测到的最大队列深度
+    pub probe_enabled: bool,        // 取自配置
+    pub static_cpu_pct: Option<f64>, // 静态画面 CPU 实测；刻意不进 JSON，只参与 Gate 判定
+    pub gate: GateResult,           // Gate 判定（passed 在 gate.passed，不是顶层字段）
 }
 ```
 
-**这是让 AI 能自主验证的设施。** 输出必须是 JSON，字段名固定（见 [40-diagnostics.md](40-diagnostics.md)）。
+**这是让 AI 能自主验证的设施。** 输出必须是 JSON，字段名固定（见 [40-diagnostics.md](40-diagnostics.md) §4）。
 
 ---
 

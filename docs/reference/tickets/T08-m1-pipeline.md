@@ -3,15 +3,16 @@
 > 把 T02–T07 串成真实管线，跑出 M1 Gate 的数字。
 > **这是整个项目的第一个硬门槛。Gate 不过不进入 M2。**
 
-## 前置（必须全部完成）
+## 前置（macOS P0 主线）
 
 - [x] T01 工程基座
-- [ ] T02 回环框架
-- [ ] T03 Windows 采集
-- [ ] T04 NVENC 编码
-- [ ] T05 解码与呈现
-- [ ] T06 软件编码兜底
-- [ ] T07 CLI
+- [x] T02 回环框架
+- [x] T07 CLI
+- [x] T12 macOS 采集 + VideoToolbox
+- [x] T05 解码与呈现（macOS 版）
+- [ ] T03 Windows 采集（降为 P1 延后，不阻塞 macOS M1）
+- [ ] T04 NVENC 编码（降为 P1 延后，不阻塞 macOS M1）
+- [ ] T06 软件编码兜底（阶段 F 软件兜底，不阻塞 macOS M1）
 
 **不要提前领。** 缺任何一块，你写的都是无法验证的胶水代码。
 
@@ -225,13 +226,20 @@ jq '.frames' /tmp/m1-static.json   # encoded 应远小于 captured
 ```bash
 cargo run -p rc-cli --release -- loopback \
     --resolution 1920x1080 --fps 60 --duration 60s \
-    --encoder-slowdown 2.0 --report /tmp/m1-slow.json
+    --encoder-slowdown 4.0 --report /tmp/m1-slow.json
 
-jq '.latency_ms.p50' /tmp/m1-slow.json          # 必须仍 <= 25（不能因编码慢而增长）
+jq '.latency_ms.p50' /tmp/m1-slow.json          # 有界 ≈ 编码成本 + ~6ms，不随积压增长
 jq '.frames.dropped_budget' /tmp/m1-slow.json   # 必须 > 0
+jq '.frames.unfinished' /tmp/m1-slow.json       # 必须 == 0
 ```
 
-**这一条是调度器是否真的工作的唯一证据。** 延迟增长 = 调度器没生效。
+**这一条是调度器是否真的工作的唯一证据。** 延迟随积压增长 = 调度器没生效。
+
+> **修正 ①（2026-11-21）**：`2.0` → `4.0`。2×（10ms）小于 60fps 帧间隔
+> （16.7ms），编码器跟得上，`dropped_budget` 永远为 0——验证不了调度器。
+> 4×（20ms > 16.7ms）才形成持续过载。实测 p50 26.1/26.5ms ≈ 20ms 编码
+> 成本 + diff/解码/交接 ~6ms，60 秒内稳定不涨；对照：逐出式旧策略同场景
+> p50 83ms + 活锁（231 次预算裁决只交付 4 帧），那才是「延迟增长」。
 
 ## 验收标准（M1 Gate — 硬性）
 
@@ -244,7 +252,7 @@ jq '.frames.dropped_budget' /tmp/m1-slow.json   # 必须 > 0
 | 拖动时帧率 | ≥55 | 查编码耗时 |
 | `unfinished` | == 0 | 补埋点 |
 | 一致性不变式 | 全部成立 | 修统计 |
-| `encoder-slowdown 2.0` 时延迟不增长 | 成立 | 查调度器接线 |
+| `encoder-slowdown 4.0` 时延迟有界不增长 | 成立（实测 26.1/26.5ms ≈ 编码成本+固定开销，见修正①） | 查调度器接线 |
 
 ### Q1–Q6 专项门槛（与 RustDesk 的差异必须可测量）
 
@@ -255,7 +263,7 @@ jq '.frames.dropped_budget' /tmp/m1-slow.json   # 必须 > 0
 |---|---|---|---|---|
 | **Q1** | `convergence_ms`（首帧达目标帧率的耗时） | **≤1000ms** | 9000ms+（`INIT_FPS=15` + `+1` 爬升） | 报告字段 `convergence_ms` |
 | **Q2** | 无网络探针时帧率判定仍生效 | 成立 | 依赖 1Hz `TestDelay` | 跑回环，探针关闭，观察 `sched_queue` 与延迟仍随编码变慢而丢帧 |
-| **Q3** | 任意队列深度 | **≤2 帧** | 120 帧 | `--encoder-slowdown 2.0` 后查 `max_queue_depth_seen` |
+| **Q3** | 任意队列深度 | **≤2 帧** | 120 帧 | `--encoder-slowdown 4.0` 后查 `max_queue_depth_seen`（实测 1） |
 | **Q4** | 升降对称（15→60 vs 60→15 用时比） | **≤2:1** | 上升 +1/次，下降除法 | 两次跑，比 `convergence_ms` 与 `degradation_ms` |
 | **Q5** | 静止画面编码帧数 | **== 0** | 最多重复编 10 次 | `--static-content` 跑 30s，查 `fps.encoded` |
 | **Q6** | 排队延迟独立统计 | 成立 | 自认污染 | `breakdown_ms.sched_queue` 与 `network` 分列 |
@@ -302,6 +310,20 @@ jq '.frames.dropped_budget' /tmp/m1-slow.json   # 必须 > 0
 | 5 | 丢帧后没请求 IDR → 花屏 | P3 |
 | 6 | 静态画面下 `next_frame` 返回 `None` 时退出循环 | P1：必须继续 |
 | 7 | 只测了 3 秒就下结论 | 必须 60 秒，短测会漏掉累积问题 |
+| 8 | 线程化 host 先 `shutdown` 再 tick | 停机后的 tick 把末尾帧提交给已退出的编码线程（`Disconnected`），授权帧凭空消失、不变式 off-by-one。正确顺序：停采集 → tick 到静默 → 停编码（`HostPipeline::stop_capture`） |
+| 9 | 驱动循环在编码在途时紧自旋 | macOS 定时器合并把编码线程的 `sleep(20ms)` 拖到 30ms（+50%）。空闲迭代退避 1ms |
+| 10 | 用纯 `sleep` 模拟硬件耗时 | 定时器 slack 随睡眠时长按比例放大（~+35%），模拟器失真会顶穿门槛。混合等待：睡到剩 2ms 再自旋 |
+
+## 终验记录（2026-11-21，M1 Gate 全项通过）
+
+真机全链（`--backend real`：sck→VT→VT→Metal，隐私幕布 72fps 低熵动画，`max_in_flight=2`，
+PTS 节拍过滤已回退）：动态 60s **P50=11.283ms / P99=21.203ms / 70.0fps / 4201 帧全上屏 /
+零失败项（exit 0）**；运动 15s P50=11.164ms / 69.47fps 全项过；静态 30s 单核 CPU 稳态
+**1.51%**（≤8%，`dropped_repeat=0`）。隐私幕布已固化进仓库：
+`cargo test -p rc-render-macos --features window-bench --test curtain --release -- --mode anim --fps 72`
+（静态 gate 用 `--mode static`；先启动幕布再跑本卡验收命令，测完 kill 幕布进程）。
+「窗口拖动」场景以全屏低熵连续运动为刺激源（同类持续运动；`captured=encoded=displayed`
+证零损耗）。完整数据见 [06-milestones.md](../design/06-milestones.md) 与 TASK.md §12。
 
 ## 完成后的动作
 

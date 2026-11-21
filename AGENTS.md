@@ -98,3 +98,70 @@
 
 1. 向对应子 agent 发送纠偏指令（明确指出当前陷入循环、给出下一步具体动作）；
 2. 纠偏无效时，终止该子 agent，将其剩余任务**重新拆分**后派发给新的子 agent。
+
+---
+
+## 八、macOS 固定签名开发证书测试指南
+
+Apple Silicon 上默认 ad-hoc 签名每次重编译都会改变 CDHash，导致 macOS TCC（屏幕录制 / 辅助功能 / 输入监控）权限失效。本项目已在登录钥匙串配置固定开发证书并封装统一脚本 [scripts/macos-dev-run.sh](scripts/macos-dev-run.sh)，**一次授权后无论重编译或切换测试二进制均不再掉权限**。
+
+### 固定身份信息
+
+| 项 | 值 |
+|---|---|
+| 登录钥匙串证书名 | `RabbitControl Dev`（SHA-1：`51F7737F3037EF8858974FF226AC37531B66EEA3`） |
+| 固定 Bundle ID | `com.rabbitcontrol.dev` |
+| 封装 App 路径 | `target/dev-app/RabbitControlDev.app` |
+| Designated Requirement | `identifier "com.rabbitcontrol.dev" and certificate leaf = H"51f7737f3037ef8858974ff226ac37531b66eea3"` |
+
+> **关键约束**：凡涉及 macOS 权限（ScreenCaptureKit 屏幕录制、CGEvent 辅助功能注入、输入监控）的真机运行/测试，**必须**通过 `./scripts/macos-dev-run.sh`（内部用 LaunchServices `open -n -W` 启动 `RabbitControlDev.app`）执行，**不要**直接运行 `cargo run` / `./target/.../rc-cli`——直接子进程的 TCC Responsible Process 会落到宿主终端/IDE，吃不到 `RabbitControlDev.app` 的授权。
+
+### 常用测试命令
+
+```bash
+# 1. 检查证书与当前 App 签名身份（不触发重编译）
+./scripts/macos-dev-run.sh check-cert
+
+# 2. 验证权限与硬件后端探测（应看到 capture.available=true, screen_recording=true）
+./scripts/macos-dev-run.sh cli -- probe --json
+
+# 3. 跑真实硬件全链 M1 Gate（release，SCK → VT 编 → VT 解 → Metal 呈现）
+./scripts/macos-dev-run.sh cli --release -- loopback \
+    --backend real --resolution 1920x1080 --fps 60 --duration 60s \
+    --report /tmp/m1-real.json
+
+# 4. 跑需要屏幕录制权限的 rc-capture-macos 真机测试
+./scripts/macos-dev-run.sh test rc-capture-macos -- --ignored --nocapture
+
+# 5. 跑需要辅助功能权限的 rc-input-macos 真机测试（需在「辅助功能」也勾选一次 RabbitControlDev.app）
+./scripts/macos-dev-run.sh test rc-input-macos -- --ignored --nocapture
+```
+
+（也可用 `just dev-cert`、`just dev-probe`、`just dev-cli ...`、`just dev-test ...` 快捷入口。）
+
+### 注意事项
+
+- **不违反铁律 3**：日常改代码内循环依然只跑 `cargo check -p <crate>` 与普通 `cargo test -p <crate>`；只有跑**真机权限测试或 `--backend real` M1 Gate** 时才调用 `scripts/macos-dev-run.sh`。
+- **静屏测试行为**：`sck_captures_at_60fps` 要求测试期间屏幕有持续画面变化；静止桌面下 SCK 返回 0 帧属于符合铁律 2（静止零编码）的正常行为。
+- **补授其他权限**：若后续测试 `rc-input-macos` 提示缺少辅助功能/输入监控权限，把同一份 `target/dev-app/RabbitControlDev.app` 拖进系统设置对应列表打开一次即可，同样跨重编译永久生效。
+
+---
+
+## 九、TASK.md 回写强制约束（2026-11-21 起）
+
+**每完成一张任务卡、一个里程碑、或一轮含实测数字的实质性修改，在给出最终回答之前，必须先把结果回写 [TASK.md](TASK.md)。** 未回写即汇报完成，视为任务未完成。
+
+回写的最低要求：
+
+| 位置 | 必须更新什么 |
+|---|---|
+| §0 速览「当前状态」行 | 一句话反映本轮后的真实状态（含测试数、关键指标） |
+| §12 当前实测基线 | 本轮所有新实测数字：场景、配置（后端形态 / 参数）、结果行 |
+| §13 过程记录 | 本轮的关键决策、根因、新踩的坑（带文件路径）；上一轮遗留清单若已解决，就地标记闭环 |
+
+补充纪律：
+
+- 数字必须带**场景与配置**（哪个 gate、什么后端、什么供给），不得只写裸数字；结论行要写门槛与是否达标。
+- 本轮**没做**的事不要顺手改旧数字；发现旧数据有误时，保留原行并追加更正说明，不直接抹掉历史。
+- 真机/带权限测量还须写明运行方式（如幕布工具命令、`scripts/macos-dev-run.sh` 入口），保证可复现。
+- 里程碑级结果（如 M1 Gate）还要同步 `docs/reference/design/06-milestones.md` 与对应任务卡（`docs/reference/tickets/Txx-*.md`）。

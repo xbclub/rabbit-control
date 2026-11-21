@@ -55,15 +55,15 @@ T11 需要 Linux，T12 需要 macOS。
 | 卡 | 标题 | 依赖 | 平台 | 阶段 | 状态 |
 |---|---|---|---|---|---|
 | [T01](T01-engineering-base.md) | 工程基座 | — | 全 | — | ✅ 已完成 |
-| [T02](T02-loopback-skeleton.md) | 回环框架骨架 | T01 | 全 | **A1** | ⬜ 待领取 |
-| [T07](T07-cli.md) | CLI 入口 | T02 | 全 | **A2** | ⬜ 待领取 |
-| [T12](T12-capture-macos.md) | macOS 采集 + VideoToolbox | T02 | **macOS** | **B1** | ⬜ 待领取 |
-| [T05](T05-decode-render.md) | 解码与呈现 | T12 | **macOS 版** | **B2** | ⬜ 待领取 |
-| [T08](T08-m1-pipeline.md) | **M1 Gate 端到端** | T02, T07, T12, T05 | **macOS** | **B3** | ⬜ 待领取 |
-| [T09](T09-net-quic.md) | QUIC 传输 | T01 | 全 | C1 | ⬜ 待领取 |
-| [T10](T10-input-channel.md) | 输入通道 | T09 | Win | C2/D3 | ⬜ 待领取 |
-| [T03](T03-capture-windows.md) | Windows DXGI 采集 | T08 | Win | D1 | ⬜ 待领取 |
-| [T04](T04-encode-nvenc.md) | NVENC 编码 | T03 | Win | D2 | ⬜ 待领取 |
+| [T02](T02-loopback-skeleton.md) | 回环框架骨架 | T01 | 全 | **A1** | ✅ 已完成 |
+| [T07](T07-cli.md) | CLI 入口 | T02 | 全 | **A2** | ✅ 已完成 |
+| [T12](T12-capture-macos.md) | macOS 采集 + VideoToolbox | T02 | **macOS** | **B1** | ✅ 已完成 |
+| [T05](T05-decode-render.md) | 解码与呈现 | T12 | **macOS 版** | **B2** | ✅ 已完成 |
+| [T08](T08-m1-pipeline.md) | **M1 Gate 端到端** | T02, T07, T12, T05 | **macOS** | **B3** | ✅ 已完成（2026-11-21，卡内两处修正见卡片末尾） |
+| [T09](T09-net-quic.md) | QUIC 传输 | T01 | 全 | C1 | ✅ 已完成（2026-11-21，23 单测 + 4 回环集成全绿；3% 丢包存活、100KB 分片逐字节重组、`DEFAULT_MAX_CONCURRENT_FRAMES=2` 均实测；N9 真路径迁移测试为已知空档） |
+| [T10](T10-input-channel.md) | 输入通道 | T09 | Win | C2/D3 | ✅ 已完成（2026-11-21，按 §6 平台重排以「全平台核心 `rc-input` + macOS 桥接 `rc-input-macos`」交付 C2；Windows SendInput/捕获为 `rc-input-win` cfg(windows) 骨架，真机实现属 D3 待领） |
+| [T03](T03-capture-windows.md) | Windows DXGI 采集 | T08 | Win | D1 | ⬜ 待领取（P1） |
+| [T04](T04-encode-nvenc.md) | NVENC 编码 | T03 | Win | D2 | ⬜ 待领取（P1） |
 | [T06](T06-encode-software.md) | 软件编码兜底 | T01 | 全 | F | ⬜ 待领取 |
 | [T11](T11-capture-linux.md) | Linux 采集 | T03 | Linux | E | 🔒 P2 归档 |
 

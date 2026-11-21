@@ -247,8 +247,12 @@ jq '.fps.encoded' /tmp/t07.json            # 必须 == 0
 # 3. Q3：队列深度
 jq '.max_queue_depth_seen' /tmp/t07.json   # 必须 <= 2
 
-# 4. Q1/Q4：收敛时间
-jq '.convergence_ms' /tmp/t07.json         # 必须 <= 1000
+# 4. Q1/Q4：收敛时间 —— 必须在**动态内容**报告上断言。
+#    静态画面无帧上屏，convergence_ms 恒为 null（T02 的 L10/30 秒规则），
+#    Gate 必失败 exit 1——这是 Q5 的预期行为，不是缺陷；断言 2 与本断言
+#    不可能在同一份 --static-content 报告上同时成立。
+cargo run -p rc-cli -- loopback --duration 3s --report /tmp/t07d.json
+jq '.convergence_ms' /tmp/t07d.json        # 必须 <= 1000
 
 # 5. 一致性不变式
 jq -e '.frames.captured == (.frames.encoded + .frames.dropped_repeat
@@ -261,7 +265,7 @@ jq -e '.frames.captured == (.frames.encoded + .frames.dropped_repeat
 | 报告必含字段 | 6 个顶层键齐全 | `impl/40-diagnostics.md` §4 |
 | `fps.encoded`（`--static-content`） | **== 0** | Q5 |
 | `max_queue_depth_seen` | **≤2** | Q3 |
-| `convergence_ms` | **≤1000** | Q1 / Q4 |
+| `convergence_ms` | **≤1000**（动态内容报告；静态恒 null） | Q1 / Q4 |
 | 一致性不变式 | 成立 | §4.3 |
 | 退出码语义 | 0 / 1 / 2 正确 | 本文「退出码约定」 |
 

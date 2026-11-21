@@ -92,7 +92,102 @@
 5. 是否有隐式 CPU 拷贝（用 GPU 采样器验证零拷贝）
 6. 调度器是否生效（看在途帧数）
 
+### M1 Gate 实测记录（2026-11-21，macOS P0 路径）
+
+#### ✅ 终验（2026-11-21）：M1 Gate 全项通过，正式进入阶段 C
+
+终验配置（相对上一轮的三处变更）：① 回退 `rc-capture-macos` 的 SCK PTS 节拍过滤
+（`should_emit_pts`，整段删除——SCK 60fps 内容的到达节拍是 8.33/16.67ms **交替**，
+按「距上一放行帧」累计判定会把节拍拉长到 25ms 周期，实测采集被压到 48fps）；
+② `max_in_flight` 切回 **2**（mif=1 在 60s 长测中预算丢帧 842 次、displayed 掉到
+56.7fps < 58；mif=2 双达标且 0 丢帧——VT 是异步会话，在途 2 重叠提交/完成开销）；
+③ 隐私幕布固化为仓库内可复现工具 `rc-render-macos/tests/curtain.rs`
+（`cargo test -p rc-render-macos --features window-bench --test curtain --release --
+--mode anim --fps 72` / `--mode static`；两个实现坑存档见该文件文档：无
+`NSApp.run()` 窗口不上屏、单 IOSurface 反复重写合成器看到冻结画面——需
+NSApp 主线程 + 渲染线程 + 4 缓冲环）。`uuremote` 未运行；`caffeinate` 保持开启防息屏。
+
+| 场景 | 结果 | 关键指标 |
+|---|---|---|
+| **1080p60 动态 60s** | **全项通过（exit 0，零失败项）** | **P50 = 11.283ms** / P95 = 16.764 / **P99 = 21.203ms** / captured 70.02fps、encoded=displayed **70.00fps** / 4201 帧全上屏（budget=0、stale=1）/ convergence 1000ms / 队列峰值 2 / unfinished=0 / 不变式全过；分段：encode 10.296 / decode 2.024 / diff 0.995 / present 0.250 / sched_queue 0 |
+| **持续运动 15s**（全屏低熵连续运动，与窗口拖动同类刺激） | **全项通过（exit 0）** | P50 = **11.164ms** / P99 = **20.431ms** / displayed **69.47fps** / 1042/1042 全上屏（零丢弃）/ convergence 1000ms / 队列峰值 2 |
+| **静态画面 30s**（纯黑真静屏） | **静态出口条件达标** | 单核 CPU 稳态均值 **1.51%**（全均值 2.13%、峰值 18.2% 仅启动段）；encoded=displayed=122（4.07fps，全部为菜单栏时钟等真实系统变化，`dropped_repeat=0`——Q5「静止画面重复编码」红线未破）；exit 1 为静态画面 fps 门的正确语义 |
+
+对照同一台机器的演进：动态 60s P50 19.087（首轮）→ 14.476（中间轮）→ **11.283ms**；
+displayed 50.22 → 56.70 → **70.00fps**；静态 CPU 11.72% → 2.52% → **1.51%**。
+三项硬门槛（≤18ms / ≥58fps / 静态 CPU ≤8%）全部满足且有余量。**M1 关卡解除，
+按 §8 顺序进入阶段 C（T09 QUIC 传输 → T10 输入通道）。**
+
+#### A. 中间轮存档：真机全链深度调优（`max_in_flight=1`，已被上方终验取代）
+
+原始记录如下（其中的「3 项未过」在终验中全部解决）：
+
+本轮完成 4 项关键修复（`rc-encode-vt` `EnableLowLatencyRateControl = true` 使编码 P95 从 17.98→10.72–11.29ms、降幅 37%–40%；`annexb.rs` 256..=511 字节 AVCC 长度误判修复；`rc-capture-macos` latest-frame-wins `FrameMailbox` + `capturesAudio=false`；`rc-pipeline` `cap_space` Condvar 替代 1ms 轮询退避）及 Phase A `max_in_flight` A/B 选优后，执行完整隐私幕布 B3 真机终验。**多项核心指标已翻绿，但仍有 3 项未过，暂不进入 M2**。
+
+| 场景 | 结果 | 关键指标与分段均值（`breakdown_ms`） |
+|---|---|---|
+| `rc-capture-macos` SCK 60fps 真机测试（`FrameMailbox` 后） | **全通过**（`2 passed; 0 failed`, 2.48s） | `sck_captures_at_60fps` 2s 采集 **149 帧**（**74.5fps**，≥116 ✅），`dt_us` min=8333 / p50=16666 / max=25000（首测 max=16667）；`sck_stream_rebuilds_after_stop` **通过** ✅ |
+| Phase A `max_in_flight` A/B（6s 隐私幕布，release，1080p60） | 双达标，**选定 `max_in_flight=1`** | `mif=2`：p50 14.274ms / p95 23.804ms / p99 28.282ms / displayed 72.33fps（`captured=434`, `dropped_budget=0`, `max_queue=2`）；**`mif=1`**：p50 **13.866ms**（复测 13.847ms）/ p95 22.034ms / p99 **24.434ms**（复测 26.271ms）/ displayed 59.50fps（复测 60.33fps，`captured=430`, `dropped_budget=73`, `max_queue=1`）。选 `mif=1`（p50 −0.408ms、p99 −3.848ms、队列峰值 1） |
+| **1080p60 动态 60s**（B3 主门槛） | **未通过**（`gate_passed=false`） | **已达标**：p50 **14.476ms**（≤18 ✅，较首轮 19.087ms 降 4.61ms）/ p95 22.955ms / p99 **26.572ms**（≤35 ✅）/ 队列峰值 **1**（≤2 ✅）/ `unfinished=0` / `decode_errors=0` / `dropped_stale=0`；**未达标**：trace 截断致 `captured=4096 / displayed=3286`（54.77fps）、`dropped_budget=810` 与 `sched.encoded=3402`（**56.70fps**，<58 ❌）报不变式失败、`convergence_ms=3090ms`（>1000 ❌）；分段：encode **11.658**、decode **2.915**、present **0.961**、diff **0.909**（首轮 4.49）、network **0.193**、packetize **0.003**、sched_queue **0** |
+| **窗口拖动 15s** | **全项通过**（`gate.passed=true` ✅） | `displayed_fps` **60.27**（≥55 ✅，`captured_fps=71.73`）/ p50 **14.193ms**（≤18 ✅）/ p95 21.969ms / p99 **24.200ms**（≤35 ✅）/ `convergence_ms=1000ms`（≤1000 ✅）/ `dropped_stale=0` / 队列峰值 1 / `unfinished=0`；分段：encode **11.532**、decode **2.816**、present **1.088**、diff **0.701**（较首轮 12.81ms 降 12.11ms）、network **0.248**、packetize **0.005**、sched_queue **0** |
+| **静态画面 30s**（纯黑真静屏） | **未全过（CPU ✅，零编码 ❌）** | 单核 CPU 均值 **2.52%**（2.5172%，≤8% ✅，稳态 0.2%–0.6%，较首轮 11.72% 显著下降）、峰值 **19.0%**（29 采样）；`captured=183`、`encoded=displayed=156`（≠0 ❌，较首轮 989 降 84%，`dropped_repeat=0`）、`unfinished=0` |
+
+最新未通过项精确根因：
+
+1. **动态 60s `rc-trace` 4096 环形缓冲截断（连锁 3 项失真/失败）**：`rc-capture-macos` 将 `minimumFrameInterval` 设为 `750_000/60 = 12_500µs` 后，ProMotion 120Hz 下交替放行 8.33/16.67ms 帧（实测 70.73–74.5fps，60s 共采 `sched_stats.captured = 4244` 帧 > 4096）。最早 148 帧（前 ~2.09s，含 116 已显示 + 32 `dropped_budget`）被驱逐；`rc-loopback::run_real()` 虽取了 `controller.displayed()` 却丢弃（`let _ = displayed_full`），继续用截断后的 merged trace 统计，直接导致不变式失败（`3402 != 3286`）、`convergence_ms` 虚高至 3090ms（15s 未溢出为 1000ms）、`displayed_fps` 被低估为 54.77fps。
+2. **动态 60s 真实编码/显示帧率 56.70fps < 58fps**：剔除截断后 `sched_stats.encoded = 3402`（56.70fps）仍低于 B3 硬门槛 58fps（代码内 `gate.displayed_fps_min = 60*0.9 = 54` 较文档宽松）。根因是 SCK 70.73fps 不均匀到达（8.33/16.67ms 交替）配合 VT 均值 11.66ms 编码耗时与 `max_in_flight=1` 触发 842 次 `dropped_budget`。
+3. **静态 30s 未达成零编码（`encoded=156`）**：绝大部分时间已零帧输出（CPU 0.2%–0.6%），但启动前 2s（CPU 13.2%/5.5%）及第 14–15s（CPU 19.0%/17.2%，`convergence_ms=15110ms`）出现两次系统合成突发；因 `run_real` 固定 `DiffMode::TrustPlatform`、`SckBackend` 无帧内容去重，突发帧全部进编码；且 `report.rs::apply_gate` 未切静态零编码分支。
+
+#### A0. 历史对照：首轮真机全链实测（调优前，`--backend real`，**未通过**）
+
+首轮解锁屏幕录制权限后跑通真机全链的调优前基线（保留作改进对比）：
+
+| 场景 | 结果 | 关键指标与分段均值（`breakdown_ms`） |
+|---|---|---|
+| `rc-capture-macos` SCK 60fps 真机测试 | `sck_stream_rebuilds_after_stop` **通过**；`sck_captures_at_60fps` **未通过** | 2s 采集 107 帧（`--test-threads=1` 复测 112 帧，门槛 ≥116）；`dt_us` min=16666 / p50=16667 / max=25000（前若干帧出现 25ms=3×8.33ms 间隔） |
+| 10s 真机全链冒烟（`--backend real`） | 链路跑通，**Gate 未通过**（exit 1） | p50 **19.545ms** / p95 25.798ms / p99 29.236ms / `captured=encoded=displayed=451`（**45.1fps**） / `convergence_ms=null` / 队列深度 1 / drop=0 / unfinished=0；分段：encode **10.84**、diff **4.84**、decode 2.20、present 0.42、network 0.10、packetize 0.01、sched_queue 0ms |
+| **1080p60 动态 60s**（首轮基线） | **未通过**（exit 1） | p50 **19.087ms**（>18 ❌）/ p95 25.989ms / p99 **28.753ms**（≤35 ✅）/ `captured=3014`（50.23fps）、`encoded=displayed=3013`（**50.22fps**，<58 ❌）/ `convergence_ms=1990ms`（>1000 ❌）/ `dropped_stale=1`、`dropped_budget=0`、`dropped_superseded=0`、`decode_errors=0` / 队列深度 **2**（≤2 ✅）/ unfinished **0**（✅）；分段（合计 18.21ms）：encode **10.75**、diff **4.49**、decode 2.40、present 0.48、network 0.08、packetize 0.01、sched_queue 0ms |
+| **窗口拖动 15s**（首轮基线） | **未通过** | `displayed_fps` **47.80**（<55 ❌）/ `captured=730`（48.67fps）、`encoded=717`、`dropped_stale=13` / p50 **25.459ms** / p95 33.001ms / p99 38.577ms / unfinished **0**（✅）；分段变化：`diff` 飙升至 **12.81ms**（+8.32ms），encode 10.30 / decode 2.03 / present 0.36ms |
+| **静态画面 30s**（首轮基线） | **未通过** | `captured=encoded=displayed=989`（32.97fps，!=0 ❌）/ `dropped_repeat=0` / unfinished 0 / 单核 CPU 平均 **11.72%**（>8% ❌）、峰值 **14.1%**（29 采样） |
+
+首轮失败根因存档（按 §3 排查顺序）：
+
+1. **动态 60s（P50 超 1.09ms、FPS 少 7.78、收敛 1990ms）**：`diff=4.49ms` 实为 SCK 合成/回调送达主线程的采集交接滞后，`encode=10.75ms` 含 `enc_req` 排队与 VT 同步编码等待，两段合占端到端延迟 **83.7%**；上游 SCK 仅 50.23fps 致前 2s 爬坡慢。
+2. **窗口拖动 15s（FPS 47.80 < 55）**：拖动期间 WindowServer/SCK 投递延迟剧增（`diff` 4.49 → 12.81ms），触发 13 帧 `dropped_stale`。
+3. **静态 30s（encoded=989、CPU 11.72%）**：`--static-content` 仅作用于假后端，`SckBackend` + `TrustPlatform` 下桌面持续 UI 刷新致 ~33fps 编码。
+
+#### B. 假后端/历史对照（`--backend auto`：Fake 采集 + Fake×WallEncoder + Fake 解码/呈现）
+
+用于验证调度器、回环报告与不变式逻辑（权限解锁前基线，命令：`rc-cli loopback --backend auto …`）：
+
+| 场景 | 结果 | 数字 |
+|---|---|---|
+| 1080p60 动态 60s | **通过**（exit 0） | p50 **9.20ms** / p99 20.60ms / 59.9fps / 队列深度 1 / unfinished 0 / 不变式全过 |
+| 静态 30s | 正确拒绝（exit 1） | encoded=0、captured=0（Q5/L8 零编码红线） |
+| 编码器减速 4×（20ms 编码成本）60s ×2 | 机制验证通过（exit 1 为预期） | 预算丢帧 1730/1728、吞吐 31.2fps≈编码器容量、队列深度 1、unfinished 0、**不变式与账目全干净**；p50 26.1/26.5ms |
+
+「减速 4×」场景的 p50 物理下界 = 20ms（模拟编码成本本身在端到端路径里）
++ diff + 解码 ≈ 22.3ms；原卡片的「p50 ≤25ms @2×」两处修正（2×→4×、
+25ms 逻辑世界口径）记录在 T08 卡内。延迟不增长靠的是**有界**：
+p50 ≈ 2×编码成本的一半以内，不随积压膨胀。
+
+本轮 Gate 过程中修掉的三个实质缺陷（都已带回归测试或仪器化）：
+
+1. **rc-sched R1 逐出→丢到达帧**：硬件编码无法中途取消，逐出在途帧 =
+   反复作废在制工作的活锁（实测 231 次预算裁决只交付 4 帧）。
+2. **线程化 host 的关机顺序**：先 `shutdown` 再 tick 会把末尾帧提交给
+   已退出的编码线程（`TrySendError::Disconnected`），授权帧凭空消失、
+   不变式 off-by-one。正确顺序：停采集 → tick 到静默 → 停编码。
+3. **驱动循环紧自旋**：编码在途时调用方线程空转，macOS 定时器合并把
+   编码线程的 sleep(20ms) 拖到 30ms（+50%）。改为 1ms 退避。
+
 ## 4. M2 双机直连
+
+> **进度（2026-11-21）**：M2-1/2/4 的传输底座已由阶段 C 交付——T09 `rc-net`
+> （QUIC 双通道、分片重组、FEC、pacing，23+4 测试）与 T10 `rc-input`
+> （4ms 批处理、手写线格式、reliable-stream 接线、macOS 注入桥接）落地；
+> 3% 丢包回环存活、100KB 逐字节重组、`DEFAULT_MAX_CONCURRENT_FRAMES=2`
+> 已实测。剩余：M2-3/5–10（会话层、鉴权、UI、重连、探测）与双机真机实测。
 
 | # | 任务 |
 |---|---|

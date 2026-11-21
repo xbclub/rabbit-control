@@ -16,3 +16,6 @@ junit.xml
 
 # 本地环境
 .env
+
+# ZCode workflow 草稿（机器自有，不进库）
+.zcode/
