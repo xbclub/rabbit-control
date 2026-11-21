@@ -1,0 +1,36 @@
+[package]
+name = "rc-input-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl macOS 输入：CGEvent 注入 + 捕获（T12）。"
+
+[dependencies]
+# 错误枚举与 rc-types 同一风格（见 src/error.rs）。本 crate 自身的错误
+# 不经 rc-types：rc-types 目前没有输入事件/输入权限类型可用（强加只会
+# 是假依赖）。
+thiserror = "1"
+# T10 适配层：bridge 实现 rc-input 的 InputInjector trait（trait 签名用
+# rc-types 的 Result），scancode 表与 rc-input 的修饰键扫描码常量互锁。
+# 二者均为跨平台纯 Rust，不影响本 crate 在非 macOS 目标上构建。
+rc-input = { path = "../rc-input" }
+rc-types = { path = "../rc-types" }
+
+# 平台依赖全部 gate 在 macOS 上：事件/键表/翻译层是纯数据纯函数，
+# 非 macOS 目标本 crate 仍可编译测试；CGEvent 相关模块只在 macOS 存在。
+# 版本与 rc-capture-macos 保持同一线（0.24）；highsierra feature 打开
+# CGEventCreateScrollWheelEvent2 的安全包装（CGEvent::new_scroll_event）。
+# core-foundation：捕获侧驱动 CGEventTap 的 CFRunLoop（core-graphics
+# 0.24 的同一依赖线，直接声明以使用其 runloop/mach_port 安全包装）。
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.24", features = ["highsierra"] }
+core-foundation = "0.10"
+# 仅为 kCFRunLoopDefaultMode / kCFRunLoopCommonModes 两个 CF 常量
+# （core-foundation 0.10 的 runloop 常量定义在 -sys 里）。
+core-foundation-sys = "0.8"
+
+# 真机回环测试（capture_inject_loopback_real_machine）需要 rc-net 的
+# Transport trait 做回环 mock。
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+rc-net = { path = "../rc-net" }

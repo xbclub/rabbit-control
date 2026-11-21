@@ -1,0 +1,14 @@
+[package]
+name = "rc-input"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl 输入通道核心：事件类型、批处理、手写线格式（T10）。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+# 输入通道接线（I1）：rc-net 的 reliable stream。rc-net 在 Transport 内部
+# 用 u32 LE 长度前缀自行成帧并按消息边界交付（NetEvent::Reliable），本
+# crate 的 u16 消息前缀叠加其上，见 src/channel.rs 的接线说明。
+rc-net = { path = "../rc-net" }

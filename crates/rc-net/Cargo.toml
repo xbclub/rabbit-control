@@ -1,0 +1,26 @@
+[package]
+name = "rc-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QUIC 传输层：datagram 媒体 + reliable 控制双通道、分片重组、FEC 集成与 pacing。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+rc-proto = { path = "../rc-proto" }
+rc-fec = { path = "../rc-fec" }
+rc-trace = { path = "../rc-trace" }
+# quinn：不用默认的 tokio runtime（会拖进整套 tokio），改用 smol runtime——
+# 它的 driver 跑在自带的的后台线程上，端点无需外部 block_on 即可自驱，
+# 这正是同步 Transport trait 嵌入 quinn 的最省事方式（坑 5）。
+# rustls-ring：只用 ring 一个 CryptoProvider，避免多 provider 并存时需要全局安装默认。
+quinn = { version = "0.11", default-features = false, features = ["runtime-smol", "rustls-ring", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+# quinn 的 send_datagram 直接吃 bytes::Bytes，需要显式依赖来命名该类型
+bytes = "1"
+
+[dev-dependencies]
+# 集成测试里的丢包注入用与 rc-loopback DamageInjector 相同的 StdRng 语义
+rand = "0.8"

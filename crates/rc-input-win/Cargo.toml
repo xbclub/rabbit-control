@@ -1,0 +1,14 @@
+[package]
+name = "rc-input-win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl Windows 输入骨架：SendInput / 低层钩子（真机实现属 D 阶段）。"
+
+# 平台裁决（TASK.md §6，2026-11-20）：Windows 任务降为 P1。本 crate 只放
+# cfg(windows) 骨架（声明 + TODO），在 macOS/Linux 上编译为空，也不含任何
+# 会在非 Windows 上空过的测试——真机验证属 D 阶段。
+[dependencies]
+rc-input = { path = "../rc-input" }
+rc-types = { path = "../rc-types" }

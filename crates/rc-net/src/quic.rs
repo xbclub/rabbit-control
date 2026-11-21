@@ -1,0 +1,1382 @@
+//! `quinn` 封装：[`Transport`] 的 QUIC 实现。
+//!
+//! # async → 同步桥接（坑 5）
+//! 本项目的管线是同步模型，而 quinn 的接收侧（`read_datagram` / `RecvStream::read`）
+//! 是 async。桥接方式：
+//!
+//! - **端点自驱**：quinn 跑在 `runtime-smol` 上，driver 任务由 smol 全局执行器的
+//!   后台线程推进，不需要外部 `block_on` 事件循环；
+//! - **接收线程化**：每个连接三条专属 OS 线程（datagram / 控制 / urgent 流），
+//!   用本模块自带的 [`block_on`]（std 的 `Wake` + thread parking，无 unsafe）
+//!   独自等待各自的 future，结果经 `std::sync::mpsc` 汇入事件队列；
+//! - **发送不阻塞**：`send_datagram` 只入 pacing 队列，真正写 socket 由
+//!   发送线程按速率放行（N3）；控制流的 reliable 写用 [`block_on`] 直接
+//!   完成（QUIC 流控让它天然反压）；urgent（输入）流的写再进一层专职
+//!   写线程的入队口——connection 级流控窗口被控制流占满时，被挡住的
+//!   是写线程而不是输入的调用方（见 [`Transport::send_reliable_urgent`]）。
+//!
+//! 这样 [`Transport::poll`] 只剩「带超时地取事件」（N4），路径上没有任何
+//! 嵌套 runtime 或 `Future` 暴露给调用方。
+//!
+//! # 通道语义（N1）
+//! - 媒体：QUIC datagram（RFC 9221），丢包不重传；
+//! - 控制：一条双向 reliable 流，消息以 4 字节小端长度前缀成帧，
+//!   边界明确、顺序保证；
+//! - 输入：**独立的第二条**双向 reliable 流（urgent），同样的长度前缀成帧，
+//!   叠加 quinn stream priority（[`URGENT_STREAM_PRIORITY`]）——两条流的
+//!   已缓冲数据竞争发送时输入字节先出，控制流大流量不挡输入。
+//!
+//! 两条流的角色按 **QUIC 流 ID 序号**判定（先打开的 = 控制流），与
+//! `accept_bi` 的交付顺序无关——弱网重传可能颠倒交付顺序（见
+//! [`control_is_first`]）。urgent 的发送入队口是**有界**通道
+//! （[`URGENT_QUEUE_CAPACITY`]），满队即报错，不无界堆积。
+//!
+//! # 丢包估计（N8）
+//! 接收侧的帧到达跟踪（[`ArrivalTracker`]）按 `packet_idx` 去重记录
+//! 分片到达；帧凑齐立即结案，未凑齐的帧在 500ms（[`TRACK_STALE_US`]，
+//! 对齐重组层放弃线）后**主动结算**成 arrival / nack 计数。因此
+//! `stats().loss_rate` 在真实丢包开始后几秒内就有读数——FEC 的冗余率
+//! 与拥塞控制靠它行动，失真等于瞎眼。
+//!
+//! # datagram 启用与尺寸（坑 1 / 坑 2 / N2）
+//! quinn 里 datagram 的「接收开关」与「尺寸协商」是同一个旋钮：
+//! `TransportConfig::datagram_receive_buffer_size(Some(n))`——非 0 才会收
+//! datagram，同时把 `max_datagram_frame_size = min(n, u16::MAX)` 协商给对端。
+//! 两端的 [`transport_config`] 都设置了它。应用层的尺寸纪律由
+//! [`QUIC_OVERHEAD`] 预算强制：单个数据报（含 `rc-proto` 包头）≤ `mtu - 48`。
+
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use rc_proto::{MediaHeader, HEADER_LEN};
+use rc_trace::{Mark, Outcome, TraceCollector, TraceSummary};
+use rc_types::{Error, FrameSeq, Result, Timestamp};
+
+use crate::pacer::Pacer;
+use crate::reassemble::FRAME_STALE_US;
+use crate::stats::LossEstimator;
+use crate::{NetConfig, NetEvent, NetStats, Role, Transport};
+
+/// QUIC 包头 + 加密 + AEAD 的每包固定开销预算（字节）。
+///
+/// 单个应用数据报不得超过 `mtu - QUIC_OVERHEAD`（N2）：QUIC datagram
+/// 不能跨包，超限要么被拒收要么触发 IP 分片——丢一等于丢全。
+pub const QUIC_OVERHEAD: usize = 48;
+
+/// 默认路径 MTU 预算（字节）。1200 是 QUIC 保证不分片的最小值。
+pub const DEFAULT_MTU: usize = 1200;
+
+/// pacing 初始速率（bps）。M3 之前不做自定义拥塞控制，这个值只用于
+/// 削平突发；之后由拥塞控制经 [`QuicTransport::set_pacing_rate`] 驱动。
+pub const DEFAULT_INITIAL_PACING_BPS: u64 = 50_000_000;
+
+/// ALPN 协议标识。两端不一致则握手失败（防误连）。
+pub const ALPN: &[u8] = b"rabbitcontrol/1";
+
+/// urgent（输入）流的 quinn stream priority。
+///
+/// quinn 语义：本地已缓冲数据按 priority 从高到低发送。控制流保持默认
+/// 0，urgent 流设 1——两条流竞争同一个拥塞窗口时，输入字节先出。
+/// 这是独立流之上的叠加优化：不设它，独立流本身也已消除队头阻塞。
+pub const URGENT_STREAM_PRIORITY: i32 = 1;
+
+/// datagram 收发缓冲（字节）。非 0 = 启用 datagram（坑 1）。
+const DATAGRAM_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// 空闲超时。迁移 / 对端卡顿期间靠 keep-alive 维持（N9）。
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 发送线程空闲时的最长睡眠（有新包入队会被 condvar 唤醒）。
+const WORKER_IDLE_WAIT: Duration = Duration::from_millis(50);
+
+/// 单条 reliable 消息的长度上限（长度前缀是 u32，必须设界防恶意长度）。
+const MAX_RELIABLE_MSG: usize = 4 * 1024 * 1024;
+
+/// 丢包估计的帧跟踪表上限：超过后按帧序号窗口强制结算最老一批。
+/// 正常流量在 [`TRACK_STALE_US`] 的主动结算下根本到不了上限——
+/// 500ms 内同时挂着 4096 个未凑齐帧需要 >8000fps 的异常/恶意流量。
+const RECV_TRACK_LIMIT: usize = 4096;
+
+/// 帧到达跟踪的结算超时：与重组层的放弃线 [`FRAME_STALE_US`]
+/// （500ms）同一条线。超过仍未凑齐的帧按「实到 / 缺失」主动结算进
+/// [`LossEstimator`]——**不等**跟踪表攒满上限。
+const TRACK_STALE_US: u32 = FRAME_STALE_US;
+
+/// urgent（输入）入队口的容量（有界通道，防消费侧卡顿时高频输入无界堆积）。
+///
+/// 满队策略是**向调用方返回错误**，而不是静默丢弃或无界堆积：rc-net
+/// 不理解输入消息的语义（哪条是可丢的移动事件、哪条是不可丢的按键），
+/// 丢弃 / 合并的决策留给持有输入语义的上层（rc-input / rc-pipeline）。
+/// 64 条对键鼠事件是数秒的缓冲余量，连这也填满即视为消费侧已卡死，
+/// 上层应当降频或合并移动类事件后重试。
+const URGENT_QUEUE_CAPACITY: usize = 64;
+
+/// 在 `mtu` 预算下，单个媒体分片可承载的最大负载（字节）。
+///
+/// 数据报 = 32 字节包头 + 媒体片 ≤ `mtu - QUIC_OVERHEAD`（N2），
+/// 所以媒体片 ≤ `mtu - QUIC_OVERHEAD - 32`。默认 1200 → 1120。
+pub const fn max_media_payload(mtu: usize) -> usize {
+    mtu.saturating_sub(QUIC_OVERHEAD + HEADER_LEN)
+}
+
+/// 加 FEC 时的媒体分片预算（字节）：比 [`max_media_payload`] 再留一个包头。
+///
+/// XOR 冗余包的负载 = 组内最长数据报（头 + 媒体片），它自己还要再带一个
+/// 32 字节包头。不留这份预算，冗余包就会超出 N2 上限——本卡的实测教训。
+pub const fn max_media_payload_with_fec(mtu: usize) -> usize {
+    mtu.saturating_sub(QUIC_OVERHEAD + 2 * HEADER_LEN)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// TLS 身份
+// ─────────────────────────────────────────────────────────────────
+
+/// 一端的 TLS 身份（证书链 + 私钥）。
+///
+/// 本卡不做证书体系（那是 M5 的会话层职责）：测试与内网场景用
+/// 自签证书 + 客户端固定信任（`connect` 的 `server_certs` 参数）。
+#[derive(Debug)]
+pub struct Identity {
+    cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+impl Identity {
+    /// 从 PEM 文本构造（证书链 + 私钥）。
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self> {
+        let cert_chain: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .collect::<std::result::Result<_, std::io::Error>>()
+            .map_err(|e| Error::InvalidConfig(format!("cert pem: {e}")))?;
+        if cert_chain.is_empty() {
+            return Err(Error::InvalidConfig(
+                "cert pem contains no certificates".into(),
+            ));
+        }
+        let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+            .map_err(|e| Error::InvalidConfig(format!("key pem: {e}")))?
+            .ok_or_else(|| Error::InvalidConfig("key pem contains no private key".into()))?;
+        Ok(Self { cert_chain, key })
+    }
+
+    /// 只解析证书链（客户端固定信任用）。
+    pub fn certs_from_pem(
+        cert_pem: &str,
+    ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+        rustls_pemfile::certs(&mut cert_pem.as_bytes())
+            .collect::<std::result::Result<_, std::io::Error>>()
+            .map_err(|e| Error::InvalidConfig(format!("cert pem: {e}")))
+    }
+
+    /// 证书链（DER）。
+    pub fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
+        &self.cert_chain
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 端点
+// ─────────────────────────────────────────────────────────────────
+
+/// QUIC 端点：绑定本地端口，可发起（Controller）或接受（Host）连接。
+///
+/// 一个端点可以同时做两件事（QUIC 天然支持）；本卡的用法是
+/// Host `accept`、Controller `connect`。
+pub struct QuicEndpoint {
+    endpoint: quinn::Endpoint,
+    mtu: usize,
+    role: Role,
+}
+
+impl QuicEndpoint {
+    /// 绑定并监听。`identity` 是本端作为服务端时的证书与私钥。
+    pub fn new(cfg: &NetConfig, identity: &Identity) -> Result<Self> {
+        validate_mtu(cfg.mtu)?;
+        let socket = UdpSocket::bind(cfg.local_addr)
+            .map_err(|e| Error::Network(format!("bind {}: {e}", cfg.local_addr)))?;
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| Error::InvalidConfig(format!("tls versions: {e}")))?
+            .with_no_client_auth()
+            .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())
+            .map_err(|e| Error::InvalidConfig(format!("server cert: {e}")))?;
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
+            .map_err(|e| Error::InvalidConfig(format!("quic server crypto: {e}")))?;
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+        server_config
+            .migration(true) // N9：允许连接迁移
+            .transport_config(transport_config());
+
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::SmolRuntime),
+        )
+        .map_err(|e| Error::Network(format!("endpoint: {e}")))?;
+
+        Ok(Self {
+            endpoint,
+            mtu: cfg.mtu,
+            role: cfg.role,
+        })
+    }
+
+    /// 实际绑定的本地地址（端口填 0 时由此得知）。
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.endpoint
+            .local_addr()
+            .map_err(|e| Error::Network(format!("local_addr: {e}")))
+    }
+
+    /// 本端配置角色（诊断用）。
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// 作为 Controller 连接对端（阻塞至握手完成或超时）。
+    ///
+    /// `server_certs` 是固定信任的服务端证书链（自签场景直接给对端证书）。
+    /// `server_name` 必须与证书 SAN 匹配（自签证书生成时要带上）。
+    pub fn connect(
+        &self,
+        peer: SocketAddr,
+        server_certs: &[rustls::pki_types::CertificateDer<'static>],
+        server_name: &str,
+        timeout: Duration,
+    ) -> Result<QuicTransport> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidConfig("connect timeout overflow".into()))?;
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut roots = rustls::RootCertStore::empty();
+        for c in server_certs {
+            roots
+                .add(c.clone())
+                .map_err(|e| Error::InvalidConfig(format!("trust cert: {e}")))?;
+        }
+        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| Error::InvalidConfig(format!("tls versions: {e}")))?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+
+        let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
+            .map_err(|e| Error::InvalidConfig(format!("quic client crypto: {e}")))?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client));
+        client_config.transport_config(transport_config());
+
+        let connecting = self
+            .endpoint
+            .connect_with(client_config, peer, server_name)
+            .map_err(|e| Error::Network(format!("connect: {e}")))?;
+
+        let conn = block_on_deadline(connecting, deadline, || Error::Timeout(timeout))
+            .and_then(|r| r.map_err(|e| Error::Network(format!("handshake: {e}"))))?;
+        // 连接发起方打开两条 reliable 双向流（先控制、后 urgent），各自写入
+        // 一条长度为 0 的引导消息：QUIC 的流是「隐式打开」的——不写数据，
+        // 对端的 accept_bi 永远看不到这个流（open_bi 只是本地动作）。
+        // 打开顺序即角色（open_bi 的流 ID 单调递增），与到达顺序无关。
+        let control = open_bootstrap_stream(&conn, deadline, timeout)?;
+        let urgent = open_bootstrap_stream(&conn, deadline, timeout)?;
+        // 输入流优先级高于控制流（叠加优化，见 URGENT_STREAM_PRIORITY）。
+        // 流此刻必然存活，失败也无害：真正的发送错误由后续写操作上报。
+        let _ = urgent.send.set_priority(URGENT_STREAM_PRIORITY);
+        QuicTransport::new(conn, control, urgent, self.mtu)
+    }
+
+    /// 作为 Host 等待并接受一个连接（阻塞至握手完成或超时）。
+    pub fn accept(&self, timeout: Duration) -> Result<QuicTransport> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidConfig("accept timeout overflow".into()))?;
+
+        let incoming =
+            block_on_deadline(self.endpoint.accept(), deadline, || Error::Timeout(timeout))?
+                .ok_or_else(|| Error::Network("endpoint stopped before accept".into()))?;
+        // Incoming → Connecting：0.11.12 里 Incoming 本身不是 Future。
+        let connecting = incoming
+            .accept()
+            .map_err(|e| Error::Network(format!("accept: {e}")))?;
+        let conn = block_on_deadline(connecting, deadline, || Error::Timeout(timeout))
+            .and_then(|r| r.map_err(|e| Error::Network(format!("handshake: {e}"))))?;
+        // 接受对端打开的两条 reliable 双向流。**角色按流 ID 序号判定**
+        // （先打开的 = control、后打开的 = urgent，见 [`control_is_first`]）：
+        // 弱网丢包重传会让 accept_bi 的交付顺序与打开顺序颠倒，按到达
+        // 顺序分配角色会让两条流静默互换（输入进了控制流、控制进了
+        // 输入流）——流 ID 是打开顺序的权威记录，不受乱序影响。
+        let first = accept_stream(&conn, deadline, timeout)?;
+        let second = accept_stream(&conn, deadline, timeout)?;
+        let (control, urgent) = order_by_stream_index(first, second)?;
+        let _ = urgent.send.set_priority(URGENT_STREAM_PRIORITY);
+        QuicTransport::new(conn, control, urgent, self.mtu)
+    }
+
+    /// 迁移到新的 UDP socket（N9：模拟 NAT rebinding 的路径迁移）。
+    ///
+    /// 影响本端点上的所有活动连接：连接 ID 不变，对端凭 ID 识别并跟随
+    /// 新地址（服务端需允许迁移，[`QuicEndpoint::new`] 已开启）。对端
+    /// 观察到地址变化后会上报 [`NetEvent::PathChanged`]。
+    pub fn rebind(&self, socket: UdpSocket) -> Result<()> {
+        self.endpoint
+            .rebind(socket)
+            .map_err(|e| Error::Network(format!("rebind: {e}")))
+    }
+}
+
+/// 一条 reliable 双向流（发送 + 接收两半）。
+///
+/// 把两半收进一个小结构体，让 [`QuicTransport::new`] 的参数列表保持在
+/// clippy 限度内（项目纪律：不用 `allow` 掩盖参数过多）。
+struct ReliableStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+}
+
+impl ReliableStream {
+    /// 流 ID 序号（quinn `StreamId::index()`，同一发起方按打开顺序递增）：
+    /// 两条流谁承载控制、谁承载输入，以此判定（与到达顺序无关）。
+    fn index(&self) -> u64 {
+        self.recv.id().index()
+    }
+}
+
+/// 流角色判定的纯核心：两个流 ID 序号中，**小者（先打开的）承载控制流**，
+/// 大者承载 urgent（输入）流。
+///
+/// 返回 `Some(true)` = `a` 是控制流；`Some(false)` = `b` 是控制流；
+/// 序号相等（同一条流被接受两次，协议异常）返回 `None`。
+///
+/// 为什么不看 accept_bi 的交付顺序：QUIC 只保证同一连接内帧的可靠性，
+/// 不保证不同流的「可见顺序」——携带先开流 STREAM 帧的包丢了要重传，
+/// 后开流可能先被交付。流 ID 序号是打开顺序的权威记录。
+fn control_is_first(a: u64, b: u64) -> Option<bool> {
+    (a != b).then_some(a < b)
+}
+
+/// 按 [`control_is_first`] 把两条已接受的流排成 `(control, urgent)`。
+fn order_by_stream_index(
+    a: ReliableStream,
+    b: ReliableStream,
+) -> Result<(ReliableStream, ReliableStream)> {
+    match control_is_first(a.index(), b.index()) {
+        Some(true) => Ok((a, b)),
+        Some(false) => Ok((b, a)),
+        None => Err(Error::Network(format!(
+            "accepted the same stream twice (id index {})",
+            a.index()
+        ))),
+    }
+}
+
+/// 打开一条 reliable 双向流并写入 0 长度引导消息（让对端 accept_bi 可见）。
+fn open_bootstrap_stream(
+    conn: &quinn::Connection,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<ReliableStream> {
+    let (mut send, recv) = block_on_deadline(conn.open_bi(), deadline, || Error::Timeout(timeout))
+        .and_then(|r| r.map_err(|e| Error::Network(format!("open stream: {e}"))))?;
+    block_on(send.write_all(&0u32.to_le_bytes()))
+        .map_err(|e| Error::Network(format!("stream bootstrap: {e}")))?;
+    Ok(ReliableStream { send, recv })
+}
+
+/// 等待并接受一条对端打开的 reliable 双向流。
+fn accept_stream(
+    conn: &quinn::Connection,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<ReliableStream> {
+    let (send, recv) = block_on_deadline(conn.accept_bi(), deadline, || Error::Timeout(timeout))
+        .and_then(|r| r.map_err(|e| Error::Network(format!("open stream: {e}"))))?;
+    Ok(ReliableStream { send, recv })
+}
+
+/// 校验 `mtu` 预算：至少要装得下一个 QUIC 开销 + 媒体包头 + 1 字节负载。
+fn validate_mtu(mtu: usize) -> Result<()> {
+    if mtu <= QUIC_OVERHEAD + HEADER_LEN {
+        return Err(Error::InvalidConfig(format!(
+            "mtu {mtu} too small: need > {} (QUIC overhead + media header)",
+            QUIC_OVERHEAD + HEADER_LEN
+        )));
+    }
+    Ok(())
+}
+
+/// 两端一致的 [`quinn::TransportConfig`]。
+///
+/// datagram 缓冲非 0 是「能收 datagram」的前提，同时把尺寸上限协商给
+/// 对端（坑 1 / 坑 2）；keep-alive + 空闲超时配合，迁移或短暂丢包
+/// 不会断连（N9）。
+fn transport_config() -> Arc<quinn::TransportConfig> {
+    let mut tc = quinn::TransportConfig::default();
+    tc.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER_BYTES));
+    tc.datagram_send_buffer_size(DATAGRAM_BUFFER_BYTES);
+    tc.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    tc.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(IDLE_TIMEOUT).expect("30s fits in VarInt idle timeout"),
+    ));
+    Arc::new(tc)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 连接
+// ─────────────────────────────────────────────────────────────────
+
+/// 发送线程与 [`QuicTransport`] 共享的状态。
+struct Shared {
+    stop: AtomicBool,
+    conn: quinn::Connection,
+    /// pacing 队列（N3）。锁只被发送路径短持有。
+    pacer: Mutex<Pacer>,
+    pacer_cv: Condvar,
+    trace: Mutex<TraceCollector>,
+    session_start: Instant,
+    sent_bytes: AtomicU64,
+    recv_bytes: AtomicU64,
+    datagram_send_errors: AtomicU64,
+}
+
+/// `Transport` 的 QUIC 实现。
+///
+/// 构造途径只有 [`QuicEndpoint::connect`] / [`QuicEndpoint::accept`]。
+/// Drop 时关闭连接并回收三条后台线程。
+pub struct QuicTransport {
+    conn: quinn::Connection,
+    shared: Arc<Shared>,
+    events_rx: Receiver<NetEvent>,
+    /// 控制流的发送半边（单流，天然保序）
+    send_stream: quinn::SendStream,
+    /// urgent（输入）流的发送入队口：专职写线程持有流本体。
+    ///
+    /// 为什么 urgent 不直接 `write_all`：QUIC 的 connection 级流控窗口
+    /// 被所有流共享，控制流大流量会把连接信用占满，直接写会连本地
+    /// 缓冲都进不去、把调用方挡住。入队 + 专职写线程让
+    /// [`Transport::send_reliable_urgent`] 永不阻塞；写线程一旦拿到
+    /// 信用，priority 保证输入字节先于控制数据发出。
+    ///
+    /// 通道是**有界**的（容量 [`URGENT_QUEUE_CAPACITY`]）：消费侧卡顿时
+    /// 高频输入不得无界堆积，满队即向调用方报错（见
+    /// [`Transport::send_reliable_urgent`] 的实现）。`Option` 只为
+    /// [`Drop`] 里提前关闭（`take` 后写线程立即以 Disconnected 退出，
+    /// 不必多等一轮 50ms 的 recv_timeout）。
+    urgent_tx: Option<SyncSender<Vec<u8>>>,
+    /// 最近的远端地址（检测迁移 → `PathChanged`，N9）
+    last_remote: SocketAddr,
+    mtu: usize,
+    /// 丢包估计（N8）
+    loss: Mutex<LossEstimator>,
+    /// 接收侧的帧到达跟踪（按 packet_idx 去重 + 过期主动结算），喂 `loss`
+    recv_track: ArrivalTracker,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl QuicTransport {
+    fn new(
+        conn: quinn::Connection,
+        control: ReliableStream,
+        urgent: ReliableStream,
+        mtu: usize,
+    ) -> Result<Self> {
+        let ReliableStream {
+            send: send_stream,
+            recv: control_recv,
+        } = control;
+        let ReliableStream {
+            send: urgent_send,
+            recv: urgent_recv,
+        } = urgent;
+
+        let (tx, events_rx) = std::sync::mpsc::channel::<NetEvent>();
+        let shared = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            conn: conn.clone(),
+            pacer: Mutex::new(Pacer::new(DEFAULT_INITIAL_PACING_BPS)),
+            pacer_cv: Condvar::new(),
+            trace: Mutex::new(TraceCollector::new(4096)),
+            session_start: Instant::now(),
+            sent_bytes: AtomicU64::new(0),
+            recv_bytes: AtomicU64::new(0),
+            datagram_send_errors: AtomicU64::new(0),
+        });
+        let last_remote = conn.remote_address();
+
+        // 连接就绪事件排队，poll 首次调用即可见。
+        let _ = tx.send(NetEvent::Connected);
+
+        // urgent 专职写线程：吸收 connection 级流控的等待，让
+        // send_reliable_urgent 对调用方永不被控制流反压挡住。
+        // 入队口有界（URGENT_QUEUE_CAPACITY），满队策略见实现处文档。
+        let (urgent_tx, urgent_rx) =
+            std::sync::mpsc::sync_channel::<Vec<u8>>(URGENT_QUEUE_CAPACITY);
+
+        let threads = vec![
+            spawn_named("rc-net-datagram", {
+                let tx = tx.clone();
+                let shared = shared.clone();
+                let conn = conn.clone();
+                move || datagram_reader(conn, tx, shared)
+            }),
+            spawn_named("rc-net-stream", {
+                let tx = tx.clone();
+                let shared = shared.clone();
+                move || stream_reader(control_recv, tx, shared, false)
+            }),
+            spawn_named("rc-net-stream-urgent", {
+                let tx = tx.clone();
+                let shared = shared.clone();
+                move || stream_reader(urgent_recv, tx, shared, true)
+            }),
+            spawn_named("rc-net-urgent-writer", {
+                let shared = shared.clone();
+                move || urgent_writer(urgent_send, urgent_rx, shared)
+            }),
+            spawn_named("rc-net-pacer", {
+                let shared = shared.clone();
+                move || pacer_worker(shared)
+            }),
+        ];
+
+        Ok(Self {
+            conn,
+            shared,
+            events_rx,
+            send_stream,
+            urgent_tx: Some(urgent_tx),
+            last_remote,
+            mtu,
+            loss: Mutex::new(LossEstimator::new()),
+            recv_track: ArrivalTracker::new(),
+            threads,
+        })
+    }
+
+    /// 单个数据报的尺寸上限：`mtu` 预算与对端协商值取小（N2）。
+    fn max_datagram(&self) -> usize {
+        let budget = self.mtu.saturating_sub(QUIC_OVERHEAD);
+        match self.conn.max_datagram_size() {
+            Some(peer) => budget.min(peer),
+            None => budget,
+        }
+    }
+
+    /// 更新 pacing 速率（M3 的拥塞控制从这里接入）。
+    pub fn set_pacing_rate(&mut self, bps: u64) {
+        let mut p = self.shared.pacer.lock().expect("pacer");
+        p.set_rate(bps);
+    }
+
+    /// 埋点汇总（诊断导出）。
+    pub fn trace_summary(&self) -> TraceSummary {
+        self.shared.trace.lock().expect("trace").summary()
+    }
+
+    /// 上层把一帧的最终结局回报给传输层埋点（如重组层 gc 丢弃后记
+    /// `LostInNetwork`，N6）。不存在的帧会新建时间线——迟到回报好过缺失。
+    pub fn mark_frame_outcome(&self, seq: FrameSeq, outcome: Outcome) {
+        let mut tc = self.shared.trace.lock().expect("trace");
+        if let Some(t) = tc.get_mut(seq) {
+            t.finish(outcome);
+        } else {
+            tc.begin(seq).finish(outcome);
+        }
+    }
+
+    /// 会话相对微秒时钟。
+    ///
+    /// **故意**直接截断成 u32（不是 [`Timestamp::since`] 的饱和语义）：
+    /// 配合判定处的 [`u32::wrapping_sub`]，71.5 分钟的回绕点自动安全
+    /// （真实经过时间远小于回绕周期），8 小时 soak 不会把时钟冻结在
+    /// `u32::MAX` 上。
+    fn now_us(&self) -> u32 {
+        self.shared.session_start.elapsed().as_micros() as u32
+    }
+
+    /// 记录一个数据报事件到帧到达跟踪（丢包估计的输入）。
+    fn track_arrival(&mut self, datagram: &[u8], now_us: u32) {
+        let Ok(h) = MediaHeader::parse(datagram) else {
+            return; // 非媒体数据报不参与统计
+        };
+        if h.flags.is_parity() {
+            return; // 冗余分片不计到达（它兜底的是缺的那片）
+        }
+        let mut loss = self.loss.lock().expect("loss");
+        self.recv_track.observe(&h, now_us, &mut loss);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 帧到达跟踪（丢包估计的输入侧，N8）
+// ─────────────────────────────────────────────────────────────────
+
+/// 一个未结算帧的到达状态。
+struct TrackedFrame {
+    /// 应到分片数（首片包头声明的 `packet_cnt`，同一帧以首片为准）
+    expected: u16,
+    /// 已到的分片序号（**按 `packet_idx` 去重**：重复投递不重复计数）
+    seen: HashSet<u16>,
+    /// 首片到达时刻（微秒，调用方注入的时钟）
+    first_seen_us: u32,
+}
+
+/// 帧到达跟踪表：把「应到 / 实到」喂给 [`LossEstimator`]。
+///
+/// 修复的两处失真：
+/// - **主动结算**：未凑齐的帧在 [`TRACK_STALE_US`]（500ms，对齐重组层
+///   放弃线）后立即按「实到记 arrival、缺失记 nack」结算——不再等
+///   跟踪表攒满 [`RECV_TRACK_LIMIT`]。旧逻辑在 60fps / 3% 丢包下要
+///   30-60 分钟才首次产生 nack，期间 `stats().loss_rate` 恒 0.0，
+///   FEC 与拥塞控制全部失明；
+/// - **分片去重**：到达按 `packet_idx` 记录，重复投递同一分片不会
+///   把缺包帧误判完整（凑齐的判定因此可信）。
+///
+/// 时间由调用方注入（u32 微秒自然回绕，经过时间用 [`u32::wrapping_sub`]
+/// 计算，与重组层 [`crate::reassemble::FrameAssembler::gc`] 同一纪律）。
+struct ArrivalTracker {
+    /// 在途未结算帧，key = `frame_seq.0`
+    frames: HashMap<u64, TrackedFrame>,
+    /// 已结案（凑齐或结算缺失）的最大帧序号：**不在途**的更老帧的迟到
+    /// 分片直接忽略，否则已结案的帧会被迟到分片「复活」成一条假丢包
+    /// 记录。所有结案路径（凑齐 / `settle_one` / `evict_oldest`）都先
+    /// 把帧从在途表移除再推进本值，因此 [`ArrivalTracker::observe`] 中
+    /// 排在在途表查找**之后**的本拦截只命中真正已结案的帧——在途帧
+    /// 不受它影响（在途优先于结案拦截，与重组层同一纪律：乱序网络下
+    /// 更新的帧可能先结案，不得饿死仍在途的老帧）。
+    highest_retired: Option<u64>,
+}
+
+impl ArrivalTracker {
+    fn new() -> Self {
+        Self {
+            frames: HashMap::new(),
+            highest_retired: None,
+        }
+    }
+
+    /// 当前跟踪的未结算帧数（诊断 / 测试用）。
+    fn tracked_frames(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// 记录一个数据分片到达（冗余分片由调用方过滤）。
+    ///
+    /// 帧凑齐时立即全部记到达并结案；重复分片被忽略（不重复计数）。
+    ///
+    /// **在途优先于结案拦截**：先查在途表、再比对 `highest_retired`
+    /// （与重组层 [`crate::reassemble::FrameAssembler::insert_packet`]
+    /// 同一纪律）。乱序网络下单片帧（如 seq=10）可能抢在多片帧（如
+    /// seq=9）凑齐之前结案、把结案线推到更高——此时在途帧的剩余分片
+    /// 仍必须照常入账。若把结案拦截放在在途查找之前，seq=9 的最后
+    /// 一片会被 `9 <= 10` 直接吞掉，帧永远凑不齐，500ms 后被
+    /// [`ArrivalTracker::settle`] 结算成幻影丢包（loss_rate 虚高）。
+    fn observe(&mut self, h: &MediaHeader, now_us: u32, loss: &mut LossEstimator) {
+        let cnt = h.packet_cnt;
+        if cnt == 0 || h.packet_idx >= cnt {
+            return; // 非法头不参与统计（parse 已挡，双保险）
+        }
+        let seq = h.frame_seq.0;
+        if let Some(f) = self.frames.get_mut(&seq) {
+            // 仍在途的帧：分片照常入账，哪怕更新的帧已把结案线推到
+            // seq 之上（在途优先，见方法文档）。
+            // 同一帧的分片以首片的 expected 为准（协议保证一致）。
+            if !f.seen.insert(h.packet_idx) {
+                return; // 重复分片：缺包帧不得被判完整
+            }
+            if f.seen.len() >= f.expected as usize {
+                let f = self.frames.remove(&seq).expect("just borrowed");
+                loss.observe_arrival(f.expected as u64);
+                self.note_retired(seq);
+            }
+            return;
+        }
+        if self.highest_retired.is_some_and(|r| seq <= r) {
+            return; // 已结案且不在途的帧：迟到分片直接忽略
+        }
+        if cnt == 1 {
+            // 单片帧：首片即凑齐，无需进表。
+            loss.observe_arrival(1);
+            self.note_retired(seq);
+            return;
+        }
+        let mut seen = HashSet::with_capacity(4);
+        seen.insert(h.packet_idx);
+        self.frames.insert(
+            seq,
+            TrackedFrame {
+                expected: cnt,
+                seen,
+                first_seen_us: now_us,
+            },
+        );
+        // 上界保护：异常 / 恶意流量不得让跟踪表无限增长（与 N10 同一精神）。
+        if self.frames.len() > RECV_TRACK_LIMIT {
+            self.evict_oldest(loss);
+        }
+    }
+
+    /// 主动结算过期未凑齐帧：实到记 arrival、缺失记 nack。
+    ///
+    /// 每次事件循环都应调用（时间注入），这样丢包几秒内就反映进
+    /// `loss_rate`——FEC 的冗余率与拥塞控制据此行动。
+    fn settle(&mut self, now_us: u32, loss: &mut LossEstimator) {
+        if self.frames.is_empty() {
+            return;
+        }
+        let doomed: Vec<u64> = self
+            .frames
+            .iter()
+            .filter(|(_, f)| now_us.wrapping_sub(f.first_seen_us) > TRACK_STALE_US)
+            .map(|(s, _)| *s)
+            .collect();
+        for s in doomed {
+            self.settle_one(s, loss);
+        }
+    }
+
+    /// 结算单个帧（从表中移除并记账）。
+    fn settle_one(&mut self, seq: u64, loss: &mut LossEstimator) {
+        if let Some(f) = self.frames.remove(&seq) {
+            let arrived = f.seen.len() as u64;
+            loss.observe_arrival(arrived);
+            // 饱和防御：恶意的不一致包头（同帧不同 cnt）不得让缺失数为负。
+            loss.observe_nack((f.expected as u64).saturating_sub(arrived));
+            self.note_retired(seq);
+        }
+    }
+
+    /// 表超上限时的兜底：按帧序号窗口强制结算最老一批（防恶意增长）。
+    /// 正常流量在 500ms 主动结算下到不了上限。
+    fn evict_oldest(&mut self, loss: &mut LossEstimator) {
+        let max_seq = self.frames.keys().copied().max().unwrap_or(0);
+        let cutoff = max_seq.saturating_sub(512);
+        let doomed: Vec<u64> = self
+            .frames
+            .keys()
+            .filter(|s| **s < cutoff)
+            .copied()
+            .collect();
+        for s in doomed {
+            self.settle_one(s, loss);
+        }
+    }
+
+    fn note_retired(&mut self, seq: u64) {
+        if self.highest_retired.map_or(true, |h| seq > h) {
+            self.highest_retired = Some(seq);
+        }
+    }
+}
+
+impl std::fmt::Debug for ArrivalTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 不展开分片集合（可能很大），只给拓扑信息（与重组层 Debug 同一模式）。
+        f.debug_struct("ArrivalTracker")
+            .field("tracked", &self.tracked_frames())
+            .field("highest_retired", &self.highest_retired)
+            .finish()
+    }
+}
+
+impl Transport for QuicTransport {
+    fn send_datagram(&mut self, data: &[u8]) -> Result<()> {
+        let max = self.max_datagram();
+        if data.len() > max {
+            return Err(Error::Network(format!(
+                "datagram {} bytes exceeds budget {max} (N2: mtu - QUIC_OVERHEAD)",
+                data.len()
+            )));
+        }
+        {
+            let mut p = self.shared.pacer.lock().expect("pacer");
+            p.enqueue(data.to_vec());
+        }
+        // 唤醒发送线程：空闲后首包立即放行（延迟优先）。
+        self.shared.pacer_cv.notify_one();
+        Ok(())
+    }
+
+    fn send_reliable(&mut self, data: &[u8]) -> Result<()> {
+        let n = write_framed(&mut self.send_stream, data)?;
+        self.shared
+            .sent_bytes
+            .fetch_add(n as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// 输入走独立 urgent 流：只校验并入队，**永不阻塞调用方**。
+    ///
+    /// - 连接级流控的等待由专职写线程（`rc-net-urgent-writer`）吸收；
+    ///   一旦拿到信用，stream priority 保证输入字节先于控制数据发出；
+    /// - 入队口是**有界**通道（容量 [`URGENT_QUEUE_CAPACITY`] = 64）：
+    ///   消费侧卡死、队列满时立即返回错误——既不静默无界堆积，也不替
+    ///   上层偷偷丢输入。rc-net 不知道哪条输入消息可丢（移动事件可丢、
+    ///   按键不可丢），丢弃 / 合并的决策留给持有输入语义的上层
+    ///   （rc-input / rc-pipeline：降频、合并移动事件后重试）。
+    fn send_reliable_urgent(&mut self, data: &[u8]) -> Result<()> {
+        ensure_reliable_len(data)?;
+        let Some(tx) = self.urgent_tx.as_ref() else {
+            return Err(Error::Network("urgent writer stopped".into()));
+        };
+        tx.try_send(data.to_vec()).map_err(urgent_enqueue_error)
+    }
+
+    fn poll(&mut self, timeout: Duration) -> Result<Vec<NetEvent>> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        let mut out = Vec::new();
+
+        // N4：最多阻塞到 deadline。先等第一个事件……
+        if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match self.events_rx.recv_timeout(remaining) {
+                Ok(ev) => out.push(ev),
+                Err(RecvTimeoutError::Timeout) => {}
+                // 所有发送端（后台线程）都退出：不再有事件源。
+                Err(RecvTimeoutError::Disconnected) => {}
+            }
+        }
+        // ……再把已就绪的全部取走（非阻塞）。
+        while let Ok(ev) = self.events_rx.try_recv() {
+            out.push(ev);
+        }
+
+        // N9：地址变化 = 路径迁移。QUIC 连接 ID 不变，媒体流天然不断，
+        // 这里只负责把变化暴露成事件让上层知情。
+        let remote = self.conn.remote_address();
+        if remote != self.last_remote {
+            self.last_remote = remote;
+            out.push(NetEvent::PathChanged);
+        }
+
+        // 丢包估计（N8）：数据报事件喂给帧到达跟踪，随后**主动结算**
+        // 过期未凑齐帧（对齐重组层 500ms 放弃线）。结算无条件执行：
+        // 几秒内 loss_rate 必须反映真实丢包，不能等跟踪表攒满上限。
+        let now_us = self.now_us();
+        for ev in &out {
+            if let NetEvent::Datagram(b) = ev {
+                self.track_arrival(b, now_us);
+            }
+        }
+        let mut loss = self.loss.lock().expect("loss");
+        self.recv_track.settle(now_us, &mut loss);
+        drop(loss);
+        Ok(out)
+    }
+
+    fn stats(&self) -> NetStats {
+        let qs = self.conn.stats();
+        NetStats {
+            rtt_us: u32::try_from(qs.path.rtt.as_micros()).unwrap_or(u32::MAX),
+            loss_rate: self.loss.lock().expect("loss").loss_rate(),
+            pacing_rate_bps: self.shared.pacer.lock().expect("pacer").rate_bps(),
+            cwnd_bytes: qs.path.cwnd,
+            bytes_sent: self.shared.sent_bytes.load(Ordering::Relaxed),
+            bytes_recv: self.shared.recv_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for QuicTransport {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.pacer_cv.notify_all();
+        // 先关闭 urgent 入队口：写线程的 recv_timeout 立即以 Disconnected
+        // 返回，不必再多空等一轮 50ms 的 WORKER_IDLE_WAIT。
+        self.urgent_tx = None;
+        // 关闭连接让阻塞中的读 future 立即出错返回，线程随之退出。
+        self.conn
+            .close(quinn::VarInt::from(0u32), b"transport dropped");
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 后台线程
+// ─────────────────────────────────────────────────────────────────
+
+fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(f)
+        .expect("spawn transport thread")
+}
+
+/// datagram 接收线程：独自等待 `read_datagram`，结果入事件队列。
+fn datagram_reader(conn: quinn::Connection, tx: Sender<NetEvent>, shared: Arc<Shared>) {
+    loop {
+        match block_on(conn.read_datagram()) {
+            Ok(bytes) => {
+                shared
+                    .recv_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                if tx.send(NetEvent::Datagram(bytes.to_vec())).is_err() {
+                    return; // 接收端已销毁
+                }
+            }
+            Err(e) => {
+                // 连接断开（正常关闭 / 超时 / 出错）是最后一个事件。
+                let _ = tx.send(NetEvent::Disconnected {
+                    reason: e.to_string(),
+                });
+                return;
+            }
+        }
+    }
+}
+
+/// reliable 流接收线程：解长度前缀帧，保序交付。
+///
+/// `urgent` 区分流归属：控制流交付 [`NetEvent::Reliable`]，
+/// 输入流交付 [`NetEvent::ReliableUrgent`]（成帧完全一致）。
+fn stream_reader(
+    mut stream: quinn::RecvStream,
+    tx: Sender<NetEvent>,
+    shared: Arc<Shared>,
+    urgent: bool,
+) {
+    loop {
+        let mut len_buf = [0u8; 4];
+        if block_on(stream.read_exact(&mut len_buf)).is_err() {
+            return; // 对端关闭或连接断开
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len > MAX_RELIABLE_MSG {
+            let _ = tx.send(NetEvent::Disconnected {
+                reason: format!("oversized reliable message: {len} bytes"),
+            });
+            return;
+        }
+        // 长度 0 是连接引导占位（让对端看见这条流），不作为事件交付。
+        if len == 0 {
+            continue;
+        }
+        let mut payload = vec![0u8; len];
+        if block_on(stream.read_exact(&mut payload)).is_err() {
+            return;
+        }
+        shared.recv_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        let ev = if urgent {
+            NetEvent::ReliableUrgent(payload)
+        } else {
+            NetEvent::Reliable(payload)
+        };
+        if tx.send(ev).is_err() {
+            return;
+        }
+    }
+}
+
+/// 校验单条 reliable 消息长度（长度前缀是 u32，必须设界防恶意长度）。
+fn ensure_reliable_len(data: &[u8]) -> Result<()> {
+    if data.len() > MAX_RELIABLE_MSG {
+        return Err(Error::Network(format!(
+            "reliable message {} bytes exceeds limit {MAX_RELIABLE_MSG}",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+/// 把一条消息以 4 字节小端长度前缀成帧写入流（控制 / urgent 共用），
+/// 返回写出的总字节数（含前缀）。
+///
+/// quinn 的流控会让 write_all 反压，[`block_on`] 不会忙等。
+fn write_framed(stream: &mut quinn::SendStream, data: &[u8]) -> Result<usize> {
+    ensure_reliable_len(data)?;
+    let mut framed = Vec::with_capacity(4 + data.len());
+    framed.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    framed.extend_from_slice(data);
+    let n = framed.len();
+    block_on(stream.write_all(&framed))
+        .map_err(|e| Error::Network(format!("reliable write: {e}")))?;
+    Ok(n)
+}
+
+/// urgent 入队结果 → 错误的映射（纯函数，便于单测满队策略）。
+///
+/// 满队报错而不是丢弃：rc-net 不理解输入消息的语义（移动可丢、按键
+/// 不可丢），丢弃决策留给持有语义的上层；调用方看到错误后应降频 /
+/// 合并移动类事件再重试。
+fn urgent_enqueue_error(err: TrySendError<Vec<u8>>) -> Error {
+    match err {
+        TrySendError::Full(_) => Error::Network(format!(
+            "urgent queue full ({URGENT_QUEUE_CAPACITY}): consumer stalled; \
+             coalesce/drop stale move events at the caller"
+        )),
+        TrySendError::Disconnected(_) => Error::Network("urgent writer stopped".into()),
+    }
+}
+
+/// urgent（输入）流专职写线程：从入队口取消息写入流。
+///
+/// 它存在的意义是吸收 connection 级流控的等待：控制流把共享窗口占满时，
+/// 这里阻塞的是本线程而不是调用方。等待期间控制流最多领先一个流控
+/// 窗口的授予周期——下一个信用一到，27 字节的输入消息比 64KB 的控制
+/// 消息优先获得发送资格。
+fn urgent_writer(mut stream: quinn::SendStream, rx: Receiver<Vec<u8>>, shared: Arc<Shared>) {
+    loop {
+        if shared.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match rx.recv_timeout(WORKER_IDLE_WAIT) {
+            Ok(msg) => match write_framed(&mut stream, &msg) {
+                Ok(n) => {
+                    shared.sent_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                // 连接断开：读线程会把它转成 Disconnected 事件。
+                Err(_) => return,
+            },
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// 发送线程：按 pacing 速率把数据报写进 QUIC（N3）。
+fn pacer_worker(shared: Arc<Shared>) {
+    loop {
+        if shared.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = Instant::now();
+        let due = shared.pacer.lock().expect("pacer").poll(now);
+        for d in due {
+            let n = d.len() as u64;
+            // 帧尾包离栈 = 整帧发出：打 Sent 点（rc-trace 语义）。
+            if let Ok(h) = MediaHeader::parse(&d) {
+                if h.is_last() && !h.flags.is_parity() {
+                    let ts = Timestamp::since(shared.session_start, Instant::now());
+                    shared
+                        .trace
+                        .lock()
+                        .expect("trace")
+                        .begin(h.frame_seq)
+                        .mark(Mark::Sent, ts);
+                }
+            }
+            match shared.conn.send_datagram(Bytes::from(d)) {
+                Ok(()) => {
+                    shared.sent_bytes.fetch_add(n, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // 记数不致命：连接级错误由读线程转成 Disconnected 事件。
+                    shared.datagram_send_errors.fetch_add(1, Ordering::Relaxed);
+                    let _ = e;
+                }
+            }
+        }
+
+        // 睡到下一个放行时刻；入队会经 condvar 提前唤醒。
+        let p = shared.pacer.lock().expect("pacer");
+        let wait = match p.next_release_at() {
+            Some(t) => t
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_micros(50)),
+            None => WORKER_IDLE_WAIT,
+        };
+        drop(shared.pacer_cv.wait_timeout(p, wait).expect("pacer cv"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 同步桥（无 unsafe 的 block_on）
+// ─────────────────────────────────────────────────────────────────
+
+/// 用线程 parking 实现的极简 `block_on`。
+///
+/// quinn 的连接由 smol 后台线程推进，这里的 future 只是等结果，
+/// 不需要驱动任何 IO，所以标准库的 `Wake` + `park` 就够了。
+fn block_on<F: Future>(fut: F) -> F::Output {
+    struct ThreadWaker(std::thread::Thread);
+    impl std::task::Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let mut fut = Box::pin(fut);
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+/// 带截止时间的 `block_on`；超时返回 `Err(on_timeout())` 并丢弃 future。
+fn block_on_deadline<F: Future>(
+    fut: F,
+    deadline: Instant,
+    on_timeout: impl FnOnce() -> Error,
+) -> Result<F::Output> {
+    struct ThreadWaker(std::thread::Thread);
+    impl std::task::Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let mut fut = Box::pin(fut);
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(on_timeout());
+        }
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return Ok(v),
+            Poll::Pending => std::thread::park_timeout(deadline - now),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rc_proto::HeaderFlags;
+
+    #[test]
+    fn media_payload_budget_matches_n2() {
+        // N2：默认 mtu 1200 → 单数据报 ≤ 1152 → 媒体片 ≤ 1120。
+        assert_eq!(DEFAULT_MTU - QUIC_OVERHEAD, 1152);
+        assert_eq!(max_media_payload(DEFAULT_MTU), 1152 - HEADER_LEN);
+        assert_eq!(max_media_payload(DEFAULT_MTU), 1120);
+        // 加 FEC：冗余包 = 最长数据报 + 自身包头，媒体片再让 32。
+        assert_eq!(max_media_payload_with_fec(DEFAULT_MTU), 1088);
+        // 冗余数据报尺寸闭环：32 + (32 + 1088) = 1152 = 预算上限。
+        assert_eq!(
+            HEADER_LEN + HEADER_LEN + max_media_payload_with_fec(DEFAULT_MTU),
+            1152
+        );
+    }
+
+    #[test]
+    fn tiny_mtu_is_rejected() {
+        assert!(validate_mtu(QUIC_OVERHEAD + HEADER_LEN).is_err());
+        assert!(validate_mtu(0).is_err());
+        assert!(validate_mtu(DEFAULT_MTU).is_ok());
+        assert!(validate_mtu(QUIC_OVERHEAD + HEADER_LEN + 1).is_ok());
+    }
+
+    #[test]
+    fn empty_identity_pem_is_rejected() {
+        // 不变量违反路径：无证书 / 无私钥的 PEM 必须报配置错误，不能 panic。
+        assert!(Identity::from_pem("", "").is_err());
+        let cert_only = Identity::from_pem("not a pem at all", "");
+        assert!(cert_only.is_err());
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 帧到达跟踪（审计修复 1：loss_rate 失真）
+    // ─────────────────────────────────────────────────────────────
+
+    /// 直接构造媒体包头（不经过 wire 序列化，纯逻辑测试）。
+    fn header(seq: u64, idx: u16, cnt: u16) -> MediaHeader {
+        MediaHeader {
+            frame_seq: FrameSeq(seq),
+            capture_ts: Timestamp(0),
+            encode_done_ts: Timestamp(0),
+            packet_idx: idx,
+            packet_cnt: cnt,
+            fec_group: 0,
+            flags: HeaderFlags::empty(),
+            layer_id: 0,
+            payload_len: 0,
+        }
+    }
+
+    #[test]
+    fn loss_settles_within_stale_window_not_track_limit() {
+        // 注入式模拟 3% 丢包：60fps、每帧 4 片、确定性丢包落点
+        // （k*37 mod 100 < 3，37 与 100 互素 → 每 100 片恰好丢 3 片）。
+        // 修复前：nack 只在跟踪表攒满 4096 帧时才产生（60fps 下要
+        // 30-60 分钟），期间 loss_rate 恒 0.0。修复后：500ms 过期主动
+        // 结算，~1s 内 loss_rate 必须非零，且量级贴近 3%。
+        let mut t = ArrivalTracker::new();
+        let mut loss = LossEstimator::new();
+        const FRAMES: u64 = 120; // 2s @ 60fps
+        let mut now_us: u32 = 0;
+        let mut rate_at_1s = None;
+        for seq in 1..=FRAMES {
+            for idx in 0..4u16 {
+                let k = (seq - 1) * 4 + idx as u64;
+                if k * 37 % 100 < 3 {
+                    continue; // 该分片在网络中丢失
+                }
+                t.observe(&header(seq, idx, 4), now_us, &mut loss);
+            }
+            now_us += 16_667; // 60fps 帧间隔
+            t.settle(now_us, &mut loss);
+            if seq == 60 && rate_at_1s.is_none() {
+                rate_at_1s = Some(loss.loss_rate());
+            }
+        }
+        // 1s（60 帧）内：最早的帧在 ~500ms 已结算，loss_rate 必须非零。
+        assert!(
+            rate_at_1s.unwrap() > 0.0,
+            "1s 内 loss_rate 必须非零（修复前恒 0.0），got {}",
+            rate_at_1s.unwrap()
+        );
+        // 2s 后：量级必须正确（期望 ~3%，容差 ±3 个百分点）。
+        let rate = loss.loss_rate();
+        assert!(
+            (0.01..=0.06).contains(&rate),
+            "3% 丢包的 loss_rate={rate} 量级错误"
+        );
+    }
+
+    #[test]
+    fn duplicate_fragments_do_not_complete_missing_frame() {
+        // 修复点二：entry.1 += 1 不去重时，重复分片会把缺包帧误判完整。
+        let mut t = ArrivalTracker::new();
+        let mut loss = LossEstimator::new();
+        // 帧 7 应到 4 片，只到 0/1/2，其中 0 号重复投递 3 次。
+        t.observe(&header(7, 0, 4), 0, &mut loss);
+        t.observe(&header(7, 0, 4), 1_000, &mut loss); // 重复
+        t.observe(&header(7, 0, 4), 2_000, &mut loss); // 再重复
+        t.observe(&header(7, 1, 4), 3_000, &mut loss);
+        t.observe(&header(7, 2, 4), 4_000, &mut loss);
+        assert_eq!(t.tracked_frames(), 1, "缺 1 片的帧仍在跟踪（不得被判完整）");
+        assert_eq!(loss.arrivals(), 0, "未凑齐不得记到达");
+        // 过期结算：3 到达、1 缺失。
+        t.settle(600_000, &mut loss);
+        assert_eq!(loss.arrivals(), 3, "重复分片只计一次");
+        assert_eq!(loss.nacks(), 1);
+        assert!((loss.loss_rate() - 0.25).abs() < 1e-6);
+        assert_eq!(t.tracked_frames(), 0);
+        // 结案后的迟到分片不得把帧「复活」成假丢包记录。
+        t.observe(&header(7, 3, 4), 700_000, &mut loss);
+        assert_eq!(t.tracked_frames(), 0);
+        assert_eq!(loss.arrivals(), 3, "已结案帧的迟到分片不重新计数");
+    }
+
+    #[test]
+    fn inflight_frame_outranks_retirement_gate() {
+        // 乱序误报丢包（审计：优先级逻辑 bug）。旧顺序（结案拦截先于
+        // 在途表查找）下的推演：
+        //   1. 帧 9（cnt=2）第 0 片入在途表；
+        //   2. 单片帧 10 抢先到达 → cnt==1 分支结案，highest_retired=10；
+        //   3. 帧 9 的第 1 片到达 → `9 <= 10` 直接 return，帧 9 永远凑不齐；
+        //   4. 500ms 后 settle 把它结算成 arrival=1/nack=1 的幻影丢包，
+        //      loss_rate 虚高（FEC 冗余率与拥塞控制据此误动作）。
+        // 修复后在途优先于结案拦截（与 reassemble 同一纪律）：仍在途的
+        // 帧分片照常入账，凑齐即结案。
+        let mut t = ArrivalTracker::new();
+        let mut loss = LossEstimator::new();
+        t.observe(&header(9, 0, 2), 0, &mut loss); // 帧 9 首片入在途表
+        t.observe(&header(10, 0, 1), 1_000, &mut loss); // 单片帧抢先结案
+        assert_eq!(t.tracked_frames(), 1, "帧 9 仍在途等待第 1 片");
+        assert_eq!(loss.arrivals(), 1, "此刻仅帧 10 记到达");
+        t.observe(&header(9, 1, 2), 2_000, &mut loss); // 迟到，但帧 9 仍在途
+        assert_eq!(t.tracked_frames(), 0, "帧 9 凑齐即结案（不得滞留在途）");
+        assert_eq!(loss.arrivals(), 3, "帧 9 的 2 片 + 帧 10 的 1 片");
+        assert_eq!(loss.nacks(), 0, "不得记任何幻影缺失");
+        assert_eq!(loss.loss_rate(), 0.0, "乱序不应制造丢包");
+    }
+
+    #[test]
+    fn complete_frame_accounts_all_arrivals_immediately() {
+        let mut t = ArrivalTracker::new();
+        let mut loss = LossEstimator::new();
+        for idx in 0..3u16 {
+            t.observe(&header(1, idx, 3), 100, &mut loss);
+        }
+        assert_eq!(t.tracked_frames(), 0, "凑齐即结案");
+        assert_eq!(loss.arrivals(), 3);
+        assert_eq!(loss.nacks(), 0);
+        // 没有过期帧时 settle 是空操作。
+        t.settle(1_000_000, &mut loss);
+        assert_eq!((loss.arrivals(), loss.nacks()), (3, 0));
+    }
+
+    #[test]
+    fn tracker_settle_survives_u32_us_wraparound() {
+        // 与重组层 gc 同一纪律：u32 微秒回绕点（8 小时 soak 必踩）。
+        let mut t = ArrivalTracker::new();
+        let mut loss = LossEstimator::new();
+        let t0 = u32::MAX - 5_000; // 回绕前 5ms
+        t.observe(&header(9, 0, 2), t0, &mut loss); // 缺 1 片
+                                                    // 跨回绕后恰好 500ms：不结算（严格大于才结算）。
+        t.settle(t0.wrapping_add(TRACK_STALE_US), &mut loss);
+        assert_eq!(loss.nacks(), 0);
+        // 501ms：结算 1 到达 + 1 缺失。
+        t.settle(t0.wrapping_add(TRACK_STALE_US).wrapping_add(1), &mut loss);
+        assert_eq!((loss.arrivals(), loss.nacks()), (1, 1));
+    }
+
+    #[test]
+    fn tracker_evicts_when_table_exceeds_limit() {
+        // 上界保护（N10 同一精神）：时间冻结时表也不得无限增长，
+        // 被强制结算的最老帧必须按缺失记账。
+        let mut t = ArrivalTracker::new();
+        let mut loss = LossEstimator::new();
+        for seq in 1..=(RECV_TRACK_LIMIT as u64 + 16) {
+            t.observe(&header(seq, 0, 2), 0, &mut loss); // 每帧只到 1/2 片
+        }
+        assert!(t.tracked_frames() <= RECV_TRACK_LIMIT, "表不得无限增长");
+        assert!(loss.nacks() > 0, "被强制结算的最老帧必须记缺失");
+        assert!(loss.arrivals() > 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 流角色判定（审计修复 2：流角色可能互换）
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stream_roles_are_assigned_by_id_not_arrival_order() {
+        // connect 先开 control（index 小）、后开 urgent（index 大）。
+        // accept 侧即使先收到后开的流（弱网重传导致 accept_bi 交付
+        // 顺序颠倒），角色仍按流 ID 序号判定。
+        assert_eq!(
+            control_is_first(0, 1),
+            Some(true),
+            "先开的（小 index）是 control"
+        );
+        assert_eq!(
+            control_is_first(1, 0),
+            Some(false),
+            "乱序到达（先收到后开的流）：后到的 index 0 仍是 control"
+        );
+        assert_eq!(control_is_first(4, 7), Some(true));
+        assert_eq!(control_is_first(9, 2), Some(false));
+        assert_eq!(control_is_first(5, 5), None, "同一条流被接受两次是协议异常");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // urgent 队列（审计修复 5：无界通道）
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn urgent_queue_is_bounded_and_full_maps_to_error() {
+        // 容量确为 URGENT_QUEUE_CAPACITY（有界），满队必须映射为
+        // 说明原因的错误——不是静默丢弃，也不是无界堆积。
+        assert_eq!(URGENT_QUEUE_CAPACITY, 64);
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(URGENT_QUEUE_CAPACITY);
+        for _ in 0..URGENT_QUEUE_CAPACITY {
+            tx.try_send(vec![0u8; 8]).expect("容量内必须可入队");
+        }
+        let err = urgent_enqueue_error(tx.try_send(vec![0u8; 8]).unwrap_err());
+        match err {
+            Error::Network(msg) => assert!(msg.contains("full"), "满队错误必须说明原因：{msg}"),
+            other => panic!("满队必须映射为网络错误，got {other:?}"),
+        }
+    }
+}

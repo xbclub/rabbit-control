@@ -7,6 +7,21 @@ members = [
     "crates/rc-fec",
     "crates/rc-proto",
     "crates/rc-trace",
+    "crates/rc-loopback",
+    "crates/rc-cli",
+    "crates/rc-capture",
+    "crates/rc-encode",
+    "crates/rc-capture-macos",
+    "crates/rc-encode-vt",
+    "crates/rc-input",
+    "crates/rc-input-macos",
+    "crates/rc-input-win",
+    "crates/rc-decode",
+    "crates/rc-decode-vt",
+    "crates/rc-render",
+    "crates/rc-render-macos",
+    "crates/rc-pipeline",
+    "crates/rc-net",
 ]
 
 [workspace.package]
