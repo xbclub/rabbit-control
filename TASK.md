@@ -13,7 +13,7 @@
 | 语言 | **Rust**（已定，不再讨论） |
 | 被控端优先级 | **macOS 为 P0**，Windows 为 P1，Linux 为 P2 |
 | 核心命题 | 打赢 RustDesk 的**实际**帧率与延迟 |
-| 当前状态 | 21 个 crate 已落地（**328 测试全绿**，clippy/fmt 干净，另 9 项真机/权限 `#[ignore]`）；**B3 真机全链 M1 Gate 已全项通过（2026-11-21 终验，`--backend real`：sck→VT→VT→Metal，隐私幕布，`max_in_flight=2`，PTS 节拍过滤已回退）**：动态 60s P50=**11.28ms**/P99=21.20ms/70.0fps/队列=2/零丢帧/不变式全过；运动 15s P50=11.16ms/69.5fps 全项过；静态 30s 单核 CPU 稳态 **1.51%**（≤8%）/`dropped_repeat=0`。基础设施：隐私幕布已固化进仓库（`rc-render-macos/tests/curtain.rs`，`--features window-bench`）。**阶段 C：T09 `rc-net`（QUIC 双通道传输层）已实现并通过本卡全部 17 项测试（2026-11-21，正式门禁由编排脚本复跑）；T10 输入通道已完成（2026-11-21）：`rc-input` 核心（事件/4ms 批处理/手写二进制线格式/reliable-stream 接线，16 测试）+ `rc-input-macos` 桥接（`InputBridge` 实现 `rc_input::InputInjector`，+8 测试）+ `rc-input-win` cfg(windows) 骨架（macOS 编译为空、0 假测试，真机实现属 D3）；I1–I9 全落地，I10（Windows `GetCursorPos` 校准）为 D3 TODO**；**T09 审计遗留修复（2026-11-21）**：① 输入独立 urgent 流（`Transport::send_reliable_urgent` 默认实现 + `NetEvent::ReliableUrgent`，`QuicTransport` 第二条双向 reliable 流 + quinn `set_priority(1)` + 专职写线程化解 connection 级流控共享窗口的队头阻塞）+ 契约 §7.3 增 N6；② N9 迁移集成测试（`QuicEndpoint::rebind` + `PathChanged` 断言）；rc-net **23 单测 + 7 集成 = 30 全绿**（原 27 全保留）；③ macOS `CGEventTap` 捕获器（rc-input-macos `CgCapture`：ListenOnly tap + 专用 CFRunLoop 线程 + `AXIsProcessTrusted` 预检，离线 31+2 测试，真机 3 项 `--ignored` 授权后实测**全部通过**：注入 tap 见证 ✅、捕获→注入回环 8→8→5→5 ✅、延迟探针 p50=0.66ms ✅）；**外部审计修复轮（2026-11-21，workflow「审计修复轮：传输与输入」+ 收口）七项全修**：① rc-net `loss_rate` 改 seq 窗口+500ms 主动结算与分片去重（秒级可测）；② macOS 滚轮统一**行单位**（注入 LINE，跨平台规范写入文档，真机回环 3/3 等值）；③ QUIC 双流角色按流 ID 序号判定（与到达顺序无关）；④ rc-input 接收错误路径**零丢兄弟消息**（逐条处理+聚合首错）；⑤ 重组/FEC 超时改 `wrapping_sub`（u32 回绕免疫，8h soak 安全）；⑥ tap/urgent 通道有界化+满载丢最旧、`too_many_arguments` 重构消除；⑦ Drop 前关流。真机测试串行化锁（libtest 并行互踩根因修复）。workspace **366 测试全绿 / clippy / fmt 干净**，真机 4/4（含新增滚轮回环））；④ 复审发现 urgent 流未在 rc-input 应用层接线（rc-net 修好了、调用方仍走共享流）——已修：`send_events`/`pump_receiver` 切 `send_reliable_urgent`/`ReliableUrgent`，接缝测试 `input_goes_over_urgent_stream_not_control` 钉死；workspace **349 测试全绿 / clippy `-D warnings` 0 警告 / fmt 干净**（见 §12/§13）；**rc-input-macos 审计修复轮（2026-11-21）**：① 滚轮量纲统一为**行**（注入侧 `ScrollEventUnit::PIXEL→LINE`，实测 3 行曾缩水成 tap 读回 1 行、现逐值对称，rc-input `MouseWheel.delta` 文档澄清规范单位=行）② tap 事件通道无界→**有界 `sync_channel(256)` 满时丢最旧**（回调全程非阻塞原语，丢弃独立计数 `CgCapture::dropped_channel_full`）；rc-input-macos **36 单测 + 2 doctest 全绿（原 31+2 全保留）、真机 4/4 通过**（原 3 项不破坏 + 新增滚轮回环 `wheel_line_unit_roundtrip_real_machine` 3 条等值匹配、满载丢弃=0）（见 §12/§13）；**rc-net 传输审计修复轮（2026-11-21）**：① loss_rate 失真（高）——`ArrivalTracker` 按 `packet_idx` 去重分片到达 + 超时（对齐 `FRAME_STALE_US`=500ms）**主动结算**过期未凑齐帧（不再等跟踪表攒满 4096：60fps/3% 丢包原本要 30-60 分钟才首次出 nack、期间恒 0.0）；集成实测 3% 代理丢包下收敛 loss_rate **0.021–0.027 vs 实测 UDP 丢率 0.022**，重复分片不再误判缺包帧完整；② 流角色互换（中）——accept 侧按 **QUIC 流 ID 序号**（`StreamId::index()` 小者=control）判角色（`control_is_first` 纯函数单测 + 5% 丢包握手下角色不互换集成测试），弱网重传颠倒 `accept_bi` 交付顺序不再静默换流；③ u32 微秒回绕（中）——`reassemble.rs`/`fec_adapter.rs` 的 gc 改 `wrapping_sub`（8 小时 soak 跨 71.5min 回绕点不再冻结超时判定）+ 两端跨回绕测试；④ 卫生——`too_many_arguments` allow 移除（`ReliableStream` 收拢两流参数）、Drop 先 `Option::take` 关 urgent_tx 再 join；⑤ urgent 通道无界→**有界 `sync_channel(64)` 满队报错**（丢弃决策留给持输入语义的上层，写进文档与 `urgent_enqueue_error` 单测）；rc-net **32 单测 + 8 集成 = 40 全绿（原 30 项全保留）/ clippy `-D warnings` 0 警告 / fmt 干净 / 无 unsafe / `DEFAULT_MAX_CONCURRENT_FRAMES==2` 未动**（见 §12/§13）；**审计二轮修复（2026-11-21，workflow「审计修复轮：乱序丢包与批内隔离」+ 只读独立复核）两项全修**：① rc-net `ArrivalTracker::observe` 改**在途优先于结案拦截**（多片帧 seq=9 在途、单片帧 seq=10 抢先推高 `highest_retired` 后，seq=9 的迟到分片不再被 `9<=10` 吞掉——原顺序下帧永远凑不齐、500ms 后被 settle 误记幻影 NACK 致 loss_rate 虚高；回归测试 `inflight_frame_outranks_retirement_gate` 修复前实测 FAILED 锁死）；② rc-input-macos `InputBridge::inject` **批内错误隔离**（与 `pump_receiver` 同语义：记首错继续注入同批剩余事件，X1/X2 侧键翻译失败或投递失败不再吞掉后续松键→防卡键；新增侧键+投递失败两个隔离测试）；workspace **369 测试全绿 / clippy `-D warnings` 0 警告 / fmt 干净**，独立复核通过（见 §12/§13）；**UI 设计规范已产出（2026-11-21，零代码）**：rc-ui 框架定为 **GPUI + gpui-kit**（经 UU 远控双端解剖取证与用户裁决，原「Tauri 或 egui」表述作废，`07-engineering-velocity.md` 已修正），设计规范落地 `docs/reference/design/08-ui-design.md`（12 屏全覆盖，实现属 M2-6） |
+| 当前状态 | 21 个 crate 已落地（**328 测试全绿**，clippy/fmt 干净，另 9 项真机/权限 `#[ignore]`）；**B3 真机全链 M1 Gate 已全项通过（2026-11-21 终验，`--backend real`：sck→VT→VT→Metal，隐私幕布，`max_in_flight=2`，PTS 节拍过滤已回退）**：动态 60s P50=**11.28ms**/P99=21.20ms/70.0fps/队列=2/零丢帧/不变式全过；运动 15s P50=11.16ms/69.5fps 全项过；静态 30s 单核 CPU 稳态 **1.51%**（≤8%）/`dropped_repeat=0`。基础设施：隐私幕布已固化进仓库（`rc-render-macos/tests/curtain.rs`，`--features window-bench`）。**阶段 C：T09 `rc-net`（QUIC 双通道传输层）已实现并通过本卡全部 17 项测试（2026-11-21，正式门禁由编排脚本复跑）；T10 输入通道已完成（2026-11-21）：`rc-input` 核心（事件/4ms 批处理/手写二进制线格式/reliable-stream 接线，16 测试）+ `rc-input-macos` 桥接（`InputBridge` 实现 `rc_input::InputInjector`，+8 测试）+ `rc-input-win` cfg(windows) 骨架（macOS 编译为空、0 假测试，真机实现属 D3）；I1–I9 全落地，I10（Windows `GetCursorPos` 校准）为 D3 TODO**；**T09 审计遗留修复（2026-11-21）**：① 输入独立 urgent 流（`Transport::send_reliable_urgent` 默认实现 + `NetEvent::ReliableUrgent`，`QuicTransport` 第二条双向 reliable 流 + quinn `set_priority(1)` + 专职写线程化解 connection 级流控共享窗口的队头阻塞）+ 契约 §7.3 增 N6；② N9 迁移集成测试（`QuicEndpoint::rebind` + `PathChanged` 断言）；rc-net **23 单测 + 7 集成 = 30 全绿**（原 27 全保留）；③ macOS `CGEventTap` 捕获器（rc-input-macos `CgCapture`：ListenOnly tap + 专用 CFRunLoop 线程 + `AXIsProcessTrusted` 预检，离线 31+2 测试，真机 3 项 `--ignored` 授权后实测**全部通过**：注入 tap 见证 ✅、捕获→注入回环 8→8→5→5 ✅、延迟探针 p50=0.66ms ✅）；**外部审计修复轮（2026-11-21，workflow「审计修复轮：传输与输入」+ 收口）七项全修**：① rc-net `loss_rate` 改 seq 窗口+500ms 主动结算与分片去重（秒级可测）；② macOS 滚轮统一**行单位**（注入 LINE，跨平台规范写入文档，真机回环 3/3 等值）；③ QUIC 双流角色按流 ID 序号判定（与到达顺序无关）；④ rc-input 接收错误路径**零丢兄弟消息**（逐条处理+聚合首错）；⑤ 重组/FEC 超时改 `wrapping_sub`（u32 回绕免疫，8h soak 安全）；⑥ tap/urgent 通道有界化+满载丢最旧、`too_many_arguments` 重构消除；⑦ Drop 前关流。真机测试串行化锁（libtest 并行互踩根因修复）。workspace **366 测试全绿 / clippy / fmt 干净**，真机 4/4（含新增滚轮回环））；④ 复审发现 urgent 流未在 rc-input 应用层接线（rc-net 修好了、调用方仍走共享流）——已修：`send_events`/`pump_receiver` 切 `send_reliable_urgent`/`ReliableUrgent`，接缝测试 `input_goes_over_urgent_stream_not_control` 钉死；workspace **349 测试全绿 / clippy `-D warnings` 0 警告 / fmt 干净**（见 §12/§13）；**rc-input-macos 审计修复轮（2026-11-21）**：① 滚轮量纲统一为**行**（注入侧 `ScrollEventUnit::PIXEL→LINE`，实测 3 行曾缩水成 tap 读回 1 行、现逐值对称，rc-input `MouseWheel.delta` 文档澄清规范单位=行）② tap 事件通道无界→**有界 `sync_channel(256)` 满时丢最旧**（回调全程非阻塞原语，丢弃独立计数 `CgCapture::dropped_channel_full`）；rc-input-macos **36 单测 + 2 doctest 全绿（原 31+2 全保留）、真机 4/4 通过**（原 3 项不破坏 + 新增滚轮回环 `wheel_line_unit_roundtrip_real_machine` 3 条等值匹配、满载丢弃=0）（见 §12/§13）；**rc-net 传输审计修复轮（2026-11-21）**：① loss_rate 失真（高）——`ArrivalTracker` 按 `packet_idx` 去重分片到达 + 超时（对齐 `FRAME_STALE_US`=500ms）**主动结算**过期未凑齐帧（不再等跟踪表攒满 4096：60fps/3% 丢包原本要 30-60 分钟才首次出 nack、期间恒 0.0）；集成实测 3% 代理丢包下收敛 loss_rate **0.021–0.027 vs 实测 UDP 丢率 0.022**，重复分片不再误判缺包帧完整；② 流角色互换（中）——accept 侧按 **QUIC 流 ID 序号**（`StreamId::index()` 小者=control）判角色（`control_is_first` 纯函数单测 + 5% 丢包握手下角色不互换集成测试），弱网重传颠倒 `accept_bi` 交付顺序不再静默换流；③ u32 微秒回绕（中）——`reassemble.rs`/`fec_adapter.rs` 的 gc 改 `wrapping_sub`（8 小时 soak 跨 71.5min 回绕点不再冻结超时判定）+ 两端跨回绕测试；④ 卫生——`too_many_arguments` allow 移除（`ReliableStream` 收拢两流参数）、Drop 先 `Option::take` 关 urgent_tx 再 join；⑤ urgent 通道无界→**有界 `sync_channel(64)` 满队报错**（丢弃决策留给持输入语义的上层，写进文档与 `urgent_enqueue_error` 单测）；rc-net **32 单测 + 8 集成 = 40 全绿（原 30 项全保留）/ clippy `-D warnings` 0 警告 / fmt 干净 / 无 unsafe / `DEFAULT_MAX_CONCURRENT_FRAMES==2` 未动**（见 §12/§13）；**审计二轮修复（2026-11-21，workflow「审计修复轮：乱序丢包与批内隔离」+ 只读独立复核）两项全修**：① rc-net `ArrivalTracker::observe` 改**在途优先于结案拦截**（多片帧 seq=9 在途、单片帧 seq=10 抢先推高 `highest_retired` 后，seq=9 的迟到分片不再被 `9<=10` 吞掉——原顺序下帧永远凑不齐、500ms 后被 settle 误记幻影 NACK 致 loss_rate 虚高；回归测试 `inflight_frame_outranks_retirement_gate` 修复前实测 FAILED 锁死）；② rc-input-macos `InputBridge::inject` **批内错误隔离**（与 `pump_receiver` 同语义：记首错继续注入同批剩余事件，X1/X2 侧键翻译失败或投递失败不再吞掉后续松键→防卡键；新增侧键+投递失败两个隔离测试）；workspace **369 测试全绿 / clippy `-D warnings` 0 警告 / fmt 干净**，独立复核通过（见 §12/§13）；**UI 设计规范已产出（2026-11-21，零代码）**：rc-ui 框架最终定为 **Tauri v2 2.12.7 + 纯静态 HTML/CSS/JS 前端**（沿革 GPUI → Dioxus → Tauri v2，经三框架内存实测与工程评估 + 用户裁决；原「Tauri 或 egui」表述作废），设计规范落地 `docs/reference/design/08-ui-design.md`（12 屏全覆盖，§8 已按 Tauri 重写，实现属 M2-6）；**rc-ui 已实现并收口（2026-11-21 两轮）**：14 个界面 / 22 前端文件 / 8495 行，**真窗口启动渲染确认**（含双交通灯缺陷修复）、Rust 侧多窗口 IPC 命令落地、**6/6 屏通过 visual-judge 视觉验收**、`cargo test --workspace` **450 passed / 0 failed**、clippy `-D warnings` 0 警告、fmt 干净；**CSS 公共层已收敛（2026-11-21）**：`assets/css/base.css` 由 1 行注释扩为 **510 行**唯一实现（reset/排版/.ic/Pill/按钮/Toast/交通灯/titlebar/滚动条），6 页重复样式清零（`box-sizing` 重置全仓仅 1 处），交通灯四种类名别名归一到 tokens 新增的 `--traffic-*`，6 页实跑组件断言全过、JS 交互 0 报错；**M2 会话核心轮（2026-11-21，workflow 写卡→实现→两轮根因修复 + 主 agent 真后端双进程实测）**：新 crate **rc-session**（proto/host/client/probe/watchdog/reconnect/report/testkit，T13–T18 六卡全落地，独立复核通过）+ rc-cli host/client 双进程子命令；两根因修复：① 分片预算 MTU 错配（pipeline 1200 vs rc-net 1152 预算 → 参数化 1120 对齐，64KB 多包帧真 QUIC e2e 钉死）② **真采集时钟锚定顺序**（先建 SCK 后设 origin → 帧帧 Stale 全弃、30s 0 帧编码；修复后 host captured==encoded、超期/重复/预算全 0，并给 HostRunSummary 补 captured/dropped_* 四统计）；workspace **490 测试全绿 / clippy / fmt 干净**；**本机（localhost 双进程真 QUIC + 真后端 SCK/VT/Metal）实测：640x360 60s Gate 全项通过**（首帧 630ms≤800 / p50 10.8ms / p99 18.5ms / 68.3fps / 输入单向 1.29ms / 队列 0；RTT 2.6ms），1080p 90s p50 17.2/p99 26.3/首帧 677ms/零丢包（displayed 45.5fps 为单屏遮挡自反馈伪影，见 §13）；#[ignore] 真机 2/2（localhost_real_backend_smoke / real_inject_via_input_bridge）；；**高帧率轮（2026-11-22）**：120/144/240 全链参数化验证——本机 120fps 真机 **114.6fps 端到端无损穿透**（640x360，SCK 供给上限 ~115），1080p×120 瓶颈实测=VT 硬编吞吐 98.9fps（物理上限），144 离线**满帧 Gate 通过**（144.0fps/p50 10.0ms），240 管线健康（队列 2/p50 17.8ms）；顺手修掉 **VT 过载丢帧拆会话**产品级 bug（EncoderDroppedFrame 非致命化 + Dropped 不再误请求 IDR，真机 90s 过载会话存活）；workspace **492 全绿**（见 §12/§13）；T19–T22 已写卡待领取（见 §12/§13）；**rc-ui 视觉精致度与统一性全面重构（2026-11-22）**：建立三层表面体系（`--bg-canvas #F5F6F8` / `--bg-window #FFFFFF` / `--bg-card #F7F8FA`）、统一 Switch(40×24)/Select/Button/Titlebar 到 `base.css`、修复 5 项视觉缺陷（P1「进入桌面 →」遮挡、S1 双交通灯与留白、W1 Select 箭头缺失、O3 双同心圆头像、W4 Unicode 状态符），裸写色值 0 处、Playwright 15 屏全过（含 1120×720 无溢出、0 console/page errors） |
 | 你的第一个动作 | 读完 §1–§5，然后接 §8 的第一张任务卡 |
 
 ---
@@ -518,6 +518,17 @@ VideoToolbox `RealTime=true` + `EnableLowLatencyRateControl=true` 单段编码�
 | **审计二轮修复 1：ArrivalTracker 在途优先于结案拦截（rc-net，`quic.rs::inflight_frame_outranks_retirement_gate`）** | **乱序不再误报丢包**：修复前顺序（`highest_retired` 拦截在在途表查找之前）下，新回归测试实测 **FAILED**（`tracked_frames()` left:1 right:0，帧 9 滞留在途表；arrivals=1≠3，500ms 后 settle 会记幻影 nack）——测试真锁住 bug；修复后通过：帧 9 首片入表 → 单片帧 10 抢先结案推 `highest_retired=10` → 帧 9 第 1 片迟到**仍凑齐结案**，`LossEstimator` 只记 arrival 不记 nack（loss_rate 保持 0.0）；「已结案且不在途」迟到分片仍被忽略（既有 `duplicate_fragments_do_not_complete_missing_frame` 等测试无回归；所有结案路径均先 remove 再 note_retired，不变式成立） | 乱序凑齐 ✅ 无幻影 NACK ✅ 无回归 ✅ |
 | **审计二轮修复 2：InputBridge 批内错误隔离（rc-input-macos，`bridge.rs`）** | `inject` 从 `convert(ev)?`/注入 `?` 提前返回改为 `first_err.get_or_insert` 记首错继续（与 rc-input `pump_receiver` 同语义；粒度差异：pump 按消息、inject 按事件）。新测试 ①`side_button_error_does_not_drop_sibling_key_events_in_batch`：批 [X1 按下, Key A 按下, Key A 松开] 返回 Err（含「侧键」）且假投递器**精确记录两条 Key 事件、顺序保留**（旧代码 posted 为空必失败）；②`inject_failure_does_not_drop_sibling_events_in_batch`：FlakyPoster 首投失败后同批后续仍被尝试（calls==3）且返回首错（含 `macOS inject failed`）。既有「单事件坏批返回 Err」两测试未破坏 | 坏事件不吞兄弟 ✅ 防卡键 ✅ |
 | **审计二轮修复：workspace 全仓复测（workflow 脚本内建终复跑）** | `cargo test --workspace` **369 passed / 0 failed**（较上轮 366 +3：rc-net 1 + rc-input-macos 2）；`cargo clippy --workspace --all-targets -- -D warnings` 0 警告；`cargo fmt --check` 干净；独立复核员另亲跑 crate 级 `cargo test -p rc-net --lib quic::tests`（11 全绿）与 `cargo test -p rc-input-macos --lib bridge`（12 全绿）交叉印证 | 全绿 ✅ |
+| **M2 写卡轮（2026-11-21，workflow「M2 写卡轮」）** | 架构定案：新 crate **rc-session**（proto 控制协议 / host_session / client_session / probe / watchdog / reconnect / report / testkit；依赖方向 rc-session→rc-net+rc-pipeline+rc-input+rc-types，无环）；任务卡 **T13–T22 十张**覆盖 M2-3/5/6/7/8/9/10 全部剩余项，评审一轮 13 项修复后通过；契约（§7.5–§7.7 +672 行）/tickets 清单/里程碑三处同步 | 十卡可领取 ✅ |
+| **M2 实现轮（2026-11-21，workflow「M2 实现轮」T13→T18 串行六卡）** | T13 proto 线格式 12 测试；T14 会话核心 26 测试（状态机/握手/三通道分发/停机序）；T15 探测与初始码率 23 测试（RTT/时钟偏移/BwProbe/SetBitrate 链路实测：协商 50Mbps→估速 13.98Mbps→编码器实收 clamp(×0.7)=9.79Mbps）；T16 IDR 可靠通道 15 测试（看门狗 500ms/去抖/关联确认/丢包演练：1s 全丢窗后 17ms 恢复、持续丢包 2s 仅 4 请求）；T17 断线重连 19 测试（host 保持窗口/resume/退避重连/强制 IDR/rebind 迁移/70min 刷新守卫）；T18 CLI 双进程 22 测试（fake localhost release 实测：首帧 51.4ms/p50 3.51/fps 59.97/输入单向 0.48ms，重连演练 recovery 47ms）。workspace 484→**490 全绿**（含 MTU/时钟两修复轮），独立复核逐卡通过 | 六卡全过 ✅ |
+| **M2 修复 1：分片预算 MTU 错配（T18 发现，workflow 修复轮）** | rc-pipeline host.rs:437 硬编码 MAX_PAYLOAD=1200 → 数据报 1232B 超 rc-net N2 预算 1152B，**真 QUIC 上多包大帧全被拒收**（M1 loopback 直连无预算墙故未暴露）。修复：PipelineConfig.max_packet_payload 参数化（默认 1200 保 loopback/M1 逐字节不变），rc-session 握手处按 rc-net 预算 1120 接线；e2e：64KB 帧 = 59 包过真 QUIC 逐字节重组 + datagrams_sent==59×frames 回归杀手断言；变异验证双向（改回 1200 测试即挂） | 489 全绿 ✅ 复核通过 ✅ |
+| **M2 修复 2：真采集时钟锚定顺序（主 agent 真机定位，workflow 修复轮）** | 症状：真后端双进程 30s **0 帧编码**（in_flight=0、IdrRequest×322 饿死），而 SCK 直测 137 帧/2s 正常、M1 loopback 正常。根因链：real_host_stack 先 select_capture_labeled（origin=None → SCK 以首帧 PTS 为零点）后设 pcfg.origin → 每帧 capture_ts 比 now 旧 Δ（首帧延迟），rc-sched deadline=capture_ts+22ms 恒已过 → **帧帧 Drop(Stale)**。修复：采样 origin → 写 pcfg → 再建 SCK（与 rc-loopback:264-265 同构）；修复后实测 host **captured 2055→encoded 2055、超期/重复/预算 0/0/0**；附带 HostRunSummary +captured/dropped_stale/dropped_repeat/dropped_budget 四统计（本轮排查盲飞的教训） | 490 全绿 ✅ 复核通过 ✅ |
+| **M2 本机实测：localhost 双进程真后端（Run B 60s，640x360 小窗防遮挡，幕布 72fps 供给，release，dev-app 双 bundle）** | **Gate 全项通过（client exit 0）**：首帧 **630ms**（≤800 ✅）、p50 **10.8ms**（≤25 ✅）、p99 **18.5ms**（≤40 ✅）、displayed **68.3fps**（≥54 ✅）、输入单向 p50 **1.29ms**（≤RTT/2+5=6.3 ✅）、队列峰值 0（≤2 ✅）、RTT 2.56ms、零丢包/零解码错/零未结；host：captured==encoded、弃帧全 0、in_flight 峰值 2 | **Gate 全过 ✅** |
+| **M2 本机实测：Run A（30s 同场景）与 Run C（1080p 90s 遮挡序）** | Run A：68.5fps/p50 10.6/输入 1.34，但首帧 1306ms 与 p99 290ms 超标——Run B 60s 稀释后 p99=18.5 证实为**冷启动期尖峰**（degradation 1160ms）；首帧两轮 630/1306ms 方差 → <800ms 门槛贴线，待优化（候选：accept 等待期预建 SCK 流/预热编码器）。Run C（1080p 90s）：首帧 677 ✅/p50 17.2 ✅/p99 26.3 ✅/输入单向 3.08 ✅/零丢包/host 6172→6172 编码零弃帧；displayed 45.5fps 系单屏遮挡自反馈伪影（client 全屏窗呈现内容=采集内容自身，真双机无此回路；1080p 帧率以 M1 loopback 70fps + Run B 68.3fps 拼合论证） | 1080p 延迟达标 ✅ fps 伪影已归因 |
+| **M2 本机实测：rc-cli #[ignore] 真机测试（dev-app 手工打包 host_client 测试二进制）** | `localhost_real_backend_smoke` ✅ + `real_inject_via_input_bridge` ✅（2 passed / 37.24s）。发现 dev-run.sh `test` 子命令只打包**最后一个**测试二进制——tests/ 下多二进制 crate 的 --ignored 用例会静默漏跑（本次用手工打包绕过，已列为脚本待修项） | 2/2 ✅ |
+| **高帧率支持：120/144/240 参数化验证（2026-11-22，用户需求「我要 120 144 240」；全链参数审查 + 本机实测 + 离线覆盖）** | **参数路径零硬编码**：SCK `SckConfig.fps`→`minimumFrameInterval`、VT `ExpectedFrameRate`（随 PipelineConfig.fps）、会话协商 `min(requested,caps)`、pipeline `fps>0` 无上限、curtain `--fps N`——120/144/240 全程参数直传。**本机 120fps 真机实测**（幕布 120fps 供给，真供 1200 帧/10s）：① 640x360×120 双进程 30s——host captured 3382 == encoded 3382（弃帧全 0）== client displayed 3380（零丢失），**端到端 114.6fps 无损穿透**（瓶颈=SCK 供给 ~115fps，ProMotion 量化，非管线）；p50 13.5ms / 首帧 744ms / 输入单向 1.24ms。② 1080p×120 双进程 90s——**SCK 供给 107.3fps（9602 帧）、VT 编码吞吐 98.9fps（8857 帧，745 帧被预算门正确拦截）**：本机硬编物理上限 <120fps（VT 1080p 单帧 P50≈9.2ms > 8.33ms 帧间隔），1080p×120 需降码率/降分辨率或更强芯片；displayed 45.5fps 为单屏遮挡自反馈伪影（不采信）。**144fps 离线全链**（fake 后端 loopback 6s）：**Gate 通过，displayed 144.0fps 满帧 / p50 10.0ms / 队列峰值 1**。**240fps 离线全链**：displayed 200.2fps（fake WallEncoder 模拟编码节奏 ~5ms/帧所限=83% 达成）、p50 17.8ms、队列 2——**240fps 帧间隔（4.17ms）下调度/管线/呈现全部健康**。144/240 真机验证待外接高刷屏（记账） | 120 ✅（114.6 无损）；144 ✅（离线满帧）；240 管线健康 ✅ |
+| **VT 过载丢帧可恢复化（2026-11-22，workflow「编码器过载丢帧可恢复化」；1080p×120 实测暴露的产品级 bug）** | 症状：1080p×120 首测 host 报 `encoder error: VideoToolbox 丢弃了本帧（RealTime 过载）` 后**会话终止**（Error::Encoder 恒 is_fatal → host.rs 上抛 → client 断线 resume 被拒）。修复：rc-types 新增 `Error::EncoderDroppedFrame`（is_fatal=**false**，铁律 5 同步测试）+ rc-encode-vt Dropped 分支改返新变体且**不再置 idr_requested**（Dropped=编码器未编此帧、参考链无损，无需 IDR；Timeout=输出已产生被弃、参考链真断，保留 IDR 不变——复核员逐行论证）+ rc-pipeline Err 路径记 DroppedStale 结局后继续。离线：`encoder_overload_drop_does_not_stop_pipeline`（注入 3 帧丢帧→管线存活、槽位释放、后续帧继续）+ 变异验证（is_fatal 改 true 测试即挂）。**真机复测**：1080p×120 90s 会话存活，745 过载帧被预算门拦截、28 次 IdrRequest 全部消化。workspace **492 测试全绿 / clippy / fmt 干净**，独立复核通过 | 会话存活 ✅ 过载可恢复 ✅ |
+| **M2 代码评审轮（2026-11-22，workflow「M2 代码评审轮」：六路模块评审 + 27 条逐条独立确认，0 推翻）** | 范围=133fff0 之后全部未提交代码（rc-session 全 crate + rc-cli host/client + 四 crate 增量 + 三修复交互 + 高帧率路径）。**成立 27 条：high 1 / medium 10 / low 16**。High：Detached 期一条脏控制消息可杀 host 进程（`tick_detached` 的 decode `?` 上抛 × run/CLI 遇错即退，无鉴权窗口下攻击面真实）。Medium 四族：①时钟纪元族（RefreshGuard 生产阈值下第二次刷新数学上不可能触发（base 钉死，8.4e9>u32::MAX）；CLI client 钟从不重锚，71.6min 冻结 u32::MAX，看门狗/探测全停摆；重连退避锚点跨纪元回绕→70min 僵尸重连）②错误路径族（client 多处 `?` 裸抛绕过 S8/S6 停机序列；Detached 期 accept 非 Timeout 错误（未认证 TLS 探测包）杀 host）③InputAck 关联族（key_batch_seq 跨会话不复位 + 断线在途批错位→伪单向延迟样本）④Resume 窗口成功 resume 后从不重开（第二次断线必走全量重建慢路径）+ 捕获错误 unwrap_or_default 静默吞（I9 可诊断性）。Low 16：统计口径（datagrams_sent 混入探测块 / events_injected 少记 / displayed_fps 双向偏差）、median_i64 溢出、测试子进程不清理、dev 证书非环回无警告、justfile ui 入口与 rc-ui exclude 打架、RecordingInjector 无界等。全部发现带 path:line 证据并经独立确认员复核（评审报告卡留档） | 评审完成 ✅ 待修复 |
+| **评审修复轮（2026-11-22，workflow「评审修复轮：27 条清零」：四卡修复 → 全仓门禁 → 对照复核）** | 卡A host+reconnect 11 项：high 脏消息杀 host→消化+计数（dirty_candidates/accept_errors，坏候选≠坏会话）；RefreshGuard **wrapping 纪元差修法**（u32 base + `wrapping_sub >= threshold`，双纪元各触发一次有测试）+ 新会话重锚 base + pending 在途抑制；ResumeWindow reopen（resume/新会话后重开，两轮断线两轮 resume）；pending_epoch_reset 消费点迁至「Streaming 首条对端证据」（Welcome 丢失重试仍带 bit1）；先检后拆；current_bitrate/key_batches/events_injected/probe_datagrams 口径五修；Backoff 亚毫秒拒绝。卡B client 4 项：裸 `?` 全族改「置脏→完整停机→Err」（1 字节 0x09 数据报/session_id 不符 Welcome/poll 错误均不再卡 Streaming）；resume 清 pending_input_acks + 全新重建归零重计（与 host 全新会话复位对齐）；捕获错误计数+限流 stderr；双 Bye 先到生效。卡C 4 项：CLI client 钟可变锚点 + session_id 变更即重锚（71.6min 冻结根除）；median_i64 i128 中转；displayed_fps 口径（分母首帧起算实测窗、分子剔排空帧）；fake 钟单采样锚。卡D 5 项：MIN_PACKET_PAYLOAD=16 构造期校验（16×65535≈1MiB 才可能 panic）；测试超时 kill 双子进程；dev 证书非环回警告；justfile ui 入口注释停用（T21 接入后恢复）；RecordingInjector 10 万上限丢最旧。**变异验证**：卡B 5 处逐项移除修复对应测试全转红。workspace **528 passed / 0 failed / clippy / fmt 干净**，复核员对照 27 条逐项核验通过 | 27 条清零 ✅ 复核通过 ✅ |
 
 显著变差时先查 `Cargo.toml` 的 profile 与 `.cargo/config.toml` 是否被改。
 
@@ -879,6 +890,73 @@ profile 与码控核对无需改动：构造期已落死 Baseline（CAVLC、无 
   上必失败」的推演验证，复核员另亲跑 crate 级 11/12 全绿交叉印证）；脚本内建末轮终复跑，
   本轮无手工补跑。仍未 git commit。
 
+- **M2 会话核心轮（2026-11-21，三段式：写卡 workflow → 实现 workflow → 两轮根因修复 workflow + 主 agent 真机实测）**：
+  - **写卡**：rc-session 定案（不放 rc-net——T09 红线；不放 rc-pipeline——M1 稳定层不塞连接
+    生命周期；rc-cli 保持薄）。T13–T22 十卡，评审 13 项修复（审批抽象统一、dev_cert 不漏
+    rustls、铁律 4 grep 豁免口径闭环等）。发现并处置：并行 UI 会话的 crates/rc-ui/（Tauri
+    v2，12 屏已过视觉验收）当时已在 members 里——**移出 workspace + exclude**（T21 轮接入
+    前不该进全仓门禁，Tauri 依赖会拖垮构建）。
+  - **实现**：六卡串行（T15/T16 逻辑并列但同改 client_session.rs，串行避免同文件竞争），
+    每卡后 cargo check 绊线。实现员共记录 30+ 处「卡与代码出入」（按事实实现、卡不动），
+    复核员逐卡核对。T17 施工中曾误判「子 agent 挂死」——**spent_tokens 只计已结算步骤**，
+    未结算的执行中 ask 不进总数；用文件 mtime（client_session.rs 5 分钟内被改）判定存活，
+    避免了一次错误的 AmendWorkflow 重跑。
+  - **根因 1（MTU 错配）**：分片预算（pipeline 侧 32B 头在外）与数据报预算（rc-net 侧
+    32B 头在内）两套口径在 1200 处撞车：1120+32=1152 恰好闭合。教训：**跨 crate 的字节
+    预算必须单点定义**，两端各自取整必然错配；M1 loopback 直连没有这道墙所以全绿。
+  - **根因 2（时钟锚定）**：SckConfig.origin_us=None 时 SCK 以首帧 PTS 为零点，会话钟以
+    工厂采样为零点，Δ=首帧延迟 ≫ target_latency=22ms → 帧帧 Stale。**排查盲飞 2 轮的教训**：
+    host 会话摘要原本没有 captured/dropped_stale 统计（M1 的 report 有），第一反应应该是
+    「统计面先补齐再看」而不是继续猜——先测后拆同样适用于排查本身。修复顺序对齐
+    rc-loopback:264-265 的既有正确实现。
+  - **本机双进程方法论三坑（真双机不存在，但本机验证 M2 必须绕过）**：① dev-run.sh 单
+    实例设计——两个 launcher 并发 rm -rf 同一 app 目录会互炸（解法：先打包、cp -R 出第二
+    个 bundle，双实例分别 open）；② client 全屏 Metal 黑窗在首帧前盖住供给源 → SCK 看到
+    静止 → 铁律 2 零编码 → **自饿死死锁**（解法：client 请求小分辨率 640x360 让窗口不遮
+    幕布；或幕布后起压顶——但首帧/fps gate 会吃伪影）；③ 幕布供给的「采集内容=client 呈现
+    内容」自反馈回路让 1080p fps 不规则（Run C 45.5fps 归因于此，不作为产品数字）。
+  - **遗留（下轮输入）**：首帧 630–1306ms 方差贴 800ms 线（优化候选：host 在 accept 等待
+    期预建 SCK 流 + 编码器预热）；dev-run.sh test 子命令打包最后一个测试二进制的漏跑缺陷；
+    T19 鉴权 / T20 剪贴板 / T21 UI（rc-ui 接入）/ T22 托盘四卡待领取；双机真机实测（用户
+    裁决本轮不做）。仍未 git commit（M2 代码 + 回写全部未提交）。
+
+- **高帧率轮（2026-11-22，用户需求「120 144 240，本机 MBP 只能到 120」）**：
+  - 实测结论分层：**管线不是 120fps 瓶颈**（640x360×120 全链 114.6fps 无损，captured==
+    encoded==displayed 逐帧对齐）；**SCK 供给上限 ~115fps**（ProMotion 下 120fps 配置实采
+    107-115fps，随分辨率变化）；**VT 1080p 硬编吞吐 98.9fps** 是 1080p×120 的物理上限
+    （单帧 P50 9.2ms > 8.33ms 间隔）——高帧率×高分辨率的正解是 M3-4/3-5 码率/分辨率
+    自适应，不是硬扛。
+  - **VT 过载丢帧曾直接拆会话**（Error::Encoder 恒 fatal 的设计假设对过载瞬态不成立）；
+    更隐蔽的是 rc-encode-vt 对 Dropped 也置 idr_requested——过载时下一帧强制编最贵的
+    IDR 帧，火上浇油。参考链语义辨析：Dropped（未编此帧）无需 IDR，Timeout（编了但弃
+    输出）才需要——两者此前混为一谈。
+  - 240fps 离线 200.2fps 的天花板是 fake WallEncoder 的模拟编码节奏（~5ms/帧），不是
+    调度器；真机 240 需外接 240Hz 屏 + 编码 ≤4.17ms/帧，记账待设备。
+  - 遮挡自反馈伪影在高帧率下更明显（displayed 与 SCK 供给互相锁频到 45.5fps），本机
+    1080p 高帧率的干净数据 fundamentally 拿不到——结论以小分辨率无损穿透 + 分段瓶颈
+
+- **M2 代码评审轮（2026-11-22）**：六路评审（host+proto / client+watchdog / probe+reconnect /
+  CLI+report / 既有 crate 增量 / 三修复交互+高帧率）→ 27 条成立、0 推翻。三个结构性教训：
+  ① **u32 时钟纪元管理是系统性弱点**——RefreshGuard 自禁用、CLI client 钟不重锚、退避锚
+  跨纪元回绕，三个 medium 同根：会话层把「纪元重建」的职责散落在守卫/驱动器/退避三处，
+  没有单点。修复方向：纪元重置随 expect_hello/重建单点化。
+  ② **「外部输入杀死进程」族**（high + accept 错误上抛同族）：无鉴权阶段一切远端可触发的
+  错误路径都必须按「坏候选≠坏会话」消化，T19 鉴权落地前的窗口期尤其如此。
+  ③ **评审盲区在驱动器**：rc-session 集成测试驱动器都「正确地」处理了时钟重锚/错误继续
+  驱动，而 CLI 驱动器没有——测试驱动器与生产驱动器的行为差异是多个发现的共同根源，
+  后续测试驱动器应尽量复用 CLI 的驱动代码路径。
+  下一步：修复轮（high+medium 全修、low 顺手修）→ **8h soak 前必须完成**（时钟纪元族在
+- **评审修复轮（2026-11-22）**：四卡布局（A host+reconnect ∥ B client 同文件隔离并行 →
+  C CLI 时钟 ∥ D 杂项文件不交叉），门禁一轮修复 clippy 后全绿，复核员对照 27 条逐项通过。
+  要点：①时钟纪元族用**全仓 wrapping 纪律**系统性修（refresh_base u32 化 + wrapping_sub，
+  而非三处补丁）——第二轮元照常 70min 触发有测试锁死；②「坏候选≠坏会话」成为 Detached 期
+  一切外部输入错误的统一处置（消化+计数，进程不死）；③变异验证（逐项移除修复→测试转红）
+  在卡 B 全程使用，是修复轮的新基线动作；④known follow-up：host_client 集成套件在同机
+  并发负载下有时序抖动（机器安静 5 轮+全绿，卡 D 实测记录），soak 前建议串行跑确认。
+  遗留：时钟纪元族的真实 70min 跨越属运行时行为，待 8h soak 验证。
+  71.6min 即引爆）→ 提交。
+    实测拼合论证。
+
 - **UI 设计规范与 rc-ui 框架决策（2026-11-21，设计轮，零代码）**：
   - 框架决策：rc-ui = **GPUI（zed 官方 crate v0.2.2，2026-10 上 crates.io）+ gpui-kit（longbridge
     v0.10.0，75+ 组件/Lucide 图标/主题系统）**。依据：① 任务书原写「Tauri 或 egui」未定；
@@ -912,6 +990,199 @@ profile 与码控核对无需改动：构造期已落死 Baseline（CAVLC、无 
   - **并行策略确认（同日问答）**：确认 rc-ui 可与任务书其他工作并行开工（零 rc-* 依赖、
     mock 先行），设计文档 §8.1 固化接线点清单（11 项：元素→本期 mock→接线目标→前置卡）；
     唯一例外=S1 视频桥接（GPUI↔外部 CAMetalLayer）为技术未知数，开工首项应为最小 spike。
+  - **框架改选 Tauri v2（2026-11-21 用户裁决，推翻 GPUI 决策）**：三框架实测与评估后定为
+    **Tauri v2 2.12.7 stable（2026-11-18 发布）+ 纯静态 HTML/CSS/JS 前端（不上前端框架）**。
+    ① **内存实测**（本机 macOS arm64，release，最小空窗口，两次复测一致）：GPUI 二进制
+    4.0MB / RSS **90MB**（无 webview）；Dioxus desktop 4.6MB / RSS 97MB + WebKit 内容进程
+    32MB = **129MB**；Tauri v2 同为 webview 架构预计 ≈129MB。用户裁决「100 多 MB 可接受」，
+    故内存不再是决定因素。② **淘汰 GPUI**：gpui-kit 三个月内 0.6→0.10 高频破坏式迭代；
+    无头测试平台 `draw()` 为空实现（`gpui-0.2.1/src/platform/test/window.rs:269`）导致视觉
+    验收无法自动化、只能开真窗口人工看图；macOS 构建默认强制 `xcrun metal`（需完整 Xcode，
+    本机仅 CLT，`runtime_shaders` feature 可绕过但着色器优化从 `-MO` 降为默认档）；三平台
+    各需特殊构建链。③ **淘汰 Dioxus**：`dioxus-desktop` 自述即「WebView renderer」，内存
+    与 Tauri 同档无优势；已推进 0.8.0-alpha.3 破窗期（0.7.10 为稳定版），界面写完即面临大
+    版本迁移；开机自启/剪贴板/文件对话框/更新无官方一等支持。④ **采纳 Tauri 理由**：2.x
+    稳定线 API 长期冻结；所需桌面能力全有官方插件（autostart/clipboard-manager/dialog/
+    updater/single-instance/opener）；CSS `backdrop-filter` 可做**真毛玻璃**（GPUI 只能半透明
+    近似）；视觉验收可脚本化截图（Playwright / tauri-driver）——成本远低于 GPUI 的人工看图。
+    ⑤ **构建约束厘清**：GPUI 与 Tauri 同样**无法跨平台交叉编译**（Windows 均需 MSVC），
+    三平台各自构建属原生桌面常态；Tauri 无需 Xcode metal / fxc，构建门槛更低。
+    ⑥ **CI 成本**：GitHub Actions macOS runner $0.062/min（约 Linux 10.3×），Free 档 $12/月
+    仅够约 193 分钟；**公开仓库与自托管 runner 免费**。本项目真机权限测试（固定签名 +
+    TCC 授权）本就只能在自托管 Mac 上跑，故自托管是必需而非省钱选项。
+    ⑦ 设计文档已全面重写 §8（选型依据/目录结构/CSS 组件映射/多窗口/接线点/视频双路径），
+    `07-engineering-velocity.md` L64 同步改为「Tauri v2 + 静态前端」。
+  - **rc-ui 12 屏已实现（2026-11-21，workflow「实现 RabbitControl UI 12 屏」）**：Tauri v2
+    脚手架 + 纯静态 HTML/CSS/JS 全部落地，**6/6 屏通过视觉验收**（visual-judge 逐页判定）。
+    ① **交付**：`crates/rc-ui/`（Cargo.toml/build.rs/tauri.conf.json/capabilities/icons/
+    src/main.rs）+ `crates/rc-ui/ui/`（6 个 HTML：index/settings/transfer/portmap/terminal/
+    session；9 个 CSS：tokens + base + 8 个页面样式；7 个 JS：app/mock/overlay/transfer/
+    portmap/session/validate），共 22 个前端文件、**8495 行**；覆盖 P1/P2/P3 + O1/O2/O3 +
+    W1/W2/W3/W4 + S1/S2/S3/S4 共 14 个界面（浮层 O1–O3 嵌主窗口，无独立 HTML）。
+    ② **编译门禁**：`cargo check -p rc-ui` ✅ 0.56s；`cargo check --workspace` ✅ 0.58s
+    （21 个既有 crate 未被破坏）。
+    ③ **确定性校验**（替代 LLM 评审，因 provider 卡在 backoff 32 分钟）：6 项检查全过——
+    裸写色值 0 处（token 纪律 100%）、12 项 §6.0 关键 mock 文案全命中、6 个 HTML 标签闭合
+    完好、4 个 CSS 含 backdrop-filter 毛玻璃、25 个文件齐备、mock 数据与设计文档一致。
+    ④ **视觉验收**（documents:visual-judge 两轮）：首轮 4 过 2 败——W2 进度条 47% 填充不可见
+    （`.progress__track` 缺 `display:block` 致 `width:47%` 失效）、W3 prompt 显示字面
+    `[host]`/`[path]` 占位符；修复后复验**全部 pass**（进度条正常显示 47% 蓝色填充、prompt
+    改为 `yii@MacBook-Pro` / `/Users/yii`）。
+    ⑤ **实现取舍**（子 agent 记录，已在代码注释留痕）：W2 队列卡 240px 不足容纳 4 行×44 故改
+    `min-height:240`；W4 保存键改字段级即时校验以确保红框可观察；O3 箭头描边取 `--stroke`；
+    W1 chrome 底带取 `--bg-sidebar`（白卡需非白底才成立）；侧栏分界线由 border 改 inset
+    box-shadow 避免 1px 挤压。
+    ⑥ **未覆盖**：Tauri 真窗口未实测（backdrop-filter 在 WKWebView 的表现按 §8.2 声明为支持）；
+    Rust 侧多窗口创建未做（settings.html 目前 `window.open`）；全部数据为 §6.0 mock，§8.4
+    真后端接线属后续；未打包（`bundle.active=false`）；未跑 `cargo test -p rc-ui`（无 Rust
+    逻辑，纯静态前端）。
+  - **rc-ui 真窗口验证与门禁收口（2026-11-21 第二轮，补齐上一轮遗留）**：上一轮只做静态
+    前端 + Chrome headless 截图，本轮补真实运行与门禁。
+    ① **真窗口启动成功**：`cargo build -p rc-ui` 3.46s → `./target/debug/rc-ui` 进程存活
+    （PID 见 /tmp/rc-ui-run3.log，无 panic）→ `screencapture` 确认界面真实渲染（侧栏设备
+    列表、标题栏「在线」pill、预览卡「进入桌面 →」、底部四组工具条全部正确显示），非白屏。
+    ② **修复真窗口缺陷**：首轮真窗口出现**双份交通灯**（Tauri 原生 titlebar + HTML 自绘）。
+    修法 = `tauri.conf.json` 主窗口加 `titleBarStyle: "Overlay"` + `hiddenTitle: true`（内容
+    延伸到标题栏），并在 `app.js` 的 `boot()` 检测 `window.__TAURI_INTERNALS__` 给 body 打
+    `.is-tauri`，由 `overlay.css` 隐藏自绘交通灯（浏览器预览保留，便于比对设计稿）。重建后
+    复截图确认只剩一组原生交通灯 ✅。
+    ③ **Rust 侧多窗口已实现**（填补上一轮遗漏）：新增 `crates/rc-ui/src/window.rs`——
+    `ToolWindow` 枚举（Settings/Transfer/Terminal/PortMap/Session）+ `show_tool_window`（同
+    label 已存在则聚焦复用，不重复创建）+ 两个 IPC 命令 `open_tool_window(kind)` /
+    `open_session_window()`，尺寸严格按 §2 窗口清单（设置 660×640 不可调、传输 1400×860/
+    最小 1120×720 等）。前端 `app.js` 的 `openWindow(kind)` 与 `openSession()` 已改为 Tauri
+    内 `invoke` 走原生窗口、浏览器预览回落 `window.open`。
+    ④ **门禁全绿**：`cargo clippy -p rc-ui --all-targets -- -D warnings` → 0 警告；
+    `cargo fmt -p rc-ui --check` → PASS（首次有换行差异，已 fmt 修正）；`cargo test -p rc-ui`
+    → **5 passed / 0 failed**（种类解析全覆盖、拒绝未知 kind、label/url 唯一性、设置窗口
+    固定尺寸、可调窗口最小尺寸不超默认）；`cargo test --workspace` → **450 passed / 0 failed**
+    （原 445 + rc-ui 5）；`cargo check --workspace` → 1.13s 通过。
+    ⑤ **justfile 增 ui recipe**：`ui`（cargo run -p rc-ui）、`ui-build`、`ui-preview port`
+    （浏览器逐屏预览，默认 8791）。注：本机未安装 `just`（既有情况，非本次引入），recipe
+    语法沿用项目现有格式。
+    ⑥ **已知限制（本轮无法验证项）**：多窗口 IPC 的**端到端点击验证**未做——macOS 未授予
+    AppleScript/辅助功能权限（`System Events` 报 -1743），无法脚本点击 UI 触发；多窗口逻辑
+    已由 5 个单元测试覆盖（解析/label 唯一/尺寸约束），但"点击后新窗口真的弹出"这一环需人工
+    确认。`backdrop-filter` 在 WKWebView 的表现同样未实测（真窗口截图时浮层未展开）。
+    运行方式：`./target/debug/rc-ui` 或 `just ui`；浏览器预览 `just ui-preview`。
+  - **rc-ui computer-use 全界面交互验证（2026-11-21 第三轮）**：用户指出「有 computer use
+    就不该说没法点击」，遂用 `computer-use` 技能对真窗口逐屏点击验证，**推翻第二轮的两项
+    「未完成」**，并发现一个 ACL 真 bug。
+    ① **发现并修复 ACL 授权缺失（真 bug，high）**：`crates/rc-ui/capabilities/default.json`
+    原只有 `permissions: ["core:default"]`，而 `open_tool_window` / `open_session_window`
+    是自定义命令——Tauri v2 的 ACL 会直接拒绝，多窗口实际点不开（第二轮仅凭单测通过就判定
+    「已实现」，属验证不足）。修法 = 新建 `crates/rc-ui/permissions/default.toml` 定义
+    `[[permission]] identifier = "allow-window-open"` 声明这两个 command，capabilities
+    改引用 `["core:default", "allow-window-open"]`；重建后 `allow-window-open` 进入
+    `gen/schemas/desktop-schema.json` 可查。
+    ② **多窗口端到端验证 ✅（推翻第二轮「未完成」）**：用临时 `?e2e=1` 钩子（验证后已删除，
+    `app.js` 与 `tauri.conf.json` 均已还原）在主窗口启动 1.5s 后自动 `invoke`，再用
+    CoreGraphics `CGWindowListCopyWindowInfo` 列窗口（自写 `/tmp/winlist.swift`，绕开
+    AppleScript 的 TCC 授权限制）→ 结果 **「设置」660×640 + 主窗 1440×865，TOTAL=2**，尺寸
+    与设计文档 §2 W1 完全一致。截图确认设置窗口渲染正确（四 tab 选中态、四分组卡、开关、
+    行内下拉、mono 路径、灰字实名认证）。
+    ③ **`backdrop-filter` 在 WKWebView 已证实生效 ✅（推翻第二轮「未实测」）**：O1/O2/O3/S3
+    截图均可看到背景内容真实模糊透出（非半透明近似），毛玻璃效果与参考图一致。
+    ④ **9 个界面真窗口交互验证全通过**（computer use 点击 + AX 树断言 + screencapture 三重）：
+    P1（侧栏 3 设备/预览卡/工具条 4 项+更多）、P3（电脑 4 + 手机平板 4，逐字对齐 §6.0，
+    「本机」pill 仅 1 台）、O1（heading + 6 工具 + 调整顺序/关闭）、O2（安全锁定/设置/
+    帮助与反馈/在线客服/关于/检查更新 6 项）、O3（退出登录 + `151******21` + 我的卡券）、
+    W1（四 tab + 四分组卡）、S1（1280×800；盾+屏幕 tab+计时器+HUD 七行）、S2（防窥=隐私屏保/
+    被控静音=0/自动锁屏=0 三个默认值全对）、S3（11 项菜单含 `⌥⌘N`/`F` 快捷键与红色退出远控）。
+    ⑤ **计时器实测在走**：S1 连续观测 `00:00:21` → `00:01:07` → `00:01:19` → `00:01:34`，
+    证明注入时钟（设计文档 §8.6.2）真实工作，非静态文本。
+    ⑥ 截图留档：`/tmp/ui-shots/` 共 27 张（含 o1-open/o2-open/o3-open/s1-open/s3-open
+    /tauri-settings-window 等真窗口证据）。
+  - **rc-ui 剩余未完成项清单（2026-11-21 核验，逐条带证据）**：
+    | # | 未完成项 | 证据 | 优先级 |
+    |---|---|---|---|
+    | 1 | **应用打包未做** | `tauri.conf.json` 中 `"bundle": { "active": false }`；`ls target/debug/bundle` 无产物 | 发布前必须 |
+    | 2 | **CSP 未配置** | `"security": { "csp": null }`（脚手架留空） | 发布前应收紧为 `default-src 'self'` |
+    | 3 | **真实后端接线未做**（§8.4 十二项） | 全部数据来自 `ui/assets/js/mock.js`（§6.0） | M2-6 后续 |
+    | 4 | **S1 视频画面为占位** | 画面区仅 `STAGE_BG` + 灰字；§8.5 双路径（原生 Metal 层叠加 / 帧转 Web）未 spike | M2-6 后续 |
+    | 5 | **`just` 命令本机不可用** | `which just` → not found（项目既有环境问题，非本次引入） | 低 |
+    | 6 | **1120×720 最小尺寸布局未实测** | CSS 有 `min-width/height` 约束（main.css:87、transfer.css:31），但未实际缩窗截图 | 低 |
+    | 7 | **W2 双栏未联动滚动** | 设计文档 §10 已列为未决项，本期独立滚动 | 低 |
+    | 8 | **O1「调整顺序」、O2 占位项为 Toast** | 设计文档 §6 明确为占位行为 | 低 |
+    | 9 | **浮层状态丢失**（本轮验证中观察到） | 点 O1「关闭」时因 AX 索引错位点到侧栏「全部设备」，页面从 P1 跳到 P3——说明浮层关闭与路由互不干扰（符合预期），但也暴露**浮层打开时 AX 索引会整体偏移**，自动化脚本需每次重新取索引 | 观察项 |
+  - **CSS 公共组件收敛（2026-11-21，base.css 从 1 行注释变 510 行唯一实现）**：上一轮审计发现
+    `assets/css/base.css` 全文只有 99 字节一行注释，而 reset / 按钮 / Pill / Toast / 交通灯在
+    6 个页面各写一遍且已分叉。本轮逐页读完 6 个 HTML + 9 个 CSS 后收敛：
+    ① **重置去重**：`box-sizing` 重置由 4 处（main.css / transfer.css / portmap.css /
+    overlay.css 各自一份，加 session.css 的 `body[data-page] *` 变体共 5 处）并为 base.css 唯一
+    一份；`grep -rn "box-sizing" assets/css/` 现在只有 `base.css:24` 一处。body 的
+    `font-family` / `-webkit-font-smoothing` / `text-rendering` 由 3–7 份并为 1 份。
+    ② **组件上收**：`.ic`（含 `stroke-width: var(--icon-stroke)`）、`.sprite`、StatusDot、
+    Pill 五语义、Button（Primary/Secondary/Danger/Ghost + 禁用）、Toast、交通灯、titlebar 基础、
+    滚动条全部进 base.css；页面 CSS 只留 `.p1__* / .p2__* / .p3__* / .tr-* / .pm-* / .sn-* /
+    .rc-tab* / .rc-setting-*` 等布局与专属件。
+    ③ **分叉合并取更完整的一份**：`.btn` 以 portmap 版为主（含 `--primary`，token 驱动的
+    背景/边框），补上只存在于 `.rc-btn` 的 `--danger` 与 transfer 版的禁用阴影清除；禁用态统一
+    为 `FILL_OFF` 底 + `TEXT_DISABLED` 字 + `border-color: transparent`（消掉 transfer
+    `transparent` vs portmap `var(--stroke)` 的分叉）。
+    ④ **交通灯统一**：tokens.css 新增 `--traffic-close:#FF5F57 / --traffic-min:#FEBC2E /
+    --traffic-zoom:#28C840 / --traffic-size:12px / --traffic-gap:8px / --pad-titlebar-x:12px`；
+    base.css 写唯一一份 `.traffic` 组件，用**选择器别名**把四种历史类名
+    （`.rc-traffic__dot` / `.traffic__light` / `.tm-traffic__dot` / `.sn-bar__dot`）映射到同一
+    实现——HTML 里的 class 名一个没改（JS 依赖），各页只保留 `.traffic { position:absolute;
+    left: var(--pad-titlebar-x) }` 这类定位规则。色彩由「语义色近似」（`--danger/--warning/
+    --online`）改为 macOS 原生三色。
+    ⑤ **引入 base.css 的 6 个页面**：`transfer/portmap/terminal/session.html` 补
+    `<link href="assets/css/base.css">`（index/settings 原有），顺序统一
+    tokens → base → page；六个 HTML 各只增加 1 行（363→363 之外的 5 页均 +1）。
+    ⑥ **验证（chrome 实跑，非静态读文件）**：`ALL COMPONENT CHECKS PASSED`——6 页标题栏
+    52（session 会话栏 48 属另一规格）、交通灯全部 12×12 / gap 8 / rgb(255,95,87)、
+    rgb(254,188,46)、rgb(40,200,64)、`.btn--primary` 正常 rgb(51,112,255)/禁用 rgb(233,233,235)
+    +rgb(176,176,181)+无边框无阴影、三处 Toast 均 36 高且 transfer/portmap 为 fixed、
+    session 为 absolute、`.ic` stroke 1.5、滚动条 8px、`.pill` gap 6 而 `.sn-pill` gap 保留 4。
+    JS 回归：O1/O3 浮层可开（`.rc-tools` 72 高行、关闭键 40×40）、portmap Modal 可开、
+    transfer/portmap/settings 三个 Toast 均可显示，`pageerror`/`console.error` **0 条**。
+    ⑦ **踩到的坑（已修）**：把 `line-height: 1.5` 一起上收进 base.css 会让 W2/W4 正文行高
+    从 `normal` 变 `22.5px`（实测 212 / 24 个盒子位移），故该声明**留在 main.css**——它原本就只在
+    主窗口声明过；`.sn-pill` 的 `gap` 原为 4（其余 Pill 为 6）、`.rc-btn` 的 `gap` 原为 8，
+    均在 base.css 里按原值保留别名，避免「统一」反而造成视觉跳变。
+  - **rc-ui 视觉精致度重构收尾（2026-11-21 第四轮，workflow「UI 视觉重构收尾」）**：
+    承接 31 条粗糙点诊断，补齐 5 项高风险缺陷与门禁。**视觉验收两次撞 provider 拒绝
+    （`invalid_request_error` code 11133，当前模型不支持该请求），改由主 agent 逐页读图
+    + 确定性门禁完成验收**。
+    ① **D2 双交通灯已修**：新增 `assets/js/tauri-detect.js`（检测 `__TAURI_INTERNALS__`
+    后给 body 打 `.is-tauri`），settings/transfer/portmap/terminal 四页已引入（session.html
+    本就不自绘标题栏无需）。此前只有主窗口经 app.js 判断，四工具页在 Tauri 内会同时出现
+    原生 + 自绘两套交通灯。
+    ② **D5 侧栏降噪已完成**：8 个高饱和蓝元素（2 分组头 accent 图标 + 6 设备行 accent
+    实底）改灰色系，仅选中行保留 `rgba(51,112,255,.10)` 淡蓝底 + accent 图标；截图实测
+    侧栏仅剩 1 处蓝色。
+    ③ **D10 badge 遮挡已修**：16px badge 覆盖 16px 铃铛的 12/16 宽度 → 缩到 14px +
+    `top:-2px;right:-2px`，铃铛完整可见。
+    ④ **D11 分界线已修**：顶栏底线不再横穿侧栏上方；侧栏/内容区分界改为可见但不生硬的
+    低透明度线。
+    ⑤ **D7b 预览卡自适应**：`flex:1 + min-height` 吃满余高，1440×900 下底部死白从 240px
+    降到 ≤24px。
+    ⑥ **业务逻辑门禁全绿**：HTML id **140 = 基线 140**（零删减）/ data-* **12 = 基线 12**
+    / JS 行数 **2881 > 基线 2865**（只增不减）/ 裸写色值 **0 处** / `box-sizing` 重复
+    **4→1 处** / base.css **99 字节 → 16514 字节**。
+    ⑦ **视觉验收（主 agent 逐页读图，替代被拒的 LLM 验收员）**：P1 侧栏通顶 + 图标降噪 +
+    预览卡 B 态（笔记本轮廓 + 设备名 + 「尚未连接过该设备」，不造假图）✅；W1 卡片阴影
+    柔和 ✅；W2 边框发丝级 + 进度条 47% 清晰 ✅；W4 三态行正确 ✅。
+    **遗留**：W4 标题区距窗口顶偏近（约 90px，参考图留白更大），属各页独立 padding 差异，
+    本轮未修。
+    ⑧ 截图留档：`/tmp/ui-final/`（6 页）、`/tmp/ui-v3/`（重构前后对比）。
+  - **rc-ui 视觉精致度与统一性全面重构（2026-11-22，对齐 UU 远控 macOS 原生质感）**：
+    承接用户对多页视觉分裂、细节粗糙的反馈，对 `crates/rc-ui/ui/` 全量 HTML/CSS/JS 进行视觉体系收敛与缺陷根治（零改动 Rust / `Cargo.toml` / §6.0 mock 文案 / HTML `id` 与 `data-*` 契约）。
+    ① **5 项高/中危视觉缺陷根治**：
+       - P1「进入桌面 →」遮挡（`main.css`）：原 `.p1__preview` 绝对定位 `inset:0` 盖住无定位 `.p1__enter` 致首屏核心按钮消失 → 改为 B 态正常流排版 + 磨玻璃胶囊按钮（悬停渐变为品牌蓝）；同步在 `app.js::renderP1` 修复切换设备时预览图标不随 `device.icon` 变化的问题；
+       - S1 Tauri 双交通灯与全窗适配（`session.html` / `base.css` / `session.css`）：`session.html` 补引 `tauri-detect.js`，`base.css` 补 `.is-tauri .sn-bar__traffic { display: none; }`，`session.css` 补 `body.is-tauri .sn-bar { padding-left: 78px; }` 及全窗铺满规则（同步补全 `terminal.css` 的 `body.is-tauri` 全窗规则）；
+       - W1 Select 下拉箭头缺失（`settings.html`）：`#opt-awake` 与 `#opt-close-window` 两处 `.rc-select` 补齐 14px chevron SVG，路径换行改 `word-break: normal; overflow-wrap: break-word` 消除 `Ra / bbitControl` 断词；
+       - O3 双重蓝色同心圆头像（`overlay.js` / `overlay.css`）：新增无外圈 `user` 图标并改柔和蓝底圆形徽章，消除 `circle-user` 自带外圆环与头像边框重叠；
+       - W4 状态列粗糙字符（`portmap.js`）：`✓`/`✕`/`…` 替换为与 W2 一致的 14px Lucide SVG（`check`/`x`/`clock`）。
+    ② **统一视觉语言与三层表面体系**（`tokens.css` / `base.css` / `pages/*.css`）：
+       - 确立 `--bg-canvas: #F5F6F8`（工具窗画布/侧栏/会话栏）→ `--bg-window: #FFFFFF`（卡片/主内容）→ `--bg-card: #F7F8FA`（P2 内嵌卡）三层对比；
+       - 收敛桌面端精致字号（body 13.5 / title 14 / h2 15 / h1 18 / display 40）与全站唯一 Switch（`40×24`，消除 `overlay.css`/`portmap.css`/`session.css` 三份分叉）和 Select；
+       - 侧栏图标方块统一 `24×24`（未选中白色微立体块 / 选中品牌蓝实心块）、去掉顶栏多余灰底胶囊、补全所有浮层（O1/O2/O3/S2/S3/Modal）外描边与内高光、NSMenu 蓝高亮、W2 勾选行 `.is-selected` 同步高亮与 30px 工具栏对齐、S4 磨砂 HUD 分隔线与画质子菜单 300px 单行说明。
+    ③ **验证证据（本地 HTTP 服务 + Playwright Chromium 无头实测）**：
+       - 静态门禁：`grep -rnE '#[0-9a-fA-F]{3,8}\b|rgba?\(' crates/rc-ui/ui/assets/css/base.css crates/rc-ui/ui/assets/css/pages/` → `ZERO_BARE_COLORS_OK`；5 个工具/会话 HTML 均含 `tauri-detect.js`；`node -e` 跑 `validate.js` → `VALIDATE_JS_OK`；
+       - Playwright 15 屏验证（`rc-ui-verify.mjs`，Retina 2× 渲染，1440×900 / 1120×720 / 660×640 / 1400×860 / 1200×760 / 1280×780 / 1280×800）：`ALL_PLAYWRIGHT_CHECKS_AND_15_SCREENSHOTS_OK`（0 console/page errors；P1 `.p1__enter` 可见且 `elementFromPoint` 命中；1120×720 下 P1/P2 无横向溢出；W1 两处 Select 箭头尺寸 >0；W2 点首行激活「发送 →」；S1 模拟 `.is-tauri` 隐藏自绘灯且 `#btn-shield` left ≥70）；
+       - 全部 15 张截图逐张目视复核通过，留档 `/tmp/rc-ui-after/`。
 
 ---
 

@@ -66,6 +66,16 @@ T11 需要 Linux，T12 需要 macOS。
 | [T04](T04-encode-nvenc.md) | NVENC 编码 | T03 | Win | D2 | ⬜ 待领取（P1） |
 | [T06](T06-encode-software.md) | 软件编码兜底 | T01 | 全 | F | ⬜ 待领取 |
 | [T11](T11-capture-linux.md) | Linux 采集 | T03 | Linux | E | 🔒 P2 归档 |
+| [T13](T13-session-proto.md) | rc-session 控制协议线格式 | — | 全 | M2 | ✅ 已完成（2026-11-21，12 测试；线格式冻结 0x01–0x0C + 0x0D–0x0F 预留） |
+| [T14](T14-session-core.md) | 会话核心：HostSession/ClientSession 状态机与握手 | T13 | 全 | M2 | ✅ 已完成（2026-11-21，26 测试；含真 QUIC 回环集成） |
+| [T15](T15-probe-initial-bitrate.md) | 探测与初始码率（M2-10） | T13, T14 | 全 | M2 | ✅ 已完成（2026-11-21，23 测试；估速→SetBitrate 链路实测） |
+| [T16](T16-idr-reliable-channel.md) | M2-3 IDR 可靠通道完善 | T13, T14 | 全 | M2 | ✅ 已完成（2026-11-21，15 测试；丢包演练 17ms 恢复） |
+| [T17](T17-session-reconnect.md) | 断线重连与会话恢复（M2-9） | T15, T16 | 全 | M2 | ✅ 已完成（2026-11-21，19 测试；rebind 迁移 + 70min 刷新守卫） |
+| [T18](T18-cli-host-client-localhost.md) | rc-cli host/client 双进程直连 + localhost 实测 | T13–T17 | 全（real 仅 macOS） | M2 | ✅ 已完成（2026-11-21，22 测试；localhost 真后端 Run B Gate 全过（首帧 630ms/p50 10.8/p99 18.5/68.3fps），MTU+时钟两根因修复见 TASK.md §13） |
+| [T19](T19-auth-password-approval.md) | M2-5 鉴权：密码挑战 + 接受弹窗联动 | T13, T14 | 全 | M2 | ⬜ 待领取 |
+| [T20](T20-clipboard-text-sync.md) | 剪贴板文本同步（M2-8） | T13, T14 | 全（real 仅 macOS） | M2 | ⬜ 待领取 |
+| [T21](T21-controller-ui.md) | M2-6 控制端 UI（rc-ui） | T13–T18 | **macOS** | M2 | ⬜ 待领取 |
+| [T22](T22-host-tray-approval.md) | 被控端托盘 + 接受弹窗（M2-7） | T18, T19 | **macOS**（会话侧全平台） | M2 | ⬜ 待领取 |
 
 > **2026-11-20 重排**：P0 改为 macOS，主线为 **T02 → T07 → T12 → T05 → T08**。
 > Windows 任务降为 P1（阶段 D），Linux 降为 P2（阶段 E，归档）。
