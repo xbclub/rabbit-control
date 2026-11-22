@@ -1,5 +1,7 @@
 //! 子命令定义、值解析函数与派发。
 
+pub mod client;
+pub mod host;
 pub mod loopback;
 pub mod probe;
 pub mod version;
@@ -19,6 +21,8 @@ pub fn dispatch(command: Command) -> CliResult<ExitCode> {
     match command {
         Command::Loopback(args) => loopback::run(&args),
         Command::Probe(args) => probe::run(&args),
+        Command::Host(args) => host::run(&args),
+        Command::Client(args) => client::run(&args),
         Command::Version => version::run(),
     }
 }
@@ -38,6 +42,10 @@ pub enum Command {
     Loopback(LoopbackArgs),
     /// 探测采集/编码/解码后端可用性（当前为假后端）
     Probe(ProbeArgs),
+    /// 被控端：accept 一条 QUIC 连接并流媒体 + 注入输入（T18）
+    Host(HostArgs),
+    /// 控制端：connect 被控端，跑完整会话并出报告（Gate 通过 exit 0）
+    Client(ClientArgs),
     /// 打印版本、git commit 与编译时间
     Version,
 }
@@ -114,6 +122,124 @@ pub struct ProbeArgs {
     /// 以 JSON 输出（机器可读）
     #[arg(long)]
     pub json: bool,
+}
+
+/// `host` 子命令参数（被控端，T18）。
+#[derive(Args)]
+pub struct HostArgs {
+    /// 监听地址。--duration 是「接受连接后的会话时长」：accept 等待期不消耗
+    ///（accept 等待上限 300s，超时报错 exit 1）。
+    #[arg(long, default_value = "127.0.0.1:9901")]
+    pub listen: std::net::SocketAddr,
+    /// 后端模式：fake / auto / real（复用 parse_backend）。real 下
+    /// host = SCK + VideoToolbox；任一降级即报错 exit 1。
+    #[arg(long, default_value = "fake", value_parser = parse_backend)]
+    pub backend: BackendMode,
+    #[arg(long, default_value = "1920x1080", value_parser = parse_resolution)]
+    pub resolution: Resolution,
+    #[arg(long, default_value_t = 60)]
+    pub fps: u32,
+    /// 目标码率（Hello 请求值；host 按编码器能力夹紧后经 Welcome 裁定）。
+    #[arg(long, default_value_t = 8_000_000)]
+    pub bitrate_bps: u32,
+    /// 会话时长兜底（client 正常关闭发 Bye；到时未收到则自行优雅收尾）。
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    pub duration: Duration,
+    /// 静止画面（铁律 2：静止零编码）。fake 后端下构造 FakeContent::Static
+    /// 栈；client 侧将观测到零媒体数据报。
+    #[arg(long)]
+    pub static_content: bool,
+    /// 注入模式：record = 记录不真注入（默认，免权限）；real = CGEvent
+    /// 真注入（需辅助功能权限，仅 macOS）。
+    #[arg(long, default_value = "record", value_parser = parse_inject_mode)]
+    pub inject_mode: InjectMode,
+    /// 服务端证书 / 私钥 PEM；默认内嵌开发证书（仅开发用，S3）。
+    #[arg(long)]
+    pub cert: Option<PathBuf>,
+    #[arg(long)]
+    pub key: Option<PathBuf>,
+    /// host 侧摘要 JSON 输出路径；省略或 `-` 表示 stdout（无 gate 段）。
+    #[arg(long)]
+    pub report: Option<PathBuf>,
+}
+
+/// `client` 子命令参数（控制端，T18）。
+#[derive(Args)]
+pub struct ClientArgs {
+    /// 对端地址（必填）。
+    #[arg(long)]
+    pub connect: std::net::SocketAddr,
+    /// 后端模式：fake / auto / real。real 下 client = VideoToolbox 解码 +
+    /// Metal 呈现（会弹真窗口）。
+    #[arg(long, default_value = "fake", value_parser = parse_backend)]
+    pub backend: BackendMode,
+    /// 请求参数（Hello 携带；实际以 Welcome 裁定值为准）。
+    #[arg(long, default_value = "1920x1080", value_parser = parse_resolution)]
+    pub resolution: Resolution,
+    #[arg(long, default_value_t = 60)]
+    pub fps: u32,
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    pub duration: Duration,
+    /// 输入模式：scripted = 脚本回放（默认，持续产出输入流量供 InputAck
+    /// 采样）；none = 不发输入；real = CgCapture 本机捕获（需输入监控
+    /// 权限，仅 macOS）。
+    #[arg(long, default_value = "scripted", value_parser = parse_input_mode)]
+    pub input_mode: InputMode,
+    /// 到点主动断开传输层，触发自动退避重连（重连演练，T17 机制）。
+    #[arg(long, value_parser = parse_duration)]
+    pub reconnect_at: Option<Duration>,
+    /// 固定信任的服务端证书 PEM；默认内嵌开发证书公钥。
+    #[arg(long)]
+    pub server_cert: Option<PathBuf>,
+    /// 证书 SAN 名（须与证书匹配）。
+    #[arg(long, default_value = rc_session::dev_cert::DEV_SERVER_NAME)]
+    pub server_name: String,
+    /// 报告 JSON 输出路径；省略或 `-` 表示 stdout（含 gate 段）。
+    #[arg(long)]
+    pub report: Option<PathBuf>,
+}
+
+/// `host --inject-mode` 取值。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InjectMode {
+    /// 记录不真注入（localhost 实测默认，免辅助功能权限）。
+    Record,
+    /// CGEvent 真注入（仅 macOS，需辅助功能权限）。
+    Real,
+}
+
+/// 解析 `host --inject-mode`。
+pub fn parse_inject_mode(s: &str) -> Result<InjectMode, String> {
+    match s {
+        "record" => Ok(InjectMode::Record),
+        "real" => Ok(InjectMode::Real),
+        other => Err(format!(
+            "无效的注入模式 {other:?}：应为 record / real 之一（real 仅 macOS 且需权限）"
+        )),
+    }
+}
+
+/// `client --input-mode` 取值。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputMode {
+    /// 不发输入。
+    None,
+    /// 脚本回放（默认）。
+    Scripted,
+    /// CgCapture 本机捕获（仅 macOS，需输入监控权限）。
+    Real,
+}
+
+/// 解析 `client --input-mode`。
+pub fn parse_input_mode(s: &str) -> Result<InputMode, String> {
+    match s {
+        "none" => Ok(InputMode::None),
+        "scripted" => Ok(InputMode::Scripted),
+        "real" => Ok(InputMode::Real),
+        other => Err(format!(
+            "无效的输入模式 {other:?}：应为 none / scripted / real 之一（real 仅 macOS 且需权限）"
+        )),
+    }
 }
 
 /// 解析 `WxH` 分辨率。拒绝非数字、缺 `x`、多段、零尺寸。

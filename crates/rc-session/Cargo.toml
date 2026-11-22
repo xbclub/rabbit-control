@@ -1,0 +1,25 @@
+[package]
+name = "rc-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl 会话层：M2 控制协议线格式（T13）与会话状态机（T14）。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+rc-net = { path = "../rc-net" }
+rc-pipeline = { path = "../rc-pipeline" }
+rc-input = { path = "../rc-input" }
+rc-trace = { path = "../rc-trace" } # 只读 trace 汇报（unfinished 断言等）
+# with_parts 的公开签名点名了四个后端 trait（Box<dyn rc_capture::CaptureBackend>
+# 等），rc-proto 供测试手工造媒体数据报（任务卡依赖表把 rc-capture/rc-encode/
+# rc-decode/rc-render 列为 dev-dependencies，与 API 契约冲突，按契约落实为
+# 正式依赖——均为 workspace 内 path 依赖，无第三方新增）。
+rc-capture = { path = "../rc-capture" }
+rc-encode = { path = "../rc-encode" }
+rc-decode = { path = "../rc-decode" }
+rc-render = { path = "../rc-render" }
+
+[dev-dependencies]
+rc-proto = { path = "../rc-proto" } # split_frame 手工造数据报（client 单测）

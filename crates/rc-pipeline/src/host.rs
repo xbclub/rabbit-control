@@ -26,7 +26,7 @@
 use crate::{select_all, DiffMode, PipelineConfig};
 use rc_capture::{CaptureBackend, CapturedFrame, FrameTexture};
 use rc_diff::{DiffResult, TileDiff};
-use rc_proto::{split_frame, MediaHeader, MAX_PAYLOAD};
+use rc_proto::{split_frame, MediaHeader};
 use rc_sched::{Decision, DropReason, Scheduler, SchedulerConfig, SchedulerStats};
 use rc_trace::{Mark, Outcome, TraceCollector};
 use rc_types::{Error, FrameKind, Result, Timestamp};
@@ -67,6 +67,26 @@ enum EncodeDone {
     },
 }
 
+/// 调用方线程 → 编码线程的异步命令（M2-10 / T15：[`HostPipeline::set_bitrate`]
+/// 的转发通道；后续动态控制面复用此通道，不另开）。
+enum EncCmd {
+    /// 调整编码目标码率。
+    SetBitrate(u32),
+}
+
+/// 编码线程内应用一条命令：编码器侧拒绝只进 stderr——对齐本文件
+/// 「留 stderr 痕迹便于发现回归」的既有风格，不回传（会话层不该为一次
+/// 码率调整阻塞等待，见 [`HostPipeline::set_bitrate`] 文档）。
+fn apply_enc_cmd(encoder: &mut dyn rc_encode::Encoder, cmd: EncCmd) {
+    match cmd {
+        EncCmd::SetBitrate(bps) => {
+            if let Err(e) = encoder.set_bitrate(bps) {
+                eprintln!("rc-pipeline: set_bitrate({bps}) rejected by encoder: {e}");
+            }
+        }
+    }
+}
+
 /// 被控端管线。
 pub struct HostPipeline {
     cfg: PipelineConfig,
@@ -85,6 +105,8 @@ pub struct HostPipeline {
     enc_done: Receiver<EncodeDone>,
     enc_stop: Arc<AtomicBool>,
     enc_handle: Option<std::thread::JoinHandle<()>>,
+    /// 编码线程命令通道（[`HostPipeline::set_bitrate`] 的转发路径，M2-10）。
+    enc_cmd: SyncSender<EncCmd>,
     /// 会话时钟（见模块文档）。
     clock: Option<Arc<dyn Fn() -> u32 + Send + Sync>>,
     /// 下一帧应编成 IDR（丢帧恢复 / 控制端请求）。粘住直到真正编出 IDR。
@@ -262,6 +284,9 @@ impl HostPipeline {
         // `on_encoded == false` 识别并丢弃产出）。
         let (req_tx, req_rx) = sync_channel::<Mutex<Option<EncodeReq>>>(4);
         let (done_tx, done_rx) = sync_channel::<EncodeDone>(8);
+        // 命令通道（M2-10）：有界容量 8——满即向上报错而不无界堆积，
+        // 对齐 rc-net URGENT_QUEUE_CAPACITY 的有界通道纪律。
+        let (enc_cmd_tx, enc_cmd_rx) = sync_channel::<EncCmd>(8);
         let enc_stop = Arc::new(AtomicBool::new(false));
         let enc_flag = Arc::clone(&enc_stop);
         let mut encoder = encoder;
@@ -269,6 +294,11 @@ impl HostPipeline {
             .name("rc-host-encode".into())
             .spawn(move || {
                 while !enc_flag.load(Ordering::Relaxed) {
+                    // 每轮迭代先应用命令（含 5ms 超时醒来后的轮次：
+                    // 空闲时命令最迟 5ms 生效）。
+                    while let Ok(cmd) = enc_cmd_rx.try_recv() {
+                        apply_enc_cmd(encoder.as_mut(), cmd);
+                    }
                     match req_rx.recv_timeout(Duration::from_millis(5)) {
                         Ok(slot) => {
                             let req = slot.lock().expect("req lock").take();
@@ -290,6 +320,10 @@ impl HostPipeline {
                         }
                         Err(_) => continue,
                     }
+                }
+                // 停机排空段同样先排命令再排编码请求。
+                while let Ok(cmd) = enc_cmd_rx.try_recv() {
+                    apply_enc_cmd(encoder.as_mut(), cmd);
                 }
                 // 停机前排空已提交的请求（P2：每帧都要有结局）。
                 while let Ok(slot) = req_rx.try_recv() {
@@ -326,6 +360,7 @@ impl HostPipeline {
             enc_done: done_rx,
             enc_stop,
             enc_handle: Some(enc_handle),
+            enc_cmd: enc_cmd_tx,
             clock: None,
             pending_idr: false,
             no_idr_yet: true,
@@ -399,7 +434,9 @@ impl HostPipeline {
                         encode_done_ts,
                         self.fec_group,
                         &frame.data,
-                        MAX_PAYLOAD,
+                        // 分片预算来自配置（默认 MAX_PAYLOAD = M1 行为；真 QUIC
+                        // 会话层按 rc-net 的 N2 预算覆盖，见字段文档）。
+                        self.cfg.max_packet_payload,
                     );
                     self.fec_group = self.fec_group.wrapping_add(1);
                     let sent_at = self.now(now_us);
@@ -413,7 +450,17 @@ impl HostPipeline {
                     // P2：Err 路径同样先释放槽位（P7：不终止管线）。
                     self.sched.on_encoded(seq, now_us);
                     if let Some(f) = self.trace.get_mut(seq) {
-                        f.finish(Outcome::DecodeError);
+                        // 编码器过载丢帧（EncoderDroppedFrame）：帧在编码器
+                        // 入口被丢、未进参考链。最贴近的现有结局是
+                        // DroppedStale（「超过 deadline 主动丢弃」——RealTime
+                        // 过载丢帧的本质就是编码器判定本帧编不进实时预算）；
+                        // 本次修复不新增 Outcome 变体（红线），其余编码
+                        // 错误沿用既有 DecodeError 记法。
+                        let outcome = match &err {
+                            Error::EncoderDroppedFrame { .. } => Outcome::DroppedStale,
+                            _ => Outcome::DecodeError,
+                        };
+                        f.finish(outcome);
                     }
                     if err.is_fatal() {
                         return Err(err);
@@ -461,6 +508,37 @@ impl HostPipeline {
     /// 控制端请求关键帧（经会话层转发）。
     pub fn request_idr(&mut self) {
         self.pending_idr = true;
+    }
+
+    /// 动态调整编码目标码率（会话层 SetBitrate 消息的落点，M2-10）。
+    ///
+    /// 编码器在构造时被 move 进编码线程，本方法经**命令通道**转发：
+    /// 纯增量——不改既有 tick / request_idr / stop_capture / shutdown 的
+    /// 任何签名或时序。命令入队即返回（非阻塞），编码线程在下一个循环
+    /// 迭代（≤5ms，其 recv_timeout 周期）应用并调用 `Encoder::set_bitrate`
+    /// （Fake/VT 均实现）。编码器侧拒绝（超范围）只进 stderr——不回传：
+    /// 会话层不该为一次码率调整阻塞等待。
+    ///
+    /// - `bps == 0`：本地拒绝（Err InvalidConfig），不发命令；
+    /// - 命令通道（sync_channel(8)，有界）满：Err——调用方失控重发的信号；
+    /// - 编码线程已退出（停机后）：Err——调用方按会话错误策略记错。
+    pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+        if bps == 0 {
+            return Err(Error::InvalidConfig(
+                "set_bitrate: bps must be > 0".to_string(),
+            ));
+        }
+        self.enc_cmd
+            .try_send(EncCmd::SetBitrate(bps))
+            .map_err(|e| match e {
+                TrySendError::Full(_) => Error::InvalidConfig(format!(
+                    "encode cmd channel full (capacity 8): set_bitrate({bps}) dropped \
+                     (caller is re-sending uncontrollably)"
+                )),
+                TrySendError::Disconnected(_) => Error::InvalidConfig(format!(
+                    "encode thread exited (pipeline shut down): set_bitrate({bps}) dropped"
+                )),
+            })
     }
 
     /// 帧时间线（本端半场：Captured→Sent + 调度丢弃结局）。

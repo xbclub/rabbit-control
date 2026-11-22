@@ -86,3 +86,20 @@ dev-cli *args:
 # 用已授权的固定签名 App 运行指定 crate 的真机测试（示例：just dev-test rc-capture-macos -- --ignored --nocapture）
 dev-test crate *args:
     ./scripts/macos-dev-run.sh test {{crate}} {{args}}
+
+# ── rc-ui（Tauri v2 控制端界面，设计规范 docs/reference/design/08-ui-design.md）──
+#
+# 修复卡D-4：rc-ui 当前被根 Cargo.toml 的 `exclude = ["crates/rc-ui"]`
+# 排除出 workspace（T21 卡接入并过门禁前排除——Tauri 依赖会拖垮全仓
+# 构建与测试），`cargo run/build -p rc-ui` 会报
+# "package ID specification `rc-ui` did not match any packages"。
+# 故 ui / ui-build 两个入口注释停用，待 T21 接入 workspace 后去掉
+# 本注释块恢复（原始命令如下）：
+#
+#   cargo run -p rc-ui      # 原 `just ui`
+#   cargo build -p rc-ui    # 原 `just ui-build`
+
+# 在浏览器里预览静态前端（逐屏比对设计稿用，默认端口 8791；纯静态文件
+# 不经 cargo，rc-ui 被 exclude 不影响本入口）
+ui-preview port="8791":
+    cd crates/rc-ui/ui && python3 -m http.server {{port}}

@@ -23,6 +23,8 @@ fn cfg() -> PipelineConfig {
         trace_capacity: 1024,
         diff: DiffMode::TrustPlatform,
         clock_origin_us: None,
+        // M1 兼容性锁定：默认预算（1200）。
+        max_packet_payload: rc_pipeline::MAX_PAYLOAD,
     }
 }
 
@@ -76,6 +78,45 @@ impl Encoder for FailingEncoder {
         if self.seen <= self.fail_first {
             // 非致命（is_fatal == false）：管线应记录后继续（P7）。
             return Err(Error::Timeout(core_duration()));
+        }
+        self.inner.encode(frame, force_idr, deadline_ts)
+    }
+    fn capabilities(&self) -> EncoderCaps {
+        self.inner.capabilities()
+    }
+    fn set_bitrate(&mut self, bps: u32) -> Result<()> {
+        self.inner.set_bitrate(bps)
+    }
+    fn request_idr(&mut self) {
+        self.inner.request_idr()
+    }
+    fn flush(&mut self) -> Result<Vec<rc_encode::EncodedFrame>> {
+        self.inner.flush()
+    }
+}
+
+/// 注入编码器过载丢帧（VT RealTime 的 [`Error::EncoderDroppedFrame`]）
+/// 的包装编码器：前 `drop_first` 次编码在入口丢弃，其余透传内层。
+struct OverloadDroppingEncoder {
+    inner: Box<dyn Encoder>,
+    drop_first: u64,
+    seen: u64,
+}
+
+impl Encoder for OverloadDroppingEncoder {
+    fn encode(
+        &mut self,
+        frame: &rc_capture::CapturedFrame,
+        force_idr: bool,
+        deadline_ts: Timestamp,
+    ) -> Result<rc_encode::EncodedFrame> {
+        self.seen += 1;
+        if self.seen <= self.drop_first {
+            // VT RealTime 过载的同构注入：非致命（is_fatal == false），
+            // 管线应释放槽位、记结局后继续（P7）。
+            return Err(Error::EncoderDroppedFrame {
+                msg: "测试注入：模拟 RealTime 过载丢帧".to_string(),
+            });
         }
         self.inner.encode(frame, force_idr, deadline_ts)
     }
@@ -235,6 +276,41 @@ fn encoder_failure_does_not_stop_pipeline() {
     assert_eq!(s.decode_errors, 3, "前 3 帧编码失败应记 DecodeError");
     assert!(displayed >= 17, "失败后的帧继续上屏，实际 {displayed}");
     assert_eq!(s.unfinished, 0);
+}
+
+// ── 3b. P7：编码器过载丢帧（EncoderDroppedFrame）不终止管线 ──
+// 复现 1080p×120 真机缺陷的离线形态：VT RealTime 过载丢帧曾被映射为
+// 恒致命的 Error::Encoder，导致 host Err 上抛拆会话。本测试注入同构的
+// 非致命丢帧，断言会话存活、槽位释放、后续帧照常编码上屏。
+#[test]
+fn encoder_overload_drop_does_not_stop_pipeline() {
+    let encoder = Box::new(OverloadDroppingEncoder {
+        inner: fake_encoder(),
+        drop_first: 3,
+        seen: 0,
+    });
+    let (mut host, mut controller, clock) =
+        host_controller(fake_capture(FakeContent::Dynamic, 60), encoder);
+    // drive 内部对每次 tick expect("tick ok")：若过载丢帧被上抛（回归），
+    // 这里直接 panic，即「管线不终止」断言。
+    let displayed = drive(&mut host, &mut controller, &clock, 20);
+    controller.finish_in_flight();
+    let s = merged(&host, &controller).summary();
+    // 过载丢帧按语义最近的现有 Outcome 记 DroppedStale（host.rs 注释）。
+    assert_eq!(
+        s.dropped_stale, 3,
+        "前 3 帧过载丢帧应记 DroppedStale，实际 {s:?}"
+    );
+    assert!(displayed >= 17, "丢帧后的帧继续上屏，实际 {displayed}");
+    assert_eq!(s.unfinished, 0, "P4：每帧必须有结局，实际 {s:?}");
+    // 槽位释放：失败路径漏调 on_encoded 会让 max_in_flight=2 被占满，
+    // 第 4 帧起全部 Drop(Budget)。
+    let st = host.sched_stats();
+    assert_eq!(
+        st.dropped_budget, 0,
+        "过载丢帧后槽位必须释放，实际 budget 丢弃 {st:?}"
+    );
+    assert!(st.encoded > 3, "丢帧后仍应继续编码成功，实际 {st:?}");
 }
 
 // ── 4. P2：on_encoded 在所有路径调用（在途槽位释放）─────────

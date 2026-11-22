@@ -195,6 +195,8 @@ impl Loopback {
             trace_capacity: trace_cap,
             diff: rc_pipeline::DiffMode::TrustPlatform,
             clock_origin_us: None,
+            // 回环无数据报预算墙：保持默认 1200（M1 行为逐字节不变）。
+            max_packet_payload: rc_pipeline::MAX_PAYLOAD,
         };
         pcfg.validate()
             .map_err(|e| LoopbackError::InvalidConfig(e.to_string()))?;

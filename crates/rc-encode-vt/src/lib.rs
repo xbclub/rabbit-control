@@ -269,10 +269,18 @@ impl Encoder for VtEncoder {
                     return Err(Error::Timeout(started.elapsed()));
                 }
                 Err(ffi::EncodeError::Dropped) => {
-                    self.idr_requested = true;
-                    return Err(Error::Encoder(
-                        "VideoToolbox 丢弃了本帧（RealTime 过载）".to_string(),
-                    ));
+                    // 参考链语义（与 Timeout 分支的刻意对比）：
+                    // - Dropped：编码器**没有编这帧**——输入被丢，编码器内部
+                    //   与解码端的参考链均无损，下一帧照常 P 帧即可，因此
+                    //   **不**置 idr_requested（置了会让下一帧无谓地变 IDR）。
+                    // - Timeout：输出已产生但迟到被弃 → 解码端缺这一帧、
+                    //   参考链真断 → 必须置 idr_requested 重建参考（现状不动）。
+                    // RealTime 过载丢帧在高帧率逼近硬编吞吐上限时是预期瞬态
+                    // （1080p×120 实测 VT 吞吐 ≈105–108fps < 120fps），
+                    // 用非致命变体上报：管线丢帧继续（P7），不拆会话。
+                    return Err(Error::EncoderDroppedFrame {
+                        msg: "VideoToolbox 丢弃了本帧（RealTime 过载）".to_string(),
+                    });
                 }
                 Err(ffi::EncodeError::Failed(msg)) => return Err(Error::Encoder(msg)),
             };

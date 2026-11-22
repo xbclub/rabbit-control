@@ -1092,9 +1092,16 @@ dependencies = [
  "assert_cmd",
  "clap",
  "predicates",
+ "rc-capture",
  "rc-capture-macos",
+ "rc-decode",
+ "rc-encode",
+ "rc-input",
+ "rc-input-macos",
  "rc-loopback",
  "rc-pipeline",
+ "rc-render",
+ "rc-session",
  "rc-types",
 ]
 
@@ -1272,6 +1279,22 @@ version = "0.1.0"
 dependencies = [
  "rc-types",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "rc-session"
+version = "0.1.0"
+dependencies = [
+ "rc-capture",
+ "rc-decode",
+ "rc-encode",
+ "rc-input",
+ "rc-net",
+ "rc-pipeline",
+ "rc-proto",
+ "rc-render",
+ "rc-trace",
+ "rc-types",
 ]
 
 [[package]]

@@ -118,11 +118,10 @@ impl InputChannel {
         let mut first_err: Option<rc_types::Error> = None;
         for ev in transport.poll(timeout)? {
             if let NetEvent::ReliableUrgent(msg) = ev {
-                // 解码 + 注入合成一步：任一失败 → 记首个错误，继续下一条。
-                let decoded = decode_events(&msg)
-                    .and_then(|events| injector.inject(&events).map(|()| events));
-                match decoded {
-                    Ok(events) => injected += events.len(),
+                // 逐条注入：任一失败 → 记首个错误，继续下一条（语义与
+                // [`inject_message`] 完全一致，见其文档）。
+                match inject_message(&msg, injector) {
+                    Ok(n) => injected += n,
                     Err(e) => {
                         first_err.get_or_insert(e);
                     }
@@ -136,6 +135,21 @@ impl InputChannel {
     pub fn batcher(&self) -> &InputBatcher {
         &self.batcher
     }
+}
+
+/// 解码并注入**一条** urgent 消息（[`InputChannel::pump_receiver`] 循环体
+/// 的提取）。
+///
+/// 为什么提取：`pump_receiver` 内部自己 `transport.poll`，同批到达的非
+/// urgent 事件（控制消息 / `Disconnected`）会被静默丢弃——会话层必须
+/// **独占** poll 做三通道分发，urgent 注入改走本函数，逐条调用。错误
+/// 隔离语义与 `pump_receiver` 完全一致：单条消息失败返回 `Err`、**不
+/// 注入半批**（解码失败时整条消息的事件都不注入），成功时返回注入的
+/// 事件数。`pump_receiver` 内部循环调用本函数，行为不变。
+pub fn inject_message(msg: &[u8], injector: &mut dyn InputInjector) -> Result<usize> {
+    let events = decode_events(msg)?;
+    injector.inject(&events)?;
+    Ok(events.len())
 }
 
 /// 把一批事件编码成一个或多个消息并通过输入专用的 urgent reliable

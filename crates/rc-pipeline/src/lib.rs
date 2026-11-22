@@ -32,6 +32,23 @@ use rc_render::{FakeRenderer, FakeRendererConfig, Renderer};
 use rc_types::{Error, Resolution, Result};
 use std::time::Duration;
 
+/// 单个媒体分片的最大负载（[`rc_proto::MAX_PAYLOAD`] 的再导出）。
+///
+/// 回环 / M1 语境下 [`PipelineConfig::max_packet_payload`] 的默认值；
+/// 真 QUIC 会话应改用 `rc_net::quic::max_media_payload(mtu)`（见该字段文档）。
+pub use rc_proto::MAX_PAYLOAD;
+
+/// 分片预算下限（私有常量，注释写数学）。
+///
+/// [`rc_proto::split_frame`] 的 `packet_cnt` 是 u16：预算 B 下可安全分片
+/// 的最大帧 = B × 65535 字节，超过即运行期 assert panic（修复卡D-1：
+/// 预算 1 时 > 64KB 帧切出 > 65535 片，panic 落在生产路径）。取 16 时
+/// 即便 65535B 的大帧也只切 ⌈65535/16⌉ = 4096 片，距 u16::MAX 余量
+/// 充足（要 panic 需 > 16×65535 ≈ 1MiB 的单帧，现实码率下不会出现）；
+/// 正常预算 1120（QUIC `max_media_payload`）/ 1200（[`MAX_PAYLOAD`]）
+/// 远超下限。
+const MIN_PACKET_PAYLOAD: usize = 16;
+
 /// 重复帧判定策略。
 ///
 /// M1 默认信任平台：ScreenCaptureKit 是回调驱动（有回调即有变化），
@@ -72,6 +89,19 @@ pub struct PipelineConfig {
     /// 设值后，平台采集后端（如 macOS SCK）的 `CapturedFrame::timestamp` 将以
     /// 同一原点换算，保证 `Captured` 与管线会话时钟零偏移同轴。
     pub clock_origin_us: Option<u64>,
+    /// 媒体分片预算（字节）：[`HostPipeline`](host::HostPipeline) 调
+    /// [`split_frame`](rc_proto::split_frame) 时单片载荷的上限。
+    ///
+    /// 默认 [`MAX_PAYLOAD`]（1200）——回环 / M1 的既有行为，逐字节不变。
+    /// 真 QUIC 会话的单个数据报（32 字节包头 + 媒体片）受 N2 约束
+    /// （≤ `mtu - QUIC_OVERHEAD`），预算必须由会话层按
+    /// `rc_net::quic::max_media_payload(mtu)`（默认 MTU 下 = 1120）覆盖，
+    /// 否则多包大帧会被 `send_datagram` 整批拒收（T18 实测）。
+    /// 合法范围 `[MIN_PACKET_PAYLOAD(16), MAX_PAYLOAD]`（下限的数学见
+    /// [`MIN_PACKET_PAYLOAD`] 文档；修复卡D-1：预算 1 会放行到运行期，
+    /// 大于 64KB 的帧在 `split_frame` 的 `packet_cnt` assert panic），由
+    /// [`PipelineConfig::validate`] 在构造期拒绝非法值。
+    pub max_packet_payload: usize,
 }
 
 impl Default for PipelineConfig {
@@ -85,6 +115,7 @@ impl Default for PipelineConfig {
             trace_capacity: 4096,
             diff: DiffMode::TrustPlatform,
             clock_origin_us: None,
+            max_packet_payload: MAX_PAYLOAD,
         }
     }
 }
@@ -117,6 +148,16 @@ impl PipelineConfig {
             return Err(Error::InvalidConfig(
                 "pipeline: bitrate_bps must be > 0".into(),
             ));
+        }
+        // 分片预算的构造期校验（split_frame 内的 assert 在这里给出带字段名
+        // 的错误，防止非法配置活到运行期才 panic）。下限 16 的数学见
+        // MIN_PACKET_PAYLOAD 文档（修复卡D-1：预算 1 放行时，> 64KB 帧切出
+        // > 65535 片，packet_cnt 的 assert 在生产路径 panic）。
+        if self.max_packet_payload < MIN_PACKET_PAYLOAD || self.max_packet_payload > MAX_PAYLOAD {
+            return Err(Error::InvalidConfig(format!(
+                "pipeline: max_packet_payload must be in [{MIN_PACKET_PAYLOAD}, {MAX_PAYLOAD}] (got {})",
+                self.max_packet_payload
+            )));
         }
         Ok(())
     }
@@ -365,5 +406,64 @@ mod tests {
         };
         assert!(bad_res.validate().is_err());
         assert!(PipelineConfig::default().validate().is_ok());
+    }
+
+    /// 分片预算的构造期校验：小于 [`MIN_PACKET_PAYLOAD`]（含 0，修复
+    /// 卡D-1：预算 1 会把 > 64KB 帧放行到 `split_frame` 的 `packet_cnt`
+    /// assert panic）与超过 [`MAX_PAYLOAD`] 的值必须被
+    /// [`PipelineConfig::validate`] 拒绝，错误信息带字段名。
+    #[test]
+    fn config_rejects_invalid_packet_budget() {
+        let zero = PipelineConfig {
+            max_packet_payload: 0,
+            ..PipelineConfig::default()
+        };
+        let err = zero.validate().unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidConfig(msg) if msg.contains("max_packet_payload")),
+            "0 预算应被拒绝且带字段名，实际 {err:?}"
+        );
+
+        // 修复卡D-1：预算 1（及其他 < 16 的值）同样被构造期拒绝。
+        for too_small in [1usize, 8, 15] {
+            let cfg = PipelineConfig {
+                max_packet_payload: too_small,
+                ..PipelineConfig::default()
+            };
+            assert!(
+                matches!(
+                    cfg.validate().unwrap_err(),
+                    Error::InvalidConfig(ref msg) if msg.contains("max_packet_payload")
+                ),
+                "预算 {too_small} 应被拒绝（split_frame 的 packet_cnt 会溢出 u16）"
+            );
+        }
+
+        let over = PipelineConfig {
+            max_packet_payload: MAX_PAYLOAD + 1,
+            ..PipelineConfig::default()
+        };
+        assert!(
+            matches!(
+                over.validate().unwrap_err(),
+                Error::InvalidConfig(ref msg) if msg.contains("max_packet_payload")
+            ),
+            "超过 MAX_PAYLOAD 的预算应被拒绝"
+        );
+
+        // 边界值：下限 16 与 MAX_PAYLOAD 本身合法（默认值即 MAX_PAYLOAD）。
+        PipelineConfig {
+            max_packet_payload: MIN_PACKET_PAYLOAD,
+            ..PipelineConfig::default()
+        }
+        .validate()
+        .expect("下限 16 合法");
+        PipelineConfig {
+            max_packet_payload: MAX_PAYLOAD,
+            ..PipelineConfig::default()
+        }
+        .validate()
+        .expect("MAX_PAYLOAD 合法");
+        assert_eq!(PipelineConfig::default().max_packet_payload, MAX_PAYLOAD);
     }
 }

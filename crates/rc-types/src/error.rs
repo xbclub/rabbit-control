@@ -34,6 +34,19 @@ pub enum Error {
     #[error("encoder error: {0}")]
     Encoder(String),
 
+    /// 编码器因过载/预算**丢弃了本帧输入**（未编码）——可恢复。
+    ///
+    /// 典型来源：VideoToolbox RealTime 模式过载（`kVTEncodeInfo_FrameDropped`）。
+    /// 帧根本没被编码，编码器内部与解码端的参考链**均无损**，下一帧照常
+    /// P 帧即可；高帧率逼近硬编吞吐上限时属于预期瞬态（1080p×120 实测
+    /// VT 吞吐上限 ≈105–108fps < 120fps），正确行为是丢帧继续，不是像
+    /// [`Error::Encoder`] 那样拆会话。
+    #[error("encoder dropped frame (overloaded): {msg}")]
+    EncoderDroppedFrame {
+        /// 说明
+        msg: String,
+    },
+
     /// 解码器不可用或失败
     #[error("decoder error: {0}")]
     Decoder(String),
@@ -70,6 +83,8 @@ impl Error {
             Error::Capture { recoverable, .. } => !recoverable,
             Error::Encoder(_) | Error::Decoder(_) | Error::Protocol { .. } => true,
             Error::InvalidFrame(_) | Error::InvalidConfig(_) => true,
+            // 过载丢帧是预期瞬态（见变体文档），管线丢帧继续，不拆会话。
+            Error::EncoderDroppedFrame { .. } => false,
             Error::Network(_) | Error::Io(_) | Error::Timeout(_) => false,
         }
     }
@@ -100,6 +115,21 @@ mod tests {
     #[test]
     fn encoder_error_is_fatal() {
         assert!(Error::Encoder("init failed".into()).is_fatal());
+    }
+
+    /// 过载丢帧是预期瞬态：非致命（管线丢帧继续），与恒致命的
+    /// [`Error::Encoder`]（真编码器故障）形成对照。
+    #[test]
+    fn encoder_dropped_frame_is_not_fatal() {
+        let dropped = Error::EncoderDroppedFrame {
+            msg: "VideoToolbox RealTime 过载".into(),
+        };
+        assert!(
+            !dropped.is_fatal(),
+            "过载丢帧不得拆会话（参考链无损，下一帧照常 P 帧）"
+        );
+        // 对照：同一错误族里的真编码器故障仍然恒致命。
+        assert!(Error::Encoder("session broken".into()).is_fatal());
     }
 
     #[test]

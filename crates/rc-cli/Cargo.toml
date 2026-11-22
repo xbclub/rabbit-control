@@ -12,9 +12,18 @@ clap = { version = "4", features = ["derive"] }
 rc-types = { path = "../rc-types" }
 rc-loopback = { path = "../rc-loopback" }
 rc-pipeline = { path = "../rc-pipeline" }
+rc-session = { path = "../rc-session" }
+rc-input = { path = "../rc-input" }
+# host/client 子命令的管线后端构造（fake 栈 / real 标签校验；T18）
+rc-capture = { path = "../rc-capture" }
+rc-encode = { path = "../rc-encode" }
+rc-decode = { path = "../rc-decode" }
+rc-render = { path = "../rc-render" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rc-capture-macos = { path = "../rc-capture-macos" }
+# host --inject-mode real / client --input-mode real（CGEvent 桥，需权限）
+rc-input-macos = { path = "../rc-input-macos" }
 
 [dev-dependencies]
 assert_cmd = "2"
