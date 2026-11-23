@@ -126,6 +126,8 @@ fn paired_sessions(
             handshake_timeout: Duration::from_millis(500),
             injector: Box::new(inj),
             pace_capture: true, // 假后端必须节流（坑 4）
+            auth: rc_session::HostAuthConfig::default(),
+            approver: Box::new(rc_session::AutoApprover),
         },
         Box::new(ta),
         Box::new(
@@ -173,6 +175,7 @@ fn paired_sessions(
                 scripted: click.into_iter().collect(),
             }),
             input_window: rc_input::DEFAULT_WINDOW,
+            auth: rc_session::ClientAuthConfig::default(),
         },
         Box::new(tb),
         Box::new(

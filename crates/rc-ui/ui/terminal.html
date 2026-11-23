@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>session1 — RabbitControl</title>
+  <link rel="stylesheet" href="assets/css/tokens.css" />
+  <link rel="stylesheet" href="assets/css/base.css" />
+  <link rel="stylesheet" href="assets/css/pages/terminal.css" />
+</head>
+<!-- W3 终端窗口：1200×760 / 最小 720×480（08 §2），TERMINAL_BG 铺满（08 §6 W3） -->
+<body data-page="terminal">
+  <!-- Tauri 真窗口：给 body 打 .is-tauri，隐藏自绘交通灯（原生灯已由窗口提供） -->
+  <script src="assets/js/tauri-detect.js"></script>
+  <div class="tm-window" id="terminal-window">
+    <header class="tm-titlebar" data-tauri-drag-region>
+      <div class="tm-traffic" aria-hidden="true" data-tauri-drag-region>
+        <span class="tm-traffic__dot tm-traffic__dot--close" data-tauri-drag-region></span>
+        <span class="tm-traffic__dot tm-traffic__dot--min" data-tauri-drag-region></span>
+        <span class="tm-traffic__dot tm-traffic__dot--zoom" data-tauri-drag-region></span>
+      </div>
+      <h1 class="tm-title" id="terminal-title" data-tauri-drag-region>session1</h1>
+    </header>
+
+    <main class="tm-body" id="terminal-body">
+      <!-- 静态预览态（!IS_TAURI）默认保留 §6 W3 视觉稿 -->
+      <div class="tm-row" id="terminal-mock-row">
+        <div class="tm-prompt">
+          <span class="tm-tag">yii@MacBook-Pro</span>
+          <span class="tm-tag">/Users/yii</span>
+          <span class="tm-tilde">~</span>
+          <span class="tm-chevron">&gt;</span>
+          <span class="tm-cursor" aria-hidden="true"></span>
+        </div>
+        <!-- 右上计时：TERMINAL_MUTED mono 14px，注入时钟，从 00:00:00 起每秒 +1 -->
+        <span class="tm-timer" id="terminal-timer" role="timer" aria-live="off">00:00:00</span>
+      </div>
+
+      <!-- Tauri 实时交互多标签栏（默认隐藏，IS_TAURI 激活，最多 4 个） -->
+      <div class="tm-tabs" id="terminal-tabs" role="tablist" aria-label="终端标签" hidden>
+        <div class="tm-tabs__list" id="terminal-tab-list"></div>
+        <button type="button" class="tm-tabs__add" id="terminal-new-tab" title="新建终端标签（最多 4 个）" aria-label="新建终端标签">+</button>
+      </div>
+
+      <!-- Tauri 实时交互终端头栏（默认隐藏，IS_TAURI 激活） -->
+      <div class="tm-status-bar" id="terminal-status-bar" hidden>
+        <div class="tm-status-bar__left">
+          <span class="tm-status-dot" id="terminal-status-dot" aria-hidden="true"></span>
+          <span class="tm-status-text" id="terminal-status-text">连接中…</span>
+          <span class="tm-tag" id="terminal-cwd" hidden></span>
+        </div>
+        <div class="tm-status-bar__right" id="terminal-status-right">
+          <button type="button" class="tm-btn" id="terminal-reconnect" hidden>重新连接</button>
+        </div>
+      </div>
+
+      <!-- 实时 PTY 输出区（零 innerHTML，安全 DOM 节点渲染） -->
+      <pre class="tm-screen" id="terminal-screen" tabindex="0" aria-label="远程终端" hidden></pre>
+
+      <!-- 中文输入法组合输入代理（透明定位，不影响视觉） -->
+      <textarea class="tm-ime-input" id="terminal-ime" autocomplete="off" autocorrect="off"
+                autocapitalize="off" spellcheck="false" aria-hidden="true" tabindex="-1"></textarea>
+
+      <!-- 未连接 / 异常居中提示 -->
+      <div class="tm-notice" id="terminal-notice" hidden>
+        <p class="tm-notice__text" id="terminal-notice-text">请先建立远控会话</p>
+        <button type="button" class="tm-btn tm-btn--primary" id="terminal-notice-reconnect">重新连接</button>
+      </div>
+    </main>
+  </div>
+
+  <script src="assets/js/bridge.js"></script>
+  <script src="assets/js/terminal.js"></script>
+</body>
+</html>

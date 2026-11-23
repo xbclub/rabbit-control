@@ -16,7 +16,7 @@
 //! | 契约 | 属性 |
 //! |---|---|
 //! | 硬件路径 | 编码器规格 `kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder = true`（显式要求硬件编码器；null 规格下 VT 只是「优先硬件」，落回软编会在构造期变成失败而不是静默上线） |
-//! | 低延迟码控 | 编码器规格 `kVTVideoEncoderSpecification_EnableLowLatencyRateControl = true`（与 `RealTime`、`ExpectedFrameRate`、`PrioritizeEncodingSpeedOverQuality` 构成 Apple 官方低延迟 4 件套，强制低延迟码控与零 look-ahead） |
+//! | 低延迟码控 | 编码器规格 `kVTVideoEncoderSpecification_EnableLowLatencyRateControl`：当 `fps < 90` 时为 `true`（与 `RealTime`、`ExpectedFrameRate`、`PrioritizeEncodingSpeedOverQuality` 构成 Apple 官方低延迟 4 件套，维持 60fps 及以下路径不变）；当 `fps >= 90` 时设为 `false`（M1 Pro `1512x982@120` 30s loopback 实测 LLRC=`true` 约 3s 后跌至 ~84fps、LLRC=`false` 且保持 `RealTime=true` 时稳态 **118.0fps**） |
 //! | M6 / E2 | `kVTCompressionPropertyKey_RealTime = true`（未设时 VT 按文件转码优化，缓冲 20–40ms；同时关掉 look-ahead 类优化。VT 无独立 2-pass 开关，实时路径不存在 2-pass） |
 //! | E1 | `kVTCompressionPropertyKey_AllowFrameReordering = false`（禁 B 帧/重排） |
 //! | E3 | `kVTCompressionPropertyKey_MaxFrameDelayCount = 0`（输出零延迟） |
@@ -34,6 +34,8 @@
 // 见模块文档：本模块是 crate 内唯一允许 unsafe 的地方。
 #![allow(unsafe_code)]
 
+use std::any::Any;
+use std::collections::VecDeque;
 use std::ffi::{c_int, c_void};
 use std::fmt;
 use std::ptr::NonNull;
@@ -226,6 +228,7 @@ mod raw {
         pub static kVTCompressionPropertyKey_ExpectedFrameRate: Option<&'static CFString>;
         pub static kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality:
             Option<&'static CFString>;
+        pub static kVTCompressionPropertyKey_MaximizePowerEfficiency: Option<&'static CFString>;
         pub static kVTEncodeFrameOptionKey_ForceKeyFrame: Option<&'static CFString>;
 
         // —— 会话函数 ——
@@ -312,6 +315,8 @@ enum VtKey {
     ExpectedFrameRate,
     /// PrioritizeEncodingSpeedOverQuality（预设微调）。
     PrioritizeEncodingSpeedOverQuality,
+    /// MaximizePowerEfficiency（显式关闭省电降频）。
+    MaximizePowerEfficiency,
     /// 帧选项：ForceKeyFrame（按需 IDR）。
     ForceKeyFrame,
 }
@@ -334,6 +339,7 @@ impl VtKey {
             VtKey::PrioritizeEncodingSpeedOverQuality => {
                 "kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality"
             }
+            VtKey::MaximizePowerEfficiency => "kVTCompressionPropertyKey_MaximizePowerEfficiency",
             VtKey::ForceKeyFrame => "kVTEncodeFrameOptionKey_ForceKeyFrame",
         }
     }
@@ -362,6 +368,9 @@ impl VtKey {
                 VtKey::PrioritizeEncodingSpeedOverQuality => {
                     raw::kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality
                 }
+                VtKey::MaximizePowerEfficiency => {
+                    raw::kVTCompressionPropertyKey_MaximizePowerEfficiency
+                }
                 VtKey::ForceKeyFrame => raw::kVTEncodeFrameOptionKey_ForceKeyFrame,
             }
         };
@@ -385,9 +394,15 @@ enum CallbackState {
     Dropped,
 }
 
+/// 回调与等待线程共享的邮箱（同时服务同步 `encode` 与 2-deep 流水线编码）。
+struct SharedState {
+    sync: CallbackState,
+    pipelined: VecDeque<(usize, CallbackState)>,
+}
+
 /// 回调与等待线程共享的邮箱。
 struct Shared {
-    state: Mutex<CallbackState>,
+    state: Mutex<SharedState>,
     cond: Condvar,
 }
 
@@ -409,7 +424,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// 绝不做重活、绝不 panic（跨 C 边界 unwind 是未定义行为）。
 unsafe extern "C" fn vt_output_callback(
     output_callback_refcon: *mut c_void,
-    _source_frame_refcon: *mut c_void,
+    source_frame_refcon: *mut c_void,
     status: OSStatus,
     info_flags: u32,
     sample_buffer: *mut CMSampleBuffer,
@@ -435,7 +450,13 @@ unsafe extern "C" fn vt_output_callback(
         CallbackState::Failed(status)
     };
     let mut guard = lock(&shared.state);
-    *guard = state;
+    if source_frame_refcon.is_null() {
+        guard.sync = state;
+    } else {
+        guard
+            .pipelined
+            .push_back((source_frame_refcon as usize, state));
+    }
     drop(guard);
     shared.cond.notify_all();
 }
@@ -527,6 +548,26 @@ pub(crate) fn pixel_buffer_info(ptr: *mut c_void) -> (u32, u32, u32) {
     )
 }
 
+/// 2-deep 异步流水线编码最大在途帧数（铁律 1）。
+const MAX_PIPELINED_IN_FLIGHT: usize = 2;
+
+/// 异步流水线单帧提交元数据：保活 SCK `resource_guard` 直到回调输出提取/丢弃。
+struct InFlightMeta {
+    submit_id: usize,
+    token: u64,
+    frame_ts: u32,
+    started: Instant,
+    _resource_guard: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+/// 异步流水线单帧输出。
+pub(crate) struct PipelinedOutput {
+    pub token: u64,
+    pub frame_ts: u32,
+    pub started: Instant,
+    pub result: Result<EncodedOutput, EncodeError>,
+}
+
 /// 一个配置好的 `VTCompressionSession`。
 ///
 /// `Send`：随 `VtEncoder`（`Encoder: Send`）跨线程**移交所有权**；所有
@@ -536,6 +577,10 @@ pub(crate) struct CompressionSession {
     /// +1 的会话引用（VTCompressionSessionCreate 返回）。Drop 前必须先
     /// Invalidate（Apple 文档要求），见 [`CompressionSession::drop`]。
     session: NonNull<c_void>,
+    /// 异步流水线在途元数据与 SCK 像素缓冲保活守卫（按提交顺序存放）。
+    in_flight: VecDeque<InFlightMeta>,
+    /// 单调非零提交 ID（通过 `source_frame_refcon` 区分同步/异步回调）。
+    next_submit_id: usize,
     /// 回调邮箱。必须排在 session 之后：字段按声明逆序释放，Arc 在
     /// CFRelease(session) 之后才 drop。
     shared: Arc<Shared>,
@@ -593,25 +638,36 @@ pub(crate) struct SessionParams {
     pub speed_over_quality: bool,
 }
 
+/// fps >= 90 时关闭 VT 低延迟码控：真机实测（M1 Pro，1512x982@120，30s loopback）LLRC 开启时
+/// 媒体引擎 ~3s 后降速至 ~84fps（encode 19.3ms），关闭后稳态 118fps（encode 12.8ms）；
+/// `RealTime`(M6) 保持开启，60fps 及以下维持 Apple 低延迟 4 件套不变。
+pub(crate) fn use_low_latency_rate_control(fps: u32) -> bool {
+    fps < 90
+}
+
 impl CompressionSession {
     /// 创建会话并把延迟红线属性逐条落死（M6/E1/E2/E3/无限 GOP）。
     ///
     /// 任何红线属性设置失败都返回 Err（构造期暴露，而不是运行期花屏）。
     pub(crate) fn new(params: &SessionParams) -> Result<Self, String> {
         let shared = Arc::new(Shared {
-            state: Mutex::new(CallbackState::Empty),
+            state: Mutex::new(SharedState {
+                sync: CallbackState::Empty,
+                pipelined: VecDeque::with_capacity(MAX_PIPELINED_IN_FLIGHT),
+            }),
             cond: Condvar::new(),
         });
 
         let mut session_out: *mut c_void = std::ptr::null_mut();
-        // 显式要求硬件编码器 + 启用低延迟码控（VTVideoEncoder.h / VTCompressionProperties.h：
+        // 显式要求硬件编码器 + 按帧率门控低延迟码控（VTVideoEncoder.h / VTCompressionProperties.h：
         // kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder = true、
-        // kVTVideoEncoderSpecification_EnableLowLatencyRateControl = true）。
+        // kVTVideoEncoderSpecification_EnableLowLatencyRateControl = (fps < 90)）。
         // null 规格下 VT「优先硬件」仍可能在个别系统状态下落回软件编码器，
-        // 显式 true 把落回变成构造失败（E6 前就能暴露）；同时开启低延迟码控
-        // 完成 Apple 官方低延迟 4 件套（规格 + RealTime + ExpectedFrameRate +
-        // PrioritizeEncodingSpeedOverQuality）。dict 在 Create 同步返回前存活。
-        let encoder_spec = encoder_specification_dictionary()?;
+        // 显式 true 把落回变成构造失败（E6 前就能暴露）；60fps 及以下维持 Apple
+        // 低延迟 4 件套，90fps+ 关闭 LLRC 避免媒体引擎长时降速（见 use_low_latency_rate_control）。
+        // dict 在 Create 同步返回前存活。
+        let encoder_spec =
+            encoder_specification_dictionary(use_low_latency_rate_control(params.fps))?;
         // SAFETY: 出参 session_out 合法；encoder_spec 指向栈上存活的
         // CFDictionary（Create 同步读取）；其余可空参数传 null = 系统默认；
         // refcon 指向 shared 的稳定堆分配。
@@ -641,6 +697,8 @@ impl CompressionSession {
         let timescale = (params.fps.saturating_mul(1000)).min(i32::MAX as u32) as i32;
         let mut s = CompressionSession {
             session,
+            in_flight: VecDeque::with_capacity(MAX_PIPELINED_IN_FLIGHT),
+            next_submit_id: 1,
             shared,
             frame_index: 0,
             timescale,
@@ -703,6 +761,8 @@ impl CompressionSession {
         if params.speed_over_quality {
             let _ = s.set_boolean(VtKey::PrioritizeEncodingSpeedOverQuality, true, "");
         }
+        // 显式关闭编码器省电优化，避免长时间 120fps 运行触发 Apple 媒体引擎节能降频（Optional，失败容忍）。
+        let _ = s.set_boolean(VtKey::MaximizePowerEfficiency, false, "");
         Ok(s)
     }
 
@@ -800,8 +860,8 @@ impl CompressionSession {
         // 清空上一帧的迟到输出（超时丢弃策略：迟到帧弃用，调用方已请求 IDR 恢复）。
         {
             let mut guard = lock(&self.shared.state);
-            if !matches!(*guard, CallbackState::Empty) {
-                *guard = CallbackState::Empty;
+            if !matches!(guard.sync, CallbackState::Empty) {
+                guard.sync = CallbackState::Empty;
             }
         }
 
@@ -853,7 +913,7 @@ impl CompressionSession {
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(1));
         let mut guard = lock(&self.shared.state);
         loop {
-            match std::mem::replace(&mut *guard, CallbackState::Empty) {
+            match std::mem::replace(&mut guard.sync, CallbackState::Empty) {
                 CallbackState::Empty => {}
                 CallbackState::Ready(sample) => {
                     drop(guard);
@@ -883,6 +943,165 @@ impl CompressionSession {
                 .shared
                 .cond
                 .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = next_guard;
+        }
+    }
+
+    /// 当前异步流水线在途帧数（`0..=2`）。
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    /// 2-deep 异步提交一帧到 VTCompressionSession（非阻塞，立刻返回）。
+    ///
+    /// 调用方传入 `resource_guard` 保活底层 SCK `CVPixelBuffer` 直到对应输出
+    /// 被 [`Self::recv_encoded`] 提取或会话销毁；严格限制 `in_flight <= 2`。
+    pub(crate) fn submit_encode(
+        &mut self,
+        token: u64,
+        frame_ts: u32,
+        buffer: *mut c_void,
+        force_idr: bool,
+        resource_guard: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> Result<(), EncodeError> {
+        if self.in_flight.len() >= MAX_PIPELINED_IN_FLIGHT {
+            return Err(EncodeError::Failed(format!(
+                "pipelined in_flight limit ({MAX_PIPELINED_IN_FLIGHT}) reached"
+            )));
+        }
+        let _qos = QosBump::new();
+        let frame_props = if force_idr {
+            Some(force_keyframe_dictionary()?)
+        } else {
+            None
+        };
+        let props_ptr = frame_props
+            .as_ref()
+            .map(|dict| &**dict as *const CFDictionary as *const c_void)
+            .unwrap_or_else(std::ptr::null);
+
+        let submit_id = self.next_submit_id;
+        self.next_submit_id = submit_id.wrapping_add(1);
+        if self.next_submit_id == 0 {
+            self.next_submit_id = 1;
+        }
+
+        let pts = self.next_pts();
+        let mut info_flags: u32 = 0;
+        let started = Instant::now();
+        // SAFETY: 会话由本包装拥有；buffer 句柄经 lib.rs 校验非空且由
+        // resource_guard 保活直到回调完成并被 recv_encoded 提取/丢弃；
+        // props_ptr 为 null 或指向栈上存活的 CFDictionary；source_frame_refcon
+        // 为非零 submit_id（整数标签，回调不解引用）；info_flags_out 是合法出参。
+        let status = unsafe {
+            raw::VTCompressionSessionEncodeFrame(
+                self.session.as_ptr(),
+                buffer,
+                pts,
+                CMTIME_INVALID,
+                props_ptr,
+                submit_id as *mut c_void,
+                std::ptr::addr_of_mut!(info_flags),
+            )
+        };
+        if status != 0 {
+            let mut guard = lock(&self.shared.state);
+            guard.pipelined.retain(|(id, _)| *id != submit_id);
+            return Err(EncodeError::Failed(format!(
+                "VTCompressionSessionEncodeFrame 失败: OSStatus {status}"
+            )));
+        }
+        #[cfg(test)]
+        latency_diag::mark_submitted();
+        let next_index = self.frame_index.checked_add(1).ok_or_else(|| {
+            EncodeError::Failed("会话帧号耗尽 u64，无法继续保证 PTS 单调".to_string())
+        })?;
+        self.frame_index = next_index;
+        self.in_flight.push_back(InFlightMeta {
+            submit_id,
+            token,
+            frame_ts,
+            started,
+            _resource_guard: resource_guard,
+        });
+        Ok(())
+    }
+
+    /// 接收下一帧已完成的异步编码输出（按 FIFO 提交/回调顺序），超时返回 `None`。
+    pub(crate) fn recv_encoded(&mut self, timeout: Duration) -> Option<PipelinedOutput> {
+        if self.in_flight.is_empty() {
+            return None;
+        }
+        let deadline = if timeout.is_zero() {
+            None
+        } else {
+            Some(
+                Instant::now()
+                    .checked_add(timeout)
+                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(1)),
+            )
+        };
+
+        let mut guard = lock(&self.shared.state);
+        loop {
+            while let Some((submit_id, cb_state)) = guard.pipelined.pop_front() {
+                let meta = if self
+                    .in_flight
+                    .front()
+                    .is_some_and(|m| m.submit_id == submit_id)
+                {
+                    self.in_flight.pop_front()
+                } else {
+                    self.in_flight
+                        .iter()
+                        .position(|m| m.submit_id == submit_id)
+                        .and_then(|idx| self.in_flight.remove(idx))
+                };
+                let Some(meta) = meta else {
+                    continue;
+                };
+                drop(guard);
+                let result = match cb_state {
+                    CallbackState::Ready(sample) => {
+                        #[cfg(test)]
+                        latency_diag::mark_woken();
+                        let out = self.extract(sample);
+                        #[cfg(test)]
+                        latency_diag::mark_returned();
+                        out
+                    }
+                    CallbackState::Dropped => Err(EncodeError::Dropped),
+                    CallbackState::Failed(status) => Err(EncodeError::Failed(format!(
+                        "VideoToolbox 输出携带错误状态: OSStatus {status}"
+                    ))),
+                    CallbackState::Empty => Err(EncodeError::Failed(
+                        "VideoToolbox 回调投递空状态".to_string(),
+                    )),
+                };
+                // meta（及其 _resource_guard）在此处或随返回值释放前保持存活，
+                // 确保 extract 期间输入像素缓冲仍受保活保护。
+                let token = meta.token;
+                let frame_ts = meta.frame_ts;
+                let started = meta.started;
+                drop(meta);
+                return Some(PipelinedOutput {
+                    token,
+                    frame_ts,
+                    started,
+                    result,
+                });
+            }
+
+            let dl = deadline?;
+            let now = Instant::now();
+            if now >= dl {
+                return None;
+            }
+            let (next_guard, _) = self
+                .shared
+                .cond
+                .wait_timeout(guard, dl - now)
                 .unwrap_or_else(|e| e.into_inner());
             guard = next_guard;
         }
@@ -971,18 +1190,21 @@ impl Drop for CompressionSession {
     fn drop(&mut self) {
         // SAFETY: self.session 是 Create 返回的 +1 引用；Apple 文档要求
         // Invalidate 必须先于释放。顺序：
-        // 1. CompleteFrames(非数值时间) 冲刷在途帧（此时 shared 仍存活，
-        //    可能触发的回调安全）；
+        // 1. CompleteFrames(非数值时间) 冲刷在途帧（此时 shared 与 in_flight 守卫
+        //    仍存活，可能触发的回调与正在编码的像素缓冲安全）；
         // 2. Invalidate：返回后不再有新回调；
-        // 3. 锁屏障：等任何正在执行的回调离开临界区，之后不会再有代码
-        //    触碰 refcon；
-        // 4. CFRelease 会话；随后结构体字段逆序释放（shared 的 Arc 最后）。
+        // 3. 锁屏障：等任何正在执行的回调离开临界区并清空邮箱状态；
+        // 4. CFRelease 会话，随后清理在途守卫；结构体字段逆序释放（shared 的 Arc 最后）。
         unsafe {
             raw::VTCompressionSessionCompleteFrames(self.session.as_ptr(), CMTIME_INVALID);
             raw::VTCompressionSessionInvalidate(self.session.as_ptr());
-            drop(lock(&self.shared.state));
+            let mut guard = lock(&self.shared.state);
+            guard.sync = CallbackState::Empty;
+            guard.pipelined.clear();
+            drop(guard);
             raw::CFRelease(self.session.as_ptr().cast_const());
         }
+        self.in_flight.clear();
     }
 }
 
@@ -1007,7 +1229,9 @@ fn check_status(status: OSStatus, label: &str) -> Result<(), String> {
 /// VideoToolbox 低延迟码控模式（Apple `VTCompressionProperties.h` 官方
 /// 超低延迟 4 件套的第 1 项，必须在 `VTCompressionSessionCreate` 的
 /// `encoderSpecification` 中传入）。常量缺失（安装损坏）返回 `Err`。
-fn encoder_specification_dictionary() -> Result<CFRetained<CFDictionary>, String> {
+fn encoder_specification_dictionary(
+    low_latency_rc: bool,
+) -> Result<CFRetained<CFDictionary>, String> {
     // SAFETY: 只对 extern static 做一次读取（拿 CFString 引用，不写）；
     // SDK 常量在框架加载时初始化、永不释放，读取无数据竞争。
     let (req_hw_key, low_latency_key) = unsafe {
@@ -1024,17 +1248,18 @@ fn encoder_specification_dictionary() -> Result<CFRetained<CFDictionary>, String
         "VideoToolbox SDK 常量缺失: kVTVideoEncoderSpecification_EnableLowLatencyRateControl"
             .to_string()
     })?;
-    let value = CFBoolean::new(true);
+    let hw = CFBoolean::new(true);
+    let llrc = CFBoolean::new(low_latency_rc);
     let keys = [
         req_hw_key as *const CFString as *const c_void,
         low_latency_key as *const CFString as *const c_void,
     ];
     let values = [
-        value as *const CFBoolean as *const c_void,
-        value as *const CFBoolean as *const c_void,
+        hw as *const CFBoolean as *const c_void,
+        llrc as *const CFBoolean as *const c_void,
     ];
     // SAFETY: keys/values 指向栈上数组的 2 个合法指针；key 为 SDK 常量
-    // CFString、value 为不可变单例 CFBoolean，CF 类型回调（retain/release）
+    // CFString、hw/llrc 为不可变单例 CFBoolean，CF 类型回调（retain/release）
     // 对二者均正确，条目数与数组长度一致。
     let dict = unsafe {
         CFDictionary::new(
@@ -1499,5 +1724,62 @@ mod tests {
             );
             assert!(mapped.max_interval_frames > 0);
         }
+    }
+
+    #[test]
+    fn use_low_latency_rate_control_enables_only_below_90fps() {
+        assert!(use_low_latency_rate_control(30));
+        assert!(use_low_latency_rate_control(60));
+        assert!(use_low_latency_rate_control(89));
+        assert!(!use_low_latency_rate_control(90));
+        assert!(!use_low_latency_rate_control(120));
+        assert!(!use_low_latency_rate_control(144));
+    }
+
+    #[test]
+    fn vt_output_callback_routes_sync_and_pipelined_separately() {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(SharedState {
+                sync: CallbackState::Empty,
+                pipelined: VecDeque::with_capacity(MAX_PIPELINED_IN_FLIGHT),
+            }),
+            cond: Condvar::new(),
+        });
+        let refcon = Arc::as_ptr(&shared) as *mut c_void;
+
+        // SAFETY: refcon 指向存活的 Arc<Shared>；空 sample_buffer 配合 FrameDropped/status!=0 测试路由。
+        unsafe {
+            vt_output_callback(
+                refcon,
+                1usize as *mut c_void,
+                0,
+                K_VTENCODE_INFO_FRAME_DROPPED,
+                std::ptr::null_mut(),
+            );
+            vt_output_callback(
+                refcon,
+                2usize as *mut c_void,
+                -12900,
+                0,
+                std::ptr::null_mut(),
+            );
+            vt_output_callback(
+                refcon,
+                std::ptr::null_mut(),
+                0,
+                K_VTENCODE_INFO_FRAME_DROPPED,
+                std::ptr::null_mut(),
+            );
+        }
+
+        let mut guard = lock(&shared.state);
+        assert!(matches!(guard.sync, CallbackState::Dropped));
+        assert_eq!(guard.pipelined.len(), 2);
+        let first = guard.pipelined.pop_front().unwrap();
+        assert_eq!(first.0, 1);
+        assert!(matches!(first.1, CallbackState::Dropped));
+        let second = guard.pipelined.pop_front().unwrap();
+        assert_eq!(second.0, 2);
+        assert!(matches!(second.1, CallbackState::Failed(-12900)));
     }
 }

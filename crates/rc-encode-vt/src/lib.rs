@@ -215,14 +215,9 @@ fn validate_supported(cfg: &EncoderConfig) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-impl Encoder for VtEncoder {
-    fn encode(
-        &mut self,
-        frame: &CapturedFrame,
-        force_idr: bool,
-        deadline_ts: Timestamp,
-    ) -> Result<EncodedFrame> {
-        // 零拷贝路径：只接受 CVPixelBuffer 句柄（SCK 交付形态）。
+impl VtEncoder {
+    /// 校验输入帧携带有效的 `CVPixelBuffer` 且尺寸与配置匹配（M9 防线）。
+    fn validate_cv_pixel_buffer(&self, frame: &CapturedFrame) -> Result<*mut std::ffi::c_void> {
         let buffer = match &frame.texture {
             FrameTexture::CVPixelBuffer(ptr) => *ptr,
             _ => {
@@ -235,7 +230,6 @@ impl Encoder for VtEncoder {
         if buffer.is_null() {
             return Err(Error::InvalidFrame("CVPixelBuffer 句柄为空".to_string()));
         }
-        // 尺寸核对：分辨率漂移（含 Retina 2x 直灌，M9）在入口拒绝，绝不带病编码。
         let (width, height, _format) = ffi::pixel_buffer_info(buffer);
         if width != self.cfg.resolution.width || height != self.cfg.resolution.height {
             return Err(Error::InvalidFrame(format!(
@@ -243,6 +237,20 @@ impl Encoder for VtEncoder {
                 width, height, self.cfg.resolution.width, self.cfg.resolution.height
             )));
         }
+        Ok(buffer)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Encoder for VtEncoder {
+    fn encode(
+        &mut self,
+        frame: &CapturedFrame,
+        force_idr: bool,
+        deadline_ts: Timestamp,
+    ) -> Result<EncodedFrame> {
+        // 零拷贝路径：只接受 CVPixelBuffer 句柄（SCK 交付形态）。
+        let buffer = self.validate_cv_pixel_buffer(frame)?;
 
         // E5：预算 = deadline_ts - 帧时间戳（同一注入时间域），从进入本函数
         // 起算。帧时间戳是内容变化时刻，早于调用时刻的部分计入预算，因此
@@ -321,6 +329,81 @@ impl Encoder for VtEncoder {
         // E3：零输出延迟——会话内没有待取的帧；超时被丢弃的帧不在此复活
         //（丢弃帧的恢复手段是下一帧强制 IDR，不是补发）。
         Ok(Vec::new())
+    }
+
+    fn supports_pipelined_encode(&self) -> bool {
+        true
+    }
+
+    fn submit_encode(
+        &mut self,
+        token: u64,
+        frame: &CapturedFrame,
+        force_idr: bool,
+        deadline_ts: Timestamp,
+    ) -> Result<()> {
+        let buffer = self.validate_cv_pixel_buffer(frame)?;
+        let budget_us = deadline_ts.0.saturating_sub(frame.timestamp.0);
+        if budget_us == 0 {
+            return Err(Error::Timeout(Duration::ZERO));
+        }
+        let force = force_idr || self.idr_requested || self.first_frame_pending;
+        self.session
+            .submit_encode(
+                token,
+                frame.timestamp.0,
+                buffer,
+                force,
+                frame.resource_guard.clone(),
+            )
+            .map_err(|e| match e {
+                ffi::EncodeError::Timeout => Error::Timeout(Duration::ZERO),
+                ffi::EncodeError::Dropped => Error::EncoderDroppedFrame {
+                    msg: "VideoToolbox 丢弃了本帧（RealTime 过载）".to_string(),
+                },
+                ffi::EncodeError::Failed(msg) => Error::Encoder(msg),
+            })?;
+        self.first_frame_pending = false;
+        self.idr_requested = false;
+        Ok(())
+    }
+
+    fn recv_encoded(&mut self, timeout: Duration) -> Result<Option<(u64, EncodedFrame)>> {
+        let Some(out) = self.session.recv_encoded(timeout) else {
+            return Ok(None);
+        };
+        match out.result {
+            Ok(encoded) => {
+                let elapsed_us =
+                    u32::try_from(out.started.elapsed().as_micros()).unwrap_or(u32::MAX);
+                Ok(Some((
+                    out.token,
+                    EncodedFrame {
+                        data: encoded.data,
+                        kind: if encoded.keyframe {
+                            FrameKind::Idr
+                        } else {
+                            FrameKind::P
+                        },
+                        is_keyframe: encoded.keyframe,
+                        encode_done_ts: Timestamp(out.frame_ts.saturating_add(elapsed_us)),
+                    },
+                )))
+            }
+            // RealTime 过载丢帧：不置 idr_requested，避免无谓插关键帧。
+            Err(ffi::EncodeError::Dropped) => Err(Error::EncoderDroppedFrame {
+                msg: "VideoToolbox 丢弃了本帧（RealTime 过载）".to_string(),
+            }),
+            Err(ffi::EncodeError::Failed(msg)) => Err(Error::Encoder(msg)),
+            Err(ffi::EncodeError::Timeout) => {
+                self.idr_requested = true;
+                Err(Error::Timeout(out.started.elapsed()))
+            }
+        }
+    }
+
+    fn in_flight_count(&self) -> usize {
+        self.session.in_flight_count()
     }
 }
 
@@ -668,5 +751,85 @@ mod real_machine {
             forced_out.is_keyframe,
             "显式 force_idr=true 必须立即触发 IDR"
         );
+    }
+
+    /// 2-deep 流水线编码真机回归：验证 `supports_pipelined_encode`、双帧在途、
+    /// `resource_guard` 在提取后释放、以及 FIFO 输出顺序与首帧 IDR。
+    #[test]
+    #[ignore = "requires macOS + 真实 VideoToolbox 编码器（2-deep 流水线真机验证）"]
+    fn pipelined_encode_2deep_preserves_order_and_drops_guards() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct GuardDropCounter(Arc<AtomicUsize>);
+        impl Drop for GuardDropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let _serial = REAL_MACHINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut encoder = VtEncoder::new(EncoderConfig::default()).expect("构造 VtEncoder");
+        assert!(encoder.supports_pipelined_encode());
+        assert_eq!(encoder.in_flight_count(), 0);
+
+        let buffer = crate::ffi::make_pixel_buffer(1920, 1080).expect("创建测试像素缓冲");
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        for seq in 0u64..2 {
+            let ts = Timestamp((seq as u32) * 16_667);
+            let frame = CapturedFrame {
+                texture: FrameTexture::CVPixelBuffer(buffer.as_opaque_ptr()),
+                timestamp: ts,
+                dirty: None,
+                seq: CaptureSeq(seq),
+                is_repeat: false,
+                resource_guard: Some(Arc::new(GuardDropCounter(Arc::clone(&drops)))),
+            };
+            encoder
+                .submit_encode(seq + 100, &frame, false, Timestamp(ts.0 + 100_000))
+                .expect("submit_encode 应成功");
+            drop(frame);
+        }
+        assert_eq!(encoder.in_flight_count(), 2);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "在途期间 resource_guard 必须保持存活"
+        );
+
+        // 第 3 帧在途满 2 时必须被拒（铁律 1）。
+        let extra = CapturedFrame {
+            texture: FrameTexture::CVPixelBuffer(buffer.as_opaque_ptr()),
+            timestamp: Timestamp(50_000),
+            dirty: None,
+            seq: CaptureSeq(2),
+            is_repeat: false,
+            resource_guard: None,
+        };
+        assert!(
+            encoder
+                .submit_encode(102, &extra, false, Timestamp(150_000))
+                .is_err(),
+            "超过 2-deep 上限必须拒绝提交"
+        );
+
+        let first = encoder
+            .recv_encoded(Duration::from_secs(1))
+            .expect("recv 1")
+            .expect("first frame ready");
+        assert_eq!(first.0, 100);
+        assert!(first.1.is_keyframe, "首个正式帧必须是 IDR");
+        assert_eq!(encoder.in_flight_count(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        let second = encoder
+            .recv_encoded(Duration::from_secs(1))
+            .expect("recv 2")
+            .expect("second frame ready");
+        assert_eq!(second.0, 101);
+        assert!(!second.1.is_keyframe, "第二帧应为 P 帧");
+        assert_eq!(encoder.in_flight_count(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 }

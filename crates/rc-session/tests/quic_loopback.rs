@@ -113,6 +113,8 @@ fn quic_pair() -> (HostSession, ClientSession, OriginSlot) {
                 events: Arc::new(Mutex::new(Vec::new())),
             }),
             pace_capture: true, // 工厂假后端必须节流（坑 4）
+            auth: rc_session::HostAuthConfig::default(),
+            approver: Box::new(rc_session::AutoApprover),
         },
         SERVER_CERT_PEM,
         SERVER_KEY_PEM,
@@ -137,6 +139,7 @@ fn quic_pair() -> (HostSession, ClientSession, OriginSlot) {
             handshake_timeout: Duration::from_secs(5),
             capture: Box::new(IdleCapture),
             input_window: rc_input::DEFAULT_WINDOW,
+            auth: rc_session::ClientAuthConfig::default(),
         },
         // 本端端点身份（rc-net 的端点构造对 Controller 角色也要求身份；
         // 对端不校验客户端证书，测试两端共用同一份自签身份）。
@@ -426,6 +429,8 @@ fn big_frame_pair(received: Arc<Mutex<Vec<u64>>>) -> (HostSession, ClientSession
                 events: Arc::new(Mutex::new(Vec::new())),
             }),
             pace_capture: true, // 工厂假后端必须节流（坑 4）
+            auth: rc_session::HostAuthConfig::default(),
+            approver: Box::new(rc_session::AutoApprover),
         },
         SERVER_CERT_PEM,
         SERVER_KEY_PEM,
@@ -466,6 +471,7 @@ fn big_frame_pair(received: Arc<Mutex<Vec<u64>>>) -> (HostSession, ClientSession
             handshake_timeout: Duration::from_secs(5),
             capture: Box::new(IdleCapture),
             input_window: rc_input::DEFAULT_WINDOW,
+            auth: rc_session::ClientAuthConfig::default(),
         },
         SERVER_CERT_PEM,
         SERVER_KEY_PEM,

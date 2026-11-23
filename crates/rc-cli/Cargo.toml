@@ -24,6 +24,8 @@ rc-render = { path = "../rc-render" }
 rc-capture-macos = { path = "../rc-capture-macos" }
 # host --inject-mode real / client --input-mode real（CGEvent 桥，需权限）
 rc-input-macos = { path = "../rc-input-macos" }
+# host --tray（macOS 菜单栏托盘 + 连接审批弹窗；T22）
+rc-host-macos = { path = "../rc-host-macos" }
 
 [dev-dependencies]
 assert_cmd = "2"

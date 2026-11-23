@@ -30,10 +30,13 @@ use rc_proto::{split_frame, MediaHeader};
 use rc_sched::{Decision, DropReason, Scheduler, SchedulerConfig, SchedulerStats};
 use rc_trace::{Mark, Outcome, TraceCollector};
 use rc_types::{Error, FrameKind, Result, Timestamp};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{
+    sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 采集线程 → 调用方线程的消息。
 enum CapMsg {
@@ -82,6 +85,256 @@ fn apply_enc_cmd(encoder: &mut dyn rc_encode::Encoder, cmd: EncCmd) {
         EncCmd::SetBitrate(bps) => {
             if let Err(e) = encoder.set_bitrate(bps) {
                 eprintln!("rc-pipeline: set_bitrate({bps}) rejected by encoder: {e}");
+            }
+        }
+    }
+}
+
+fn take_pending_ts(pending: &mut VecDeque<(u64, Timestamp)>, token: u64) -> Timestamp {
+    if pending.front().is_some_and(|(t, _)| *t == token) {
+        return pending.pop_front().map_or(Timestamp(0), |(_, ts)| ts);
+    }
+    if let Some(pos) = pending.iter().position(|(t, _)| *t == token) {
+        return pending.remove(pos).map_or(Timestamp(0), |(_, ts)| ts);
+    }
+    Timestamp(0)
+}
+
+/// 处理一次 `recv_encoded` 结果并投递到 `done_tx`。
+/// 返回 `None` 表示当前无就绪输出；`Some(true)` 表示已投递；`Some(false)` 表示接收端已断开。
+fn handle_pipelined_recv(
+    res: Result<Option<(u64, rc_encode::EncodedFrame)>>,
+    pending: &mut VecDeque<(u64, Timestamp)>,
+    in_vt: &mut usize,
+    done_tx: &SyncSender<EncodeDone>,
+    enc_wake: &(Mutex<u64>, Condvar),
+) -> Option<bool> {
+    let msg = match res {
+        Ok(None) => return None,
+        Ok(Some((token, frame))) => {
+            *in_vt = in_vt.saturating_sub(1);
+            let capture_ts = take_pending_ts(pending, token);
+            EncodeDone::Ok {
+                seq: rc_types::FrameSeq(token),
+                capture_ts,
+                frame,
+            }
+        }
+        Err(err) => {
+            *in_vt = in_vt.saturating_sub(1);
+            let Some((seq, _)) = pending.pop_front() else {
+                return Some(true);
+            };
+            EncodeDone::Err {
+                seq: rc_types::FrameSeq(seq),
+                err,
+            }
+        }
+    };
+    if done_tx.send(msg).is_err() {
+        return Some(false);
+    }
+    signal_wake(enc_wake);
+    Some(true)
+}
+
+fn submit_pipelined_req(
+    encoder: &mut dyn rc_encode::Encoder,
+    r: EncodeReq,
+    pending: &mut VecDeque<(u64, Timestamp)>,
+    in_vt: &mut usize,
+    done_tx: &SyncSender<EncodeDone>,
+    enc_wake: &(Mutex<u64>, Condvar),
+) -> bool {
+    match encoder.submit_encode(r.seq.0, &r.frame, r.force_idr, r.deadline) {
+        Ok(()) => {
+            pending.push_back((r.seq.0, r.frame.timestamp));
+            *in_vt += 1;
+            true
+        }
+        Err(err) => {
+            if done_tx.send(EncodeDone::Err { seq: r.seq, err }).is_err() {
+                return false;
+            }
+            signal_wake(enc_wake);
+            true
+        }
+    }
+}
+
+fn run_pipelined_encode_loop(
+    encoder: &mut dyn rc_encode::Encoder,
+    req_rx: &Receiver<Mutex<Option<EncodeReq>>>,
+    done_tx: &SyncSender<EncodeDone>,
+    enc_cmd_rx: &Receiver<EncCmd>,
+    enc_flag: &AtomicBool,
+    enc_wake: &(Mutex<u64>, Condvar),
+) {
+    let mut in_vt = 0usize;
+    let mut pending: VecDeque<(u64, Timestamp)> = VecDeque::with_capacity(2);
+    let mut req_disconnected = false;
+
+    while !enc_flag.load(Ordering::Relaxed) && !req_disconnected {
+        // 1) 应用所有挂起命令（如码率调整）。
+        while let Ok(cmd) = enc_cmd_rx.try_recv() {
+            apply_enc_cmd(encoder, cmd);
+        }
+
+        let mut did_work = false;
+
+        // 2) 非阻塞排空所有已完成输出，尽快腾出 VT 在途槽位并唤醒发送端。
+        while let Some(ok) = handle_pipelined_recv(
+            encoder.recv_encoded(Duration::ZERO),
+            &mut pending,
+            &mut in_vt,
+            done_tx,
+            enc_wake,
+        ) {
+            if !ok {
+                return;
+            }
+            did_work = true;
+        }
+
+        // 3) 补满最多 2 帧在途编码（铁律 1）。
+        while in_vt < 2 {
+            match req_rx.try_recv() {
+                Ok(slot) => {
+                    if let Some(r) = slot.lock().expect("req lock").take() {
+                        did_work = true;
+                        if !submit_pipelined_req(
+                            encoder,
+                            r,
+                            &mut pending,
+                            &mut in_vt,
+                            done_tx,
+                            enc_wake,
+                        ) {
+                            return;
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    req_disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        // 4) 本轮未产生有效进展时再阻塞等待，避免空转。
+        if !did_work && !req_disconnected {
+            if in_vt > 0 {
+                let wait = if in_vt == 1 {
+                    Duration::from_millis(1)
+                } else {
+                    Duration::from_millis(5)
+                };
+                if let Some(false) = handle_pipelined_recv(
+                    encoder.recv_encoded(wait),
+                    &mut pending,
+                    &mut in_vt,
+                    done_tx,
+                    enc_wake,
+                ) {
+                    return;
+                }
+            } else {
+                match req_rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(slot) => {
+                        if let Some(r) = slot.lock().expect("req lock").take() {
+                            if !submit_pipelined_req(
+                                encoder,
+                                r,
+                                &mut pending,
+                                &mut in_vt,
+                                done_tx,
+                                enc_wake,
+                            ) {
+                                return;
+                            }
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        req_disconnected = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 5) 停机排空：应用剩余命令、提交并冲刷全部已提交/在途帧，保证 unfinished == 0。
+    while let Ok(cmd) = enc_cmd_rx.try_recv() {
+        apply_enc_cmd(encoder, cmd);
+    }
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        while let Some(ok) = handle_pipelined_recv(
+            encoder.recv_encoded(Duration::ZERO),
+            &mut pending,
+            &mut in_vt,
+            done_tx,
+            enc_wake,
+        ) {
+            if !ok {
+                return;
+            }
+        }
+        let mut req_empty = req_disconnected;
+        while in_vt < 2 && !req_empty {
+            match req_rx.try_recv() {
+                Ok(slot) => {
+                    if let Some(r) = slot.lock().expect("req lock").take() {
+                        if !submit_pipelined_req(
+                            encoder,
+                            r,
+                            &mut pending,
+                            &mut in_vt,
+                            done_tx,
+                            enc_wake,
+                        ) {
+                            return;
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    req_empty = true;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    req_disconnected = true;
+                    req_empty = true;
+                }
+            }
+        }
+        if in_vt == 0 && req_empty {
+            break;
+        }
+        if Instant::now() >= drain_deadline {
+            while let Some((seq, _)) = pending.pop_front() {
+                in_vt = in_vt.saturating_sub(1);
+                if done_tx
+                    .send(EncodeDone::Err {
+                        seq: rc_types::FrameSeq(seq),
+                        err: Error::Timeout(Duration::from_secs(2)),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                signal_wake(enc_wake);
+            }
+            break;
+        }
+        if in_vt > 0 {
+            if let Some(false) = handle_pipelined_recv(
+                encoder.recv_encoded(Duration::from_millis(5)),
+                &mut pending,
+                &mut in_vt,
+                done_tx,
+                enc_wake,
+            ) {
+                return;
             }
         }
     }
@@ -293,6 +546,20 @@ impl HostPipeline {
         let enc_handle = std::thread::Builder::new()
             .name("rc-host-encode".into())
             .spawn(move || {
+                #[cfg(target_os = "macos")]
+                rc_capture_macos::promote_current_thread_qos();
+
+                if encoder.supports_pipelined_encode() {
+                    run_pipelined_encode_loop(
+                        encoder.as_mut(),
+                        &req_rx,
+                        &done_tx,
+                        &enc_cmd_rx,
+                        &enc_flag,
+                        &enc_wake,
+                    );
+                    return;
+                }
                 while !enc_flag.load(Ordering::Relaxed) {
                     // 每轮迭代先应用命令（含 5ms 超时醒来后的轮次：
                     // 空闲时命令最迟 5ms 生效）。
@@ -561,6 +828,15 @@ impl HostPipeline {
         self.sched.in_flight_len() > 0
     }
 
+    /// 是否有尚未被 [`Self::tick`] 消费的唤醒事件（采集到达或编码完成）。
+    pub fn has_pending_work(&self) -> bool {
+        self.wake
+            .0
+            .lock()
+            .map(|g| *g != self.last_wake_gen)
+            .unwrap_or(false)
+    }
+
     /// 会话收尾第一步：只停采集线程（不再有新帧进入交接通道）。
     /// 之后调用方应继续 [`Self::tick`] 到静默（交接通道空、无在途编码），
     /// 再 [`Self::shutdown`] 停编码线程。**先 shutdown 再 tick 是错的**：
@@ -702,4 +978,221 @@ impl Drop for HostPipeline {
 pub fn datagram_header(buf: &[u8]) -> Result<MediaHeader> {
     let (h, _) = MediaHeader::parse_datagram(buf)?;
     Ok(h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rc_capture::{FakeBackend, FakeBackendConfig, FakeContent};
+    use rc_encode::{BitstreamFormat, EncodedFrame, Encoder, EncoderCaps, EncoderConfig};
+    use rc_types::{Resolution, Timestamp};
+    use std::sync::atomic::AtomicUsize;
+
+    /// 支持 2-deep 流水线编码的可编程假编码器：记录最大在途深度，支持按 token 触发过载丢帧。
+    struct MockPipelinedEncoder {
+        cfg: EncoderConfig,
+        queue: VecDeque<(u64, Timestamp, bool)>,
+        max_in_flight: Arc<AtomicUsize>,
+        drop_token: Option<u64>,
+        submitted_count: Arc<AtomicUsize>,
+    }
+
+    impl Encoder for MockPipelinedEncoder {
+        fn encode(
+            &mut self,
+            _frame: &CapturedFrame,
+            _force_idr: bool,
+            _deadline_ts: Timestamp,
+        ) -> Result<EncodedFrame> {
+            unreachable!("pipelined encoder path should call submit_encode/recv_encoded")
+        }
+
+        fn capabilities(&self) -> EncoderCaps {
+            EncoderCaps {
+                codec: self.cfg.codec,
+                hardware: true,
+                max_resolution: Resolution::new(4096, 4096),
+                bitstream_format: BitstreamFormat::AnnexB,
+                profiles: &[66],
+            }
+        }
+
+        fn set_bitrate(&mut self, _bps: u32) -> Result<()> {
+            Ok(())
+        }
+
+        fn request_idr(&mut self) {}
+
+        fn flush(&mut self) -> Result<Vec<EncodedFrame>> {
+            Ok(Vec::new())
+        }
+
+        fn supports_pipelined_encode(&self) -> bool {
+            true
+        }
+
+        fn submit_encode(
+            &mut self,
+            token: u64,
+            frame: &CapturedFrame,
+            force_idr: bool,
+            _deadline_ts: Timestamp,
+        ) -> Result<()> {
+            assert!(
+                self.queue.len() < 2,
+                "HostPipeline 必须严格遵守 in_vt <= 2（当前 {}）",
+                self.queue.len()
+            );
+            self.queue.push_back((token, frame.timestamp, force_idr));
+            self.submitted_count.fetch_add(1, Ordering::SeqCst);
+            let len = self.queue.len();
+            self.max_in_flight.fetch_max(len, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn recv_encoded(&mut self, timeout: Duration) -> Result<Option<(u64, EncodedFrame)>> {
+            let Some((token, ts, is_keyframe)) = self.queue.pop_front() else {
+                if !timeout.is_zero() {
+                    std::thread::sleep(timeout.min(Duration::from_millis(1)));
+                }
+                return Ok(None);
+            };
+            if self.drop_token == Some(token) {
+                return Err(Error::EncoderDroppedFrame {
+                    msg: "simulated overload drop".into(),
+                });
+            }
+            let nal = if is_keyframe { 0x65 } else { 0x41 };
+            Ok(Some((
+                token,
+                EncodedFrame {
+                    data: vec![0, 0, 0, 1, nal, 0xaa],
+                    kind: if is_keyframe {
+                        FrameKind::Idr
+                    } else {
+                        FrameKind::P
+                    },
+                    is_keyframe,
+                    encode_done_ts: Timestamp(ts.0.saturating_add(1_000)),
+                },
+            )))
+        }
+
+        fn in_flight_count(&self) -> usize {
+            self.queue.len()
+        }
+    }
+
+    #[test]
+    fn has_pending_work_reflects_wake_generation_changes() {
+        let cap = FakeBackend::new(FakeBackendConfig {
+            fps: 60,
+            content: FakeContent::Static,
+            ..FakeBackendConfig::default()
+        })
+        .expect("fake capture");
+        let enc = rc_encode::FakeEncoder::new(EncoderConfig {
+            resolution: Resolution::new(1920, 1080),
+            fps: 60,
+            ..EncoderConfig::default()
+        })
+        .expect("fake encoder");
+        let mut pipe = HostPipeline::with_backends_paced(
+            PipelineConfig {
+                resolution: Resolution::new(1920, 1080),
+                fps: 60,
+                ..PipelineConfig::default()
+            },
+            Box::new(cap),
+            Box::new(enc),
+            true,
+        )
+        .expect("pipeline");
+
+        assert!(!pipe.has_pending_work());
+        signal_wake(&pipe.wake);
+        assert!(pipe.has_pending_work());
+        let _ = pipe.tick(1_000).expect("tick");
+        assert!(!pipe.has_pending_work());
+        pipe.shutdown();
+    }
+
+    #[test]
+    fn pipelined_encoder_runs_2deep_handles_drops_and_drains_on_shutdown() {
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let submitted_count = Arc::new(AtomicUsize::new(0));
+        let cap = FakeBackend::new(FakeBackendConfig {
+            fps: 60,
+            content: FakeContent::Dynamic,
+            ..FakeBackendConfig::default()
+        })
+        .expect("fake capture");
+        let enc = MockPipelinedEncoder {
+            cfg: EncoderConfig {
+                resolution: Resolution::new(1920, 1080),
+                fps: 60,
+                ..EncoderConfig::default()
+            },
+            queue: VecDeque::new(),
+            max_in_flight: Arc::clone(&max_in_flight),
+            drop_token: Some(2),
+            submitted_count: Arc::clone(&submitted_count),
+        };
+        let mut pipe = HostPipeline::with_backends_paced(
+            PipelineConfig {
+                resolution: Resolution::new(1920, 1080),
+                fps: 60,
+                ..PipelineConfig::default()
+            },
+            Box::new(cap),
+            Box::new(enc),
+            true,
+        )
+        .expect("pipeline");
+
+        let mut produced_datagrams = 0usize;
+        let mut now_us = 0u32;
+        for _ in 0..80 {
+            if let Some(dgs) = pipe.tick(now_us).expect("tick") {
+                produced_datagrams += dgs.len();
+            }
+            if submitted_count.load(Ordering::SeqCst) >= 5 && produced_datagrams >= 3 {
+                break;
+            }
+            pipe.wait_event(Duration::from_millis(5));
+            now_us = now_us.saturating_add(16_667);
+        }
+        assert!(
+            produced_datagrams > 0,
+            "流水线编码路径必须成功产出媒体数据报"
+        );
+
+        // 严格 S6 停机：先 stop_capture，再排空到静默，再 shutdown + 末轮收尾。
+        pipe.stop_capture();
+        for _ in 0..50 {
+            let _ = pipe.tick(now_us).expect("drain tick");
+            if !pipe.has_pending_encodes() && !pipe.has_pending_work() {
+                break;
+            }
+            pipe.wait_event(Duration::from_millis(5));
+            now_us = now_us.saturating_add(16_667);
+        }
+        pipe.shutdown();
+        let _ = pipe.tick(now_us).expect("final drain tick");
+
+        let frames = pipe.trace().frames();
+        let finished_or_sent = frames
+            .iter()
+            .filter(|f| f.outcome().is_some() || f.at(Mark::Sent).is_some())
+            .count();
+        assert_eq!(
+            finished_or_sent,
+            frames.len(),
+            "停机排空后所有已提交帧必须有结局或 Sent 打点"
+        );
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= 2,
+            "VT 在途数不得超过 2"
+        );
+    }
 }

@@ -29,6 +29,8 @@ use rc_input::InputEvent;
 use rc_net::{NetEvent, NetStats, Transport};
 use rc_types::{Error, Result};
 
+use crate::auth::{ApprovalRequest, ApprovalVerdict, ConnectionApprover};
+use crate::clipboard::ClipboardBackend;
 use crate::proto::ControlMessage;
 
 /// 一端的私有状态：发送记录 + 脚本化投递队列。
@@ -437,6 +439,270 @@ impl rc_input::InputCapture for ScriptedCapture {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────
+// T20 追加：可编程假剪贴板 / 脚本化剪贴板
+// ─────────────────────────────────────────────────────────────────
+
+/// 可编程假剪贴板（单测与集成测试直接操纵）：确定性、不读时钟。
+#[derive(Debug, Default)]
+pub struct FakeClipboard {
+    count: u64,
+    text: Option<String>,
+    written: Vec<String>,
+}
+
+impl FakeClipboard {
+    /// 创建空假剪贴板（初始变更计数为 0，无文本内容）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 模拟用户在本机复制内容（递增变更计数）。
+    ///
+    /// `None` 表示复制了非文本内容（图片 / 文件：`read_text` 将返回 `Ok(None)`）。
+    pub fn simulate_local_copy(&mut self, text: Option<&str>) {
+        self.count = self.count.wrapping_add(1);
+        self.text = text.map(str::to_string);
+    }
+
+    /// 引擎历次 `write_text` 的记录（按写入序，断言用）。
+    pub fn writes(&self) -> &[String] {
+        &self.written
+    }
+}
+
+impl ClipboardBackend for FakeClipboard {
+    fn change_count(&mut self) -> Result<u64> {
+        Ok(self.count)
+    }
+
+    fn read_text(&mut self) -> Result<Option<String>> {
+        Ok(self.text.clone())
+    }
+
+    fn write_text(&mut self, text: &str) -> Result<()> {
+        let owned = text.to_string();
+        self.count = self.count.wrapping_add(1);
+        self.text = Some(owned.clone());
+        self.written.push(owned);
+        Ok(())
+    }
+}
+
+/// 可克隆共享句柄包装的 [`FakeClipboard`]：装箱进会话的 `enable_clipboard`
+/// 后，测试仍可通过克隆句柄触发 `simulate_local_copy` 并断言 `writes()`
+/// （与 [`MockTransport`] / [`RecordingInjector`] 同一句柄约定）。
+#[derive(Clone, Default)]
+pub struct SharedFakeClipboard {
+    inner: Arc<Mutex<FakeClipboard>>,
+}
+
+impl SharedFakeClipboard {
+    /// 创建空的共享假剪贴板句柄。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 模拟用户在本机复制内容（递增变更计数）。
+    pub fn simulate_local_copy(&self, text: Option<&str>) {
+        self.inner
+            .lock()
+            .expect("fake clipboard lock")
+            .simulate_local_copy(text);
+    }
+
+    /// 返回历次 `write_text` 记录的快照（按写入序）。
+    pub fn writes(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .expect("fake clipboard lock")
+            .writes()
+            .to_vec()
+    }
+}
+
+impl ClipboardBackend for SharedFakeClipboard {
+    fn change_count(&mut self) -> Result<u64> {
+        self.inner
+            .lock()
+            .expect("fake clipboard lock")
+            .change_count()
+    }
+
+    fn read_text(&mut self) -> Result<Option<String>> {
+        self.inner.lock().expect("fake clipboard lock").read_text()
+    }
+
+    fn write_text(&mut self, text: &str) -> Result<()> {
+        self.inner
+            .lock()
+            .expect("fake clipboard lock")
+            .write_text(text)
+    }
+}
+
+/// CLI `--clipboard scripted` 用：**IO 边界墙钟**（定位与 [`ScriptedCapture`]
+/// 同款——测量设施允许读墙钟，引擎逻辑不允许）。
+///
+/// 构造后 500ms 模拟一次固定文本复制（`"rabbitcontrol-clipboard-test"`），
+/// 之后保持不变——给双子进程 CI 测试提供确定可断言的流量，全程不碰真实剪贴板。
+pub struct ScriptedClipboard {
+    start: Instant,
+    delay: Duration,
+    scripted_text: String,
+    fired: bool,
+    count: u64,
+    text: Option<String>,
+    written: Vec<String>,
+}
+
+/// [`ScriptedClipboard::standard`] 注入的固定测试文本。
+pub const SCRIPTED_CLIPBOARD_TEXT: &str = "rabbitcontrol-clipboard-test";
+
+impl ScriptedClipboard {
+    /// 标准脚本：构造后 500ms 触发一次 `"rabbitcontrol-clipboard-test"` 复制，
+    /// 之后不再主动变更。
+    pub fn standard() -> Self {
+        Self::with_text(SCRIPTED_CLIPBOARD_TEXT)
+    }
+
+    /// 自定义文本脚本：构造后 500ms 触发一次指定文本复制，之后不再主动变更。
+    ///
+    /// 双端同时跑 `--clipboard scripted` 时让 host 与 client 使用不同文案，
+    /// 避免先发一端的文本经回声抑制吞掉另一端的同文案脚本事件。
+    pub fn with_text(text: impl Into<String>) -> Self {
+        Self {
+            start: Instant::now(),
+            delay: Duration::from_millis(500),
+            scripted_text: text.into(),
+            fired: false,
+            count: 0,
+            text: None,
+            written: Vec::new(),
+        }
+    }
+
+    /// 历次 `write_text` 记录（断言与诊断用）。
+    pub fn writes(&self) -> &[String] {
+        &self.written
+    }
+
+    /// 若墙钟已越过触发延迟且尚未触发，则推进一次本地复制事件。
+    fn maybe_fire(&mut self) {
+        if !self.fired && self.start.elapsed() >= self.delay {
+            self.fired = true;
+            self.count = self.count.wrapping_add(1);
+            self.text = Some(self.scripted_text.clone());
+        }
+    }
+}
+
+impl ClipboardBackend for ScriptedClipboard {
+    fn change_count(&mut self) -> Result<u64> {
+        self.maybe_fire();
+        Ok(self.count)
+    }
+
+    fn read_text(&mut self) -> Result<Option<String>> {
+        self.maybe_fire();
+        Ok(self.text.clone())
+    }
+
+    fn write_text(&mut self, text: &str) -> Result<()> {
+        let owned = text.to_string();
+        self.count = self.count.wrapping_add(1);
+        self.text = Some(owned.clone());
+        self.written.push(owned);
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// T22 追加：可编排连接审批人（离线测试 / 集成测试复用）
+// ─────────────────────────────────────────────────────────────────
+
+/// [`MockApprover`] 的共享内态（克隆共享，装箱进 `HostSessionConfig` 后仍可观测）。
+#[derive(Default)]
+struct MockApproverInner {
+    verdict: Option<ApprovalVerdict>,
+    request: Option<ApprovalRequest>,
+    in_flight: bool,
+    submit_count: u32,
+    cancel_count: u32,
+}
+
+/// 可编排的审批人（离线测试 / scripted 模式复用）。
+///
+/// `Clone` 与 [`MockTransport`] / [`RecordingInjector`] 同一句柄约定：
+/// 克隆体与原实例共享同一份内态。把原实例装箱进 `HostSessionConfig::approver`
+/// 后，测试仍可通过克隆体调用 [`preset`](Self::preset)、
+/// [`take_request`](Self::take_request)、[`submit_count`](Self::submit_count)、
+/// [`cancel_count`](Self::cancel_count) 编排与观测。
+#[derive(Clone, Default)]
+pub struct MockApprover {
+    inner: Arc<Mutex<MockApproverInner>>,
+}
+
+impl MockApprover {
+    /// 构造默认不自动裁决（`poll_verdict` 恒返回 `None`）的审批人。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 预置裁决：`submit` 后 `poll_verdict` 立即返回它（也可在等待期间经克隆句柄动态写入）。
+    pub fn preset(&mut self, verdict: ApprovalVerdict) {
+        self.inner.lock().expect("mock approver lock").verdict = Some(verdict);
+    }
+
+    /// 观测：取走最近一次 `submit` 收到的审批请求（断言字段完整性用；取走后清空）。
+    pub fn take_request(&mut self) -> Option<ApprovalRequest> {
+        self.inner
+            .lock()
+            .expect("mock approver lock")
+            .request
+            .take()
+    }
+
+    /// 观测：`submit` 调用次数。
+    pub fn submit_count(&self) -> u32 {
+        self.inner.lock().expect("mock approver lock").submit_count
+    }
+
+    /// 观测：`cancel` 实际撤销在途审批的次数（无在途请求时的幂等 no-op 不计数）。
+    pub fn cancel_count(&self) -> u32 {
+        self.inner.lock().expect("mock approver lock").cancel_count
+    }
+}
+
+impl ConnectionApprover for MockApprover {
+    fn submit(&mut self, req: &ApprovalRequest) {
+        let mut inner = self.inner.lock().expect("mock approver lock");
+        inner.request = Some(req.clone());
+        inner.in_flight = true;
+        inner.submit_count += 1;
+    }
+
+    fn poll_verdict(&mut self) -> Option<ApprovalVerdict> {
+        let mut inner = self.inner.lock().expect("mock approver lock");
+        if !inner.in_flight {
+            return None;
+        }
+        let verdict = inner.verdict;
+        if verdict.is_some() {
+            inner.in_flight = false;
+        }
+        verdict
+    }
+
+    fn cancel(&mut self) {
+        let mut inner = self.inner.lock().expect("mock approver lock");
+        if inner.in_flight {
+            inner.in_flight = false;
+            inner.cancel_count += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,5 +930,53 @@ mod tests {
             vec![b"input".to_vec()],
             "urgent 与 reliable 分道记录"
         );
+    }
+
+    /// T22：`MockApprover` 预置裁决、请求观测与 submit/cancel 计数及幂等性。
+    #[test]
+    fn mock_approver_preset_and_observation() {
+        let req = ApprovalRequest {
+            session_id: 0x1234_5678,
+            remote_addr: "127.0.0.1:54321".parse().unwrap(),
+            requested: crate::proto::SessionParams {
+                width: 1920,
+                height: 1080,
+                fps: 60,
+                bitrate_bps: 8_000_000,
+            },
+            auth_method: crate::proto::AuthMethod::Password,
+            password_verified: true,
+        };
+
+        let mut approver = MockApprover::new();
+        let mut observer = approver.clone();
+        assert_eq!(approver.submit_count(), 0);
+        assert_eq!(approver.cancel_count(), 0);
+        assert!(approver.take_request().is_none());
+
+        // 无在途请求时 cancel 为幂等 no-op，不 panic、不计数。
+        approver.cancel();
+        approver.cancel();
+        assert_eq!(observer.cancel_count(), 0);
+
+        // preset(Accepted) 后 submit → poll_verdict 立即返回 Some(Accepted)。
+        approver.preset(ApprovalVerdict::Accepted);
+        approver.submit(&req);
+        assert_eq!(observer.submit_count(), 1);
+        assert_eq!(approver.poll_verdict(), Some(ApprovalVerdict::Accepted));
+        // 终局后再次 poll 返回 None；take_request 取到完整字段后清空。
+        assert_eq!(approver.poll_verdict(), None);
+        assert_eq!(observer.take_request(), Some(req.clone()));
+        assert!(observer.take_request().is_none());
+
+        // 未预置裁决的在途请求：poll 返回 None，cancel 计数恰好 +1 且二次 cancel 幂等。
+        let mut pending = MockApprover::new();
+        let pending_obs = pending.clone();
+        pending.submit(&req);
+        assert_eq!(pending.poll_verdict(), None);
+        pending.cancel();
+        pending.cancel();
+        assert_eq!(pending_obs.submit_count(), 1);
+        assert_eq!(pending_obs.cancel_count(), 1);
     }
 }

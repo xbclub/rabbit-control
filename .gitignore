@@ -1,5 +1,10 @@
-# 编译产物
+# 编译产物与生成物
 /target
+server/backend/target/
+crates/rc-ui/gen/schemas/
+server/web/dist/
+node_modules/
+*.tsbuildinfo
 **/*.rs.bk
 
 # 测试与诊断输出

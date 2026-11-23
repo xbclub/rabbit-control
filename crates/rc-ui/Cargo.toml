@@ -1,0 +1,55 @@
+[package]
+name = "rc-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tauri v2 桌面应用：RabbitControl 的 12 屏 UI 载体（纯静态 HTML/CSS/JS 前端，无前端框架）。"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-clipboard-manager = "2"
+rc-session = { path = "../rc-session" }
+rc-net = { path = "../rc-net" }
+rc-input = { path = "../rc-input" }
+rc-types = { path = "../rc-types" }
+rc-pipeline = { path = "../rc-pipeline" }
+rc-capture = { path = "../rc-capture" }
+rc-encode = { path = "../rc-encode" }
+rc-render = { path = "../rc-render" }
+rc-decode = { path = "../rc-decode" }
+rc-trace = { path = "../rc-trace" }
+rc-audio = { path = "../rc-audio" }
+rc-tools = { path = "../rc-tools" }
+# 临时验证码与局域网实例 ID 生成（复用 rc-session 已引入的 rand 0.8）。
+rand = "0.8"
+# 局域网多播端口复用（SO_REUSEADDR / SO_REUSEPORT，复用 quinn 已引入的 socket2 0.6.5，零 unsafe）。
+socket2 = { version = "0.6.5", features = ["all"] }
+# 仅限 rc-ui 的 Tauri IPC 边界 derive，不向其他 crate 渗透（见 T21 坑 12）。
+serde = { version = "1", features = ["derive"] }
+# 信令原生 TCP JSON 帧与服务器配置持久化（复用 tauri 已引入的 serde_json 1）。
+serde_json = "1"
+# 客户端认证存储、HTTPS 客户端、CSR 生成与 Ed25519 PoP 签验（全部复用根 Cargo.lock 已有依赖）。
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+base64 = "0.22"
+sha2 = "0.10"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rc-capture-macos = { path = "../rc-capture-macos" }
+rc-render-macos = { path = "../rc-render-macos" }
+rc-input-macos = { path = "../rc-input-macos" }
+# 版本线与 rc-render-macos 严格对齐（objc2 0.6 + 平台绑定 0.3）。
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes"] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+    "std",
+    "CABase",
+    "CALayer",
+    "CAMetalLayer",
+    "objc2-core-foundation",
+] }
+
+[build-dependencies]
+tauri-build = "2"

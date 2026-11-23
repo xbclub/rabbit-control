@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "全窗口默认能力集：Tauri 核心默认权限 + 窗口拖动 + 剪贴板写入 + rc-ui 多窗口与会话命令。",
+  "windows": ["main", "session", "portmap", "settings", "transfer", "terminal"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "clipboard-manager:allow-write-text",
+    "allow-window-open",
+    "allow-session-ipc"
+  ]
+}

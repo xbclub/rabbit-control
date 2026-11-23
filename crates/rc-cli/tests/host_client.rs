@@ -77,9 +77,12 @@ fn wait(
     })
 }
 
-/// 临时路径（按测试名 + pid 区分）。
+/// 临时路径（按测试名 + pid 区分，跨平台使用 `std::env::temp_dir()`）。
 fn tmp(name: &str, ext: &str) -> String {
-    format!("/tmp/rc-t18-{name}-{}.{ext}", std::process::id())
+    std::env::temp_dir()
+        .join(format!("rc-t18-{name}-{}.{ext}", std::process::id()))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// host + client 双进程跑一轮。`host_extra` / `client_extra` 需各自给出
@@ -422,7 +425,7 @@ fn reconnect_scenario_recovers_within_budget() {
         .nth(1)
         .expect("recovery_ms 键");
     let value: u64 = seg
-        .split('}')
+        .split([',', '}'])
         .next()
         .expect("数值")
         .parse()
@@ -507,6 +510,323 @@ fn wait_timeout_kills_children_instead_of_leaking() {
             "{name} 被 kill 的退出状态不应是 success（实际 {status:?}）"
         );
     }
+}
+
+/// 从报告 JSON 的 `"clipboard":{...}` 段中提取指定无符号整数字段。
+fn clipboard_u64_field(json: &str, key: &str) -> u64 {
+    let clip = json
+        .split("\"clipboard\":{")
+        .nth(1)
+        .and_then(|s| s.split('}').next())
+        .unwrap_or_else(|| panic!("报告缺 session.clipboard 段：{json}"));
+    clip.split(&format!("\"{key}\":"))
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("session.clipboard.{key} 必须是数字：{json}"))
+}
+
+/// T20 双子进程真 QUIC 剪贴板同步（CI 可跑，不碰真实剪贴板）：
+/// - Case A：host `--clipboard scripted` + client `--clipboard scripted`
+///   → 两侧报告均 `session.clipboard.enabled == true`，host `received >= 1`、
+///   client `sent >= 1`（且 host stderr 摘要含剪贴板收发计数，CB10）；
+/// - Case B：缺省（不传 `--clipboard`）→ 两侧报告均
+///   `session.clipboard.enabled == false`（默认关闭，CB1）。
+#[test]
+fn clipboard_scripted_sync_over_real_quic() {
+    let _serial = pair_serial();
+
+    // ── Case A：双端 --clipboard scripted ──
+    {
+        let port = reserve_port();
+        let connect = format!("127.0.0.1:{port}");
+        let host_report = tmp("clip-on", "host.json");
+        let client_report = tmp("clip-on", "client.json");
+
+        let mut host = spawn(
+            &[
+                "host",
+                "--listen",
+                &connect,
+                "--backend",
+                "fake",
+                "--resolution",
+                "64x64",
+                "--duration",
+                "8s",
+                "--inject-mode",
+                "record",
+                "--clipboard",
+                "scripted",
+                "--report",
+                &host_report,
+            ],
+            &tmp("clip-on", "host.err"),
+        );
+        let mut client = spawn(
+            &[
+                "client",
+                "--connect",
+                &connect,
+                "--backend",
+                "fake",
+                "--resolution",
+                "64x64",
+                "--duration",
+                "3s",
+                "--input-mode",
+                "scripted",
+                "--clipboard",
+                "scripted",
+                "--report",
+                &client_report,
+            ],
+            &tmp("clip-on", "client.err"),
+        );
+
+        let client_status = wait(&mut client, &mut [&mut host], Duration::from_secs(30));
+        let host_status = wait(&mut host, &mut [], Duration::from_secs(30));
+        assert_eq!(
+            client_status.code(),
+            Some(0),
+            "scripted 剪贴板下 client 应 exit 0，stderr: {}",
+            std::fs::read_to_string(tmp("clip-on", "client.err")).unwrap_or_default()
+        );
+        assert!(
+            host_status.success(),
+            "scripted 剪贴板下 host 应正常收尾，stderr: {}",
+            std::fs::read_to_string(tmp("clip-on", "host.err")).unwrap_or_default()
+        );
+
+        let host_json = std::fs::read_to_string(&host_report).expect("host 报告必须落盘");
+        let client_json = std::fs::read_to_string(&client_report).expect("client 报告必须落盘");
+
+        assert!(
+            host_json.contains("\"clipboard\":{\"enabled\":true,"),
+            "host 报告应标记 clipboard.enabled == true：{host_json}"
+        );
+        assert!(
+            client_json.contains("\"clipboard\":{\"enabled\":true,"),
+            "client 报告应标记 clipboard.enabled == true：{client_json}"
+        );
+        let host_received = clipboard_u64_field(&host_json, "received");
+        let client_sent = clipboard_u64_field(&client_json, "sent");
+        assert!(
+            host_received >= 1,
+            "host 报告 session.clipboard.received 应 >= 1，实际 {host_received}：{host_json}"
+        );
+        assert!(
+            client_sent >= 1,
+            "client 报告 session.clipboard.sent 应 >= 1，实际 {client_sent}：{client_json}"
+        );
+        // 核对全部 8 个统计键完整落盘（CB10）。
+        for key in [
+            "sent",
+            "received",
+            "echo_suppressed",
+            "coalesced",
+            "oversize_dropped",
+            "non_text_dropped",
+            "superseded_local",
+            "received_while_disabled",
+        ] {
+            let _ = clipboard_u64_field(&host_json, key);
+            let _ = clipboard_u64_field(&client_json, key);
+        }
+        let host_stderr = std::fs::read_to_string(tmp("clip-on", "host.err")).unwrap_or_default();
+        assert!(
+            host_stderr.contains("剪贴板 发 ") && host_stderr.contains(" 收 "),
+            "host stderr 摘要应含剪贴板收发计数（CB10）：{host_stderr}"
+        );
+
+        std::fs::remove_file(&host_report).ok();
+        std::fs::remove_file(&client_report).ok();
+    }
+
+    // ── Case B：默认（不传 --clipboard）→ 两侧 enabled == false ──
+    {
+        let port = reserve_port();
+        let connect = format!("127.0.0.1:{port}");
+        let host_report = tmp("clip-off", "host.json");
+        let client_report = tmp("clip-off", "client.json");
+
+        let mut host = spawn(
+            &[
+                "host",
+                "--listen",
+                &connect,
+                "--backend",
+                "fake",
+                "--resolution",
+                "64x64",
+                "--duration",
+                "8s",
+                "--inject-mode",
+                "record",
+                "--report",
+                &host_report,
+            ],
+            &tmp("clip-off", "host.err"),
+        );
+        let mut client = spawn(
+            &[
+                "client",
+                "--connect",
+                &connect,
+                "--backend",
+                "fake",
+                "--resolution",
+                "64x64",
+                "--duration",
+                "2s",
+                "--input-mode",
+                "scripted",
+                "--report",
+                &client_report,
+            ],
+            &tmp("clip-off", "client.err"),
+        );
+
+        let client_status = wait(&mut client, &mut [&mut host], Duration::from_secs(30));
+        let host_status = wait(&mut host, &mut [], Duration::from_secs(30));
+        assert_eq!(
+            client_status.code(),
+            Some(0),
+            "默认配置下 client 应 exit 0，stderr: {}",
+            std::fs::read_to_string(tmp("clip-off", "client.err")).unwrap_or_default()
+        );
+        assert!(
+            host_status.success(),
+            "默认配置下 host 应正常收尾，stderr: {}",
+            std::fs::read_to_string(tmp("clip-off", "host.err")).unwrap_or_default()
+        );
+
+        let host_json = std::fs::read_to_string(&host_report).expect("host 报告必须落盘");
+        let client_json = std::fs::read_to_string(&client_report).expect("client 报告必须落盘");
+
+        assert!(
+            host_json.contains("\"clipboard\":{\"enabled\":false,"),
+            "默认配置下 host 报告应标记 clipboard.enabled == false：{host_json}"
+        );
+        assert!(
+            client_json.contains("\"clipboard\":{\"enabled\":false,"),
+            "默认配置下 client 报告应标记 clipboard.enabled == false：{client_json}"
+        );
+
+        std::fs::remove_file(&host_report).ok();
+        std::fs::remove_file(&client_report).ok();
+    }
+}
+
+/// T22（U11）：host `--approval deny` + client 连接 → client exit 1、stderr 含
+/// 拒绝语义，且 host 主动关闭连接后迅速退出（不挂死到 `--duration`）。
+#[test]
+fn deny_mode_rejects_client() {
+    let _serial = pair_serial();
+    let port = reserve_port();
+    let connect = format!("127.0.0.1:{port}");
+    let host_err = tmp("deny", "host.err");
+    let client_err = tmp("deny", "client.err");
+
+    let mut host = spawn(
+        &[
+            "host",
+            "--listen",
+            &connect,
+            "--backend",
+            "fake",
+            "--resolution",
+            "64x64",
+            "--duration",
+            "15s",
+            "--inject-mode",
+            "record",
+            "--approval",
+            "deny",
+        ],
+        &host_err,
+    );
+    let mut client = spawn(
+        &[
+            "client",
+            "--connect",
+            &connect,
+            "--backend",
+            "fake",
+            "--resolution",
+            "64x64",
+            "--duration",
+            "5s",
+            "--input-mode",
+            "scripted",
+        ],
+        &client_err,
+    );
+
+    let started = Instant::now();
+    let client_status = wait(&mut client, &mut [&mut host], Duration::from_secs(20));
+    let host_status = wait(&mut host, &mut [], Duration::from_secs(20));
+    let elapsed = started.elapsed();
+
+    let c_stderr = std::fs::read_to_string(&client_err).unwrap_or_default();
+    let h_stderr = std::fs::read_to_string(&host_err).unwrap_or_default();
+    assert_eq!(
+        client_status.code(),
+        Some(1),
+        "deny 模式下 client 必须 exit 1，stderr: {c_stderr}"
+    );
+    let c_lower = c_stderr.to_lowercase();
+    assert!(
+        c_lower.contains("reject") || c_stderr.contains("拒绝"),
+        "client stderr 应包含拒绝语义：{c_stderr}"
+    );
+    assert!(
+        !host_status.success(),
+        "deny 模式拒绝握手后 host 应以错误退出，stderr: {h_stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "deny 模式应立即拒绝并结束，而非等待 duration（实际 {:?}）",
+        elapsed
+    );
+
+    std::fs::remove_file(&host_err).ok();
+    std::fs::remove_file(&client_err).ok();
+}
+
+/// T22：`host --approval bogus` → clap 参数解析报错 exit 2。
+#[test]
+fn invalid_approval_mode_rejected() {
+    let mut child = Command::new(bin())
+        .args(["host", "--approval", "bogus"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let status = wait(&mut child, &mut [], Duration::from_secs(10));
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "非法 --approval 值应由 clap 返回 exit 2"
+    );
+}
+
+/// T22：headless 下 `--approval prompt`（无 `--tray`）→ 参数校验报错 exit 2，
+/// 不得挂起等待一个不存在的弹窗。
+#[test]
+fn prompt_without_tray_is_rejected() {
+    let mut child = Command::new(bin())
+        .args(["host", "--approval", "prompt"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let status = wait(&mut child, &mut [], Duration::from_secs(10));
+    assert_eq!(
+        status.code(),
+        Some(2),
+        "无 --tray 时指定 --approval prompt 必须返回 exit 2"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────

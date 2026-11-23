@@ -77,6 +77,7 @@ pub(crate) struct RefChainGate {
     chain_ok: bool,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 impl RefChainGate {
     /// 新建：链断裂（首个 IDR 之前）。
     pub(crate) fn new() -> Self {

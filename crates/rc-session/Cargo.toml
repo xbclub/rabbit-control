@@ -20,6 +20,10 @@ rc-capture = { path = "../rc-capture" }
 rc-encode = { path = "../rc-encode" }
 rc-decode = { path = "../rc-decode" }
 rc-render = { path = "../rc-render" }
+rand = "0.8" # 仅挑战盐生成（OS 熵）；与 rc-net/rc-loopback 同版本，不引入新依赖家族
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
 
 [dev-dependencies]
 rc-proto = { path = "../rc-proto" } # split_frame 手工造数据报（client 单测）

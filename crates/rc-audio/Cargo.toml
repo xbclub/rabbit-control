@@ -1,0 +1,19 @@
+[package]
+name = "rc-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl 音频子系统：纯 Rust IMA-ADPCM 编解码 + macOS ScreenCaptureKit 音频采集与 AudioQueue 低延迟播放。"
+
+[dependencies]
+rc-types = { path = "../rc-types" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+dispatch2 = "0.3"
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", features = ["CFArray", "CFString"] }
+objc2-core-media = "0.3"
+objc2-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"

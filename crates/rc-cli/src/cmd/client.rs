@@ -18,12 +18,13 @@ use std::time::{Duration, Instant};
 use rc_pipeline::{DiffMode, PipelineConfig};
 use rc_session::proto::{ByeReason, SessionParams};
 use rc_session::report::{FrameObservation, SessionConfigSnapshot, SessionReport};
-use rc_session::testkit::ScriptedCapture;
+use rc_session::testkit::{ScriptedCapture, ScriptedClipboard};
 use rc_session::{
-    ClientSession, ClientSessionConfig, ReconnectOutcome, SessionClock, SessionState,
+    ClientSession, ClientSessionConfig, ClipboardBackend, ReconnectOutcome, SessionClock,
+    SessionState,
 };
 
-use super::{BackendMode, CliResult, ClientArgs, InputMode};
+use super::{BackendMode, CliResult, ClientArgs, ClipboardMode, InputMode};
 
 /// run 循环的常规 poll 预算（照 ClientSession::run 的分档）。
 const RUN_POLL_BUDGET: Duration = Duration::from_millis(1);
@@ -63,10 +64,10 @@ fn measurement_duration_us(
     first_frame: Option<Instant>,
     window_close: Instant,
     requested: Duration,
-) -> u32 {
+) -> u64 {
     match first_frame {
-        Some(f) => u32::try_from(window_close.duration_since(f).as_micros()).unwrap_or(u32::MAX),
-        None => u32::try_from(requested.as_micros()).unwrap_or(u32::MAX),
+        Some(f) => u64::try_from(window_close.duration_since(f).as_micros()).unwrap_or(u64::MAX),
+        None => u64::try_from(requested.as_micros()).unwrap_or(u64::MAX),
     }
 }
 
@@ -74,8 +75,17 @@ fn measurement_duration_us(
 /// 收口那一刻的会话钟读数（当前纪元；重建换新 trace，观测帧必同纪元），
 /// close() 排空期才呈现的帧 presented_us 严格晚于它。无 presented 打点
 /// 的帧（未结/网络丢失）保留——它们计入各自结局桶，本就不进 fps 分子。
-fn drop_drain_frames(frames: &mut Vec<FrameObservation>, window_end_us: u32) {
-    frames.retain(|f| f.presented_us.map_or(true, |p| p <= window_end_us));
+/// 返回被剔除的排空期上屏帧数，供调用方同步扣减 `obs.total_displayed`。
+fn drop_drain_frames(frames: &mut Vec<FrameObservation>, window_end_us: u32) -> u64 {
+    let mut dropped = 0u64;
+    frames.retain(|f| {
+        let keep = f.presented_us.map_or(true, |p| p <= window_end_us);
+        if !keep {
+            dropped += 1;
+        }
+        keep
+    });
+    dropped
 }
 
 /// 执行 `client` 子命令：计时起点（Endpoint 创建之前）→ connect →
@@ -107,6 +117,13 @@ pub fn run(args: &ClientArgs) -> CliResult<ExitCode> {
         }
     };
 
+    // ── 剪贴板后端前置校验（on 模式启动即校验，非 macOS 不做静默空操作；
+    //    scripted 模式待握手后再构造，确保 500ms 延迟从 Streaming 开始起算）──
+    let mut prebuilt_clipboard = match args.clipboard {
+        ClipboardMode::Off | ClipboardMode::Scripted => None,
+        ClipboardMode::On => Some(build_real_clipboard_backend()?),
+    };
+
     // ── 会话配置（管线模板：握手后以裁定值覆盖，实际后端由工厂选）──
     let pipeline = PipelineConfig {
         resolution: args.resolution,
@@ -136,6 +153,10 @@ pub fn run(args: &ClientArgs) -> CliResult<ExitCode> {
         handshake_timeout: Duration::from_secs(10),
         capture,
         input_window: rc_input::DEFAULT_WINDOW,
+        auth: rc_session::ClientAuthConfig {
+            password: args.password.clone(),
+            ..rc_session::ClientAuthConfig::default()
+        },
     };
 
     // ── 计时起点：Endpoint 创建之前（坑 3 写死的口径）──
@@ -218,6 +239,19 @@ pub fn run(args: &ClientArgs) -> CliResult<ExitCode> {
         negotiated.width, negotiated.height, negotiated.fps,
     );
 
+    // ── 剪贴板显式启用（CB1：Off 不调用 enable_clipboard）──
+    match args.clipboard {
+        ClipboardMode::Off => {}
+        ClipboardMode::On => {
+            if let Some(cb) = prebuilt_clipboard.take() {
+                client.enable_clipboard(cb);
+            }
+        }
+        ClipboardMode::Scripted => {
+            client.enable_clipboard(Box::new(ScriptedClipboard::standard()));
+        }
+    }
+
     // ── 驱动循环（照 ClientSession::run 手工展开；见模块文档）──
     let duration = args.duration;
     let mut last_busy = true;
@@ -274,9 +308,16 @@ pub fn run(args: &ClientArgs) -> CliResult<ExitCode> {
                 let outcome = client
                     .tick_reconnect(u64::from((clock_reader)()))
                     .map_err(|e| format!("client 重连驱动失败: {e}"))?;
-                if let ReconnectOutcome::Waiting { next_attempt_in_ms } = outcome {
-                    let nap = Duration::from_millis(next_attempt_in_ms).min(RUN_RECONNECT_SLEEP);
-                    std::thread::sleep(nap);
+                match outcome {
+                    ReconnectOutcome::Waiting { next_attempt_in_ms } => {
+                        let nap =
+                            Duration::from_millis(next_attempt_in_ms).min(RUN_RECONNECT_SLEEP);
+                        std::thread::sleep(nap);
+                    }
+                    ReconnectOutcome::Resumed | ReconnectOutcome::Rebuilt => {
+                        on_reconnect_clipboard(&mut client, &outcome);
+                    }
+                    ReconnectOutcome::Connecting | ReconnectOutcome::GaveUp => {}
                 }
             }
             // Init/Connected/Detached 不是驱动循环可达态（client 不进 Detached）。
@@ -317,7 +358,10 @@ pub fn run(args: &ClientArgs) -> CliResult<ExitCode> {
     //    同一模式）──
     let duration_us = measurement_duration_us(first_frame_at, window_close, duration);
     let mut obs = client.observations(duration_us, first_frame_us);
-    drop_drain_frames(&mut obs.frames, window_end_us);
+    let dropped_drain = drop_drain_frames(&mut obs.frames, window_end_us);
+    if let Some(total) = obs.total_displayed.as_mut() {
+        *total = total.saturating_sub(dropped_drain);
+    }
     let snapshot = SessionConfigSnapshot {
         resolution: rc_types::Resolution::new(negotiated.width, negotiated.height),
         fps: negotiated.fps,
@@ -404,6 +448,34 @@ fn derive_session_id() -> u64 {
     (u64::from(std::process::id()) << 20) | (n & 0xF_FFFF) | 0x100_000
 }
 
+/// 构造真实平台剪贴板后端（仅 macOS；非 macOS 返回 InvalidConfig 错误，不做静默空操作）。
+fn build_real_clipboard_backend() -> CliResult<Box<dyn ClipboardBackend>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(
+            rc_session::NspasteboardBackend::new()
+                .map_err(|e| format!("macOS 剪贴板后端初始化失败: {e}"))?,
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(rc_types::Error::InvalidConfig(
+            "--clipboard on 仅 macOS 支持（其他平台请使用 off / scripted）".into(),
+        )
+        .to_string())
+    }
+}
+
+/// L1：重连恢复或重建后仅重置剪贴板纪元态（保留原后端与累计 `ClipboardStats`）。
+fn on_reconnect_clipboard(client: &mut ClientSession, outcome: &ReconnectOutcome) {
+    if matches!(
+        outcome,
+        ReconnectOutcome::Resumed | ReconnectOutcome::Rebuilt
+    ) {
+        client.reset_clipboard_epoch();
+    }
+}
+
 /// 输入模式的报告标签。
 fn input_label(mode: InputMode) -> &'static str {
     match mode {
@@ -475,7 +547,7 @@ mod tests {
             (1_900_000..=2_100_000).contains(&d),
             "首帧起算的窗长应 ≈2s，实际 {d}µs"
         );
-        // 无首帧 → 请求时长原样透传；超 u32 饱和不回绕。
+        // 无首帧 → 请求时长原样透传；超 u32 范围时 u64 精确保留不饱和。
         let close = Instant::now();
         assert_eq!(
             measurement_duration_us(None, close, Duration::from_secs(8)),
@@ -483,8 +555,8 @@ mod tests {
         );
         assert_eq!(
             measurement_duration_us(None, close, Duration::from_secs(6_000)),
-            u32::MAX,
-            "超 u32 的请求时长饱和不回绕"
+            6_000_000_000u64,
+            "超 71.6min 的请求时长 u64 精确保留不饱和"
         );
     }
 
@@ -513,5 +585,119 @@ mod tests {
         assert_eq!(frames[0].presented_us, Some(100));
         assert_eq!(frames[1].presented_us, Some(5_000));
         assert_eq!(frames[2].presented_us, None);
+    }
+
+    /// L1 回归：
+    /// 1) `ClientSession::tick` 内部已泵剪贴板（驱动循环不再冗余调用 `pump_clipboard`）；
+    /// 2) `on_reconnect_clipboard` 在 `Resumed`/`Rebuilt` 时调用 `reset_clipboard_epoch()`，
+    ///    保留累计 `ClipboardStats` 且时钟归零后可继续发送新剪贴板内容。
+    #[test]
+    fn reconnect_clipboard_resets_epoch_and_preserves_stats() {
+        use rc_session::proto::{AuthStatus, ControlMessage, HostFlags, Welcome};
+        use rc_session::testkit::{MockTransport, SharedFakeClipboard};
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let pcfg = PipelineConfig {
+            resolution: rc_types::Resolution::new(64, 64),
+            fps: 60,
+            bitrate_bps: 8_000_000,
+            prefer_hardware: false,
+            target_latency_us: 22_000,
+            trace_capacity: 64,
+            diff: DiffMode::TrustPlatform,
+            clock_origin_us: None,
+            max_packet_payload: rc_pipeline::MAX_PAYLOAD,
+        };
+        let params = SessionParams {
+            width: 64,
+            height: 64,
+            fps: 60,
+            bitrate_bps: 8_000_000,
+        };
+
+        let mut transport = MockTransport::new();
+        transport.deliver_reliable(&ControlMessage::Welcome(Welcome {
+            session_id: 77,
+            granted: params,
+            auth_status: AuthStatus::Ok,
+            host_flags: HostFlags(0),
+        }));
+
+        let client_dec = rc_decode::FakeDecoder::new(rc_decode::FakeDecoderConfig {
+            resolution: pcfg.resolution,
+            ..rc_decode::FakeDecoderConfig::default()
+        })
+        .expect("fake decoder");
+        let client_ren = rc_render::FakeRenderer::new(rc_render::FakeRendererConfig {
+            size: (pcfg.resolution.width, pcfg.resolution.height),
+            ..rc_render::FakeRendererConfig::default()
+        })
+        .expect("fake renderer");
+        let now_us = Arc::new(AtomicU32::new(4_000_000_000));
+        let client_clock: SessionClock = {
+            let now_us = Arc::clone(&now_us);
+            Arc::new(move || now_us.load(Ordering::Relaxed))
+        };
+        let mut client = ClientSession::with_parts(
+            ClientSessionConfig {
+                peer_addr: "127.0.0.1:0".parse().unwrap(),
+                mtu: rc_session::DEFAULT_SESSION_MTU,
+                requested: params,
+                session_id: 77,
+                pipeline: pcfg,
+                connect_timeout: Duration::from_secs(5),
+                handshake_timeout: Duration::from_secs(5),
+                capture: Box::new(IdleCapture),
+                input_window: rc_input::DEFAULT_WINDOW,
+                auth: rc_session::ClientAuthConfig::default(),
+            },
+            Box::new(transport),
+            Box::new(client_dec),
+            Box::new(client_ren),
+            client_clock,
+        )
+        .expect("client with_parts");
+        client.handshake().expect("client 握手");
+
+        let cb = SharedFakeClipboard::new();
+        client.enable_clipboard(Box::new(cb.clone()));
+
+        // 首拍建立基线，随后模拟本机复制，由 tick() 内部泵出（无外部冗余 pump_clipboard）。
+        let t = Instant::now();
+        client
+            .tick(Duration::from_millis(1), t)
+            .expect("baseline tick");
+        cb.simulate_local_copy(Some("before-reconnect"));
+        now_us.store(4_000_100_000, Ordering::Relaxed);
+        client
+            .tick(Duration::from_millis(1), t)
+            .expect("send tick 1");
+        assert_eq!(client.clipboard_stats().sent, 1);
+
+        // 模拟重连 Resumed + 时钟纪元归零：统计必须保留且新纪元能继续发送。
+        on_reconnect_clipboard(&mut client, &ReconnectOutcome::Resumed);
+        assert_eq!(
+            client.clipboard_stats().sent,
+            1,
+            "Resumed 重置纪元不得清零累计 ClipboardStats"
+        );
+        now_us.store(0, Ordering::Relaxed);
+        client
+            .tick(Duration::from_millis(1), t)
+            .expect("new epoch baseline");
+        cb.simulate_local_copy(Some("after-resumed"));
+        now_us.store(100_000, Ordering::Relaxed);
+        client
+            .tick(Duration::from_millis(1), t)
+            .expect("send tick 2");
+        assert_eq!(client.clipboard_stats().sent, 2);
+
+        // 模拟 Rebuilt：同样保留累计统计。
+        on_reconnect_clipboard(&mut client, &ReconnectOutcome::Rebuilt);
+        assert_eq!(
+            client.clipboard_stats().sent,
+            2,
+            "Rebuilt 重置纪元不得清零累计 ClipboardStats"
+        );
     }
 }

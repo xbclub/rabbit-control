@@ -149,6 +149,7 @@ cargo test -p rc-capture-macos -- --ignored
 | 8 | `kVTCompressionPropertyKey_RealTime` 未设 → 默认按文件转码优化 | **最常见的延迟来源** |
 | 9 | Apple Silicon 与 Intel 的 VT 能力不同 | 用 `VTCopySupportedPropertyDictionaryForEncoder` 查询 |
 | 10 | 多显示器：`SCContentFilter` 需指定 display | 每显示器一个 stream |
+| 11 | `kVTVideoEncoderSpecification_EnableLowLatencyRateControl = true` 在高帧率下会导致 Apple Silicon VideoToolbox 约 3s 后触发媒体引擎降速（M1 Pro `1512x982@120` 30s loopback 跌至 ~84fps / encode 19.3ms） | `rc-encode-vt` 在 `fps >= 90` 时自动关闭 LLRC、保持全帧率 `RealTime = true`（M6），实测 30s loopback 稳态 `118.20 fps`、25s 会话后 15s 中位 `119.7 fps`；`fps < 90` 路径与 T12 60fps 延迟不变（P50=7.72ms） |
 
 ## 依赖
 

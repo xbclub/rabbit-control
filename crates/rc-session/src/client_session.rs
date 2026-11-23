@@ -25,6 +25,7 @@
 //! 发 Bye → 停 pump（无独立线程，天然停）→ 继续收/推数据报到静默或
 //! 500ms 上限 → `finish_in_flight()` → `controller.shutdown()`。
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,7 +37,13 @@ use rc_pipeline::{ControllerPipeline, PipelineConfig};
 use rc_render::Renderer;
 use rc_types::{Error, FrameSeq, Result};
 
-use crate::proto::{self, AuthStatus, ByeReason, ControlMessage, Hello, IdrReason, SessionParams};
+use crate::auth::{ClientAuthAction, ClientAuthConfig, ClientAuthenticator};
+use crate::clipboard::{
+    ClipboardAction, ClipboardBackend, ClipboardChannel, ClipboardConfig, ClipboardStats,
+};
+use crate::proto::{
+    self, AudioFramePacket, AuthStatus, ByeReason, ControlMessage, Hello, IdrReason, SessionParams,
+};
 use crate::reconnect::{Backoff, ReconnectConfig, ReconnectStats};
 use crate::watchdog::{
     DeliveryTracker, IdrController, IdrControllerConfig, StallWatchdog, DEFAULT_STALL_US,
@@ -74,6 +81,11 @@ const PENDING_ACK_CAP: usize = 8192;
 /// 内的帧，trace 容量同级即可）。
 const FRAME_HEADER_CAP: usize = 8192;
 
+/// 工具复用接收队列有界容量上限（可靠通道绝不静默丢帧，满时返回协议错误）。
+const MAX_PENDING_TOOL_MESSAGES: usize = 2048;
+/// 音频帧接收队列有界容量上限（低延迟优先，满时丢弃最旧帧）。
+const MAX_PENDING_AUDIO_FRAMES: usize = 32;
+
 /// 控制端会话配置。
 pub struct ClientSessionConfig {
     /// 对端（被控端）地址。
@@ -88,12 +100,15 @@ pub struct ClientSessionConfig {
     pub pipeline: PipelineConfig,
     /// connect 超时，默认 10s。
     pub connect_timeout: Duration,
-    /// 发 Hello 后等 Welcome 的上限，默认 5s。
+    /// 发 Hello 后等 Welcome 的上限，默认 45s（T22 U6：`approval_timeout + 15s`，
+    /// 避免 host 30s 审批弹窗等待期间 client 先于 host 超时）。
     pub handshake_timeout: Duration,
     /// 输入捕获器（真机 = 平台捕获桥；测试 = 脚本型替身）。
     pub capture: Box<dyn rc_input::InputCapture>,
     /// InputChannel 批窗口，默认 `rc_input::DEFAULT_WINDOW`。
     pub input_window: Duration,
+    /// T19/T22：鉴权配置（默认无密码 + `DEFAULT_CLIENT_AUTH_TIMEOUT_US` = 45s）。
+    pub auth: ClientAuthConfig,
 }
 
 impl ClientSessionConfig {
@@ -111,9 +126,10 @@ impl ClientSessionConfig {
             session_id,
             pipeline: PipelineConfig::default(),
             connect_timeout: Duration::from_secs(10),
-            handshake_timeout: Duration::from_secs(5),
+            handshake_timeout: Duration::from_micros(crate::auth::DEFAULT_CLIENT_AUTH_TIMEOUT_US),
             capture,
             input_window: rc_input::DEFAULT_WINDOW,
+            auth: ClientAuthConfig::default(),
         }
     }
 }
@@ -177,6 +193,9 @@ pub struct ClientSession {
     recovery_ms: Option<u64>,
     /// 上一拍末的 displayed 计数（算每拍增量）。
     last_displayed: u64,
+    /// 历次已替换旧 `ControllerPipeline` 累计上屏帧数（H4：跨重建无界累计，
+    /// 消除 trace 环形缓冲 4096 上限与管线重建清零失真）。
+    prev_pipelines_displayed: u64,
     /// T15：RTT/偏移探测引擎（client 发起，兼 1s 心跳）。
     probe: crate::probe::ProbeEngine,
     /// T15：带宽粗测估计器（每次会话一次，v0 粗 heuristic）。
@@ -225,6 +244,38 @@ pub struct ClientSession {
     reconnect_phase: ReconnectPhase,
     /// 饱和刷新重建进行中（下一个 Welcome 必须带 host_flags bit1=1）。
     refresh_pending: bool,
+    /// T19：握手期鉴权子态（Init/Connected ⇄ 终局 Welcome/超时；A6：未终局前零启动管线）。
+    auth_phase: AuthPhase,
+    // ── T20：剪贴板 UTF-8 纯文本双向同步（默认禁用，显式 enable_clipboard 开启）──
+    /// 剪贴板同步状态：`Some((channel, backend))` 表示已启用，`None` 表示禁用（CB1）。
+    clipboard: Option<(ClipboardChannel, Box<dyn ClipboardBackend>)>,
+    /// 未启用时收到的 `ClipboardNotify` 计数（CB1：计数、不写本机、不拆会话）。
+    clipboard_received_while_disabled: u64,
+    // ── 工具复用（0x10）与音频帧（0x11）有界接收队列 ──
+    /// 工具复用消息接收队列（FILE/TERMINAL/PORTMAP，上限 [`MAX_PENDING_TOOL_MESSAGES`]）。
+    tool_rx: VecDeque<(u8, Vec<u8>)>,
+    /// 音频控制子通道（`TOOL_CHANNEL_AUDIO_CTRL`）独立最新值槽位（不被批量数据挤占）。
+    audio_ctrl_rx: Option<Vec<u8>>,
+    /// 工具复用接收队列满时触发协议错误的溢出计数。
+    tool_rx_overflow_dropped: u64,
+    /// 音频帧接收队列（上限 [`MAX_PENDING_AUDIO_FRAMES`]，满时丢最旧）。
+    audio_rx: VecDeque<AudioFramePacket>,
+}
+
+/// 握手期鉴权子态（私有状态机，不改动公开的 [`SessionState`]）。
+enum AuthPhase {
+    /// 非鉴权中（Init / Streaming / Closed / 退避等待）。
+    Idle,
+    /// 已发 Hello，鉴权进行中（等终局 Welcome 或 AuthChallenge）。
+    Authenticating(ClientAuthenticator),
+}
+
+/// 单步握手消息处理结果。
+enum ClientHandshakeStep {
+    /// 鉴权进行中（已收到过程 Welcome 或已发出 AuthResponse，继续等待终局）。
+    Authenticating,
+    /// 终局成功（收到 `Welcome{Ok}`，携带裁定参数）。
+    Done(SessionParams),
 }
 
 /// connect 工厂类型（[`ClientSession::set_connect_factory`] 的注入件）。
@@ -313,6 +364,7 @@ impl ClientSession {
             recovery_ms: None,
             datagrams_pushed_total: 0,
             last_displayed: 0,
+            prev_pipelines_displayed: 0,
             probe: crate::probe::ProbeEngine::new(),
             bw: crate::probe::BwEstimator::new(),
             bw_probe_started: false,
@@ -340,6 +392,13 @@ impl ClientSession {
             connect_factory: None,
             reconnect_phase: ReconnectPhase::Idle,
             refresh_pending: false,
+            auth_phase: AuthPhase::Idle,
+            clipboard: None,
+            clipboard_received_while_disabled: 0,
+            tool_rx: VecDeque::new(),
+            audio_ctrl_rx: None,
+            tool_rx_overflow_dropped: 0,
+            audio_rx: VecDeque::new(),
         })
     }
 
@@ -386,6 +445,7 @@ impl ClientSession {
             recovery_ms: None,
             datagrams_pushed_total: 0,
             last_displayed: 0,
+            prev_pipelines_displayed: 0,
             probe: crate::probe::ProbeEngine::new(),
             bw: crate::probe::BwEstimator::new(),
             bw_probe_started: false,
@@ -413,6 +473,13 @@ impl ClientSession {
             connect_factory: None,
             reconnect_phase: ReconnectPhase::Idle,
             refresh_pending: false,
+            auth_phase: AuthPhase::Idle,
+            clipboard: None,
+            clipboard_received_while_disabled: 0,
+            tool_rx: VecDeque::new(),
+            audio_ctrl_rx: None,
+            tool_rx_overflow_dropped: 0,
+            audio_rx: VecDeque::new(),
         })
     }
 
@@ -466,9 +533,42 @@ impl ClientSession {
         Ok(Box::new(transport))
     }
 
-    /// 已连通 transport 上的握手步骤：发 Hello → 以 handshake_timeout 为
-    /// 预算 poll 等 Welcome → 校验 session_id 回显与 auth_status → 以裁定
-    /// 参数建管线（`ControllerPipeline::with_backends`）。
+    fn drain_post_welcome_events(&mut self, ev_iter: impl Iterator<Item = NetEvent>) -> Result<()> {
+        for trailing in ev_iter {
+            match trailing {
+                NetEvent::Reliable(extra) => match self.dispatch_control(&extra) {
+                    Ok(ControlFlow::Handled) => {}
+                    Ok(ControlFlow::Bye(reason)) => {
+                        self.stop_with(StopReason::ByeReceived(reason), None);
+                        return Err(Error::Network(format!(
+                            "peer closed right after Welcome: {reason:?}"
+                        )));
+                    }
+                    Err(e) => {
+                        self.stop_with(StopReason::Disconnected(e.to_string()), None);
+                        return Err(e);
+                    }
+                },
+                NetEvent::Disconnected { reason } => {
+                    self.stop_with(StopReason::Disconnected(reason.clone()), None);
+                    return Err(Error::Network(reason));
+                }
+                NetEvent::PathChanged => {
+                    self.rstats.path_changes += 1;
+                }
+                NetEvent::Connected => {}
+                NetEvent::Datagram(_) | NetEvent::ReliableUrgent(_) => {
+                    self.early_events_dropped += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 已连通 transport 上的握手步骤：发 Hello（鉴权位来自 [`ClientAuthenticator`]，
+    /// A1：密码绝不进 Hello）→ 进内部 `Authenticating` 子态 → poll 等 `Welcome` /
+    /// `AuthChallenge`（A5/A6/A7）→ 终局 `Welcome{Ok}` 后才以裁定参数建管线
+    /// （`ControllerPipeline::with_backends`）。
     pub fn handshake(&mut self) -> Result<SessionParams> {
         match self.state {
             SessionState::Connected => {}
@@ -484,38 +584,74 @@ impl ClientSession {
                 )))
             }
         }
+        // T19（A1/A2）：构造全新 ClientAuthenticator，鉴权位来自 hello_auth()（密码绝不进 Hello）。
+        let mut auth =
+            ClientAuthenticator::with_session_id(self.cfg.auth.clone(), self.session_id_current);
+        let (auth_method, auth_payload) = auth.hello_auth();
         // 发 Hello（S3：请求参数原样上送，裁定以 Welcome 回值为准）。
         let hello = ControlMessage::Hello(Hello {
             version: proto::PROTOCOL_VERSION,
-            session_id: self.cfg.session_id,
+            session_id: self.session_id_current,
             requested: self.cfg.requested,
-            auth_method: proto::AuthMethod::None,
-            auth_payload: vec![],
+            auth_method,
+            auth_payload,
         });
         let mut buf = Vec::new();
         hello.encode(&mut buf);
-        self.transport
+        if let Err(e) = self
+            .transport
             .as_mut()
             .expect("Connected implies transport")
-            .send_reliable(&buf)?;
+            .send_reliable(&buf)
+        {
+            return Err(self.handshake_fail(e));
+        }
+        auth.on_hello_sent(u64::from((self.clock)()));
+        self.auth_phase = AuthPhase::Authenticating(auth);
 
         let slice = self.cfg.handshake_timeout.min(HANDSHAKE_POLL_SLICE);
+        let slice_ms = slice.as_millis().max(1) as u64;
         let total_ms = self.cfg.handshake_timeout.as_millis() as u64;
-        let slice_ms = HANDSHAKE_POLL_SLICE.as_millis() as u64;
-        let mut rounds_left = total_ms.div_ceil(slice_ms);
+        let mut rounds_left = total_ms.div_ceil(slice_ms).max(1);
+        let auth_budget_ms = self
+            .cfg
+            .handshake_timeout
+            .as_millis()
+            .max(Duration::from_micros(self.cfg.auth.auth_timeout_us).as_millis())
+            as u64;
+        let auth_budget_rounds = auth_budget_ms.div_ceil(slice_ms).max(1) + 2;
+
         loop {
-            let events = self
+            let events = match self
                 .transport
                 .as_mut()
                 .expect("Connected implies transport")
-                .poll(slice)?;
-            for ev in events {
+                .poll(slice)
+            {
+                Ok(ev) => ev,
+                Err(e) => return Err(self.handshake_fail(e)),
+            };
+            let mut ev_iter = events.into_iter();
+            while let Some(ev) = ev_iter.next() {
                 match ev {
                     NetEvent::Reliable(msg) => {
-                        return match self.consume_welcome(&msg) {
-                            Ok(granted) => Ok(granted),
-                            Err(e) => Err(self.handshake_fail(e)),
-                        };
+                        match self.handle_handshake_reliable(&msg) {
+                            Ok(ClientHandshakeStep::Done(granted)) => {
+                                self.auth_phase = AuthPhase::Idle;
+                                if let Err(e) = self.finalize_handshake(granted) {
+                                    return Err(self.handshake_fail(e));
+                                }
+                                // 同批中 Welcome 之后紧随到达的控制帧（例如初始 DisplayConfig ToolChannel）
+                                // 必须立即交付到 Streaming 控制分发，防止被提前 return 丢弃。
+                                self.drain_post_welcome_events(ev_iter)?;
+                                return Ok(granted);
+                            }
+                            Ok(ClientHandshakeStep::Authenticating) => {
+                                // 进入挑战/等待人工确认窗口：放宽轮询预算以覆盖 auth_timeout_us。
+                                rounds_left = rounds_left.max(auth_budget_rounds);
+                            }
+                            Err(e) => return Err(self.handshake_fail(e)),
+                        }
                     }
                     // S4：Streaming 之前到达的媒体/输入事件丢弃并计数，不缓存。
                     NetEvent::Datagram(_) | NetEvent::ReliableUrgent(_) => {
@@ -523,6 +659,7 @@ impl ClientSession {
                     }
                     NetEvent::Connected | NetEvent::PathChanged => {}
                     NetEvent::Disconnected { reason } => {
+                        self.auth_phase = AuthPhase::Idle;
                         self.state = SessionState::Closed;
                         self.closed_reason = Some(StopReason::Disconnected(reason.clone()));
                         self.transport = None;
@@ -532,8 +669,19 @@ impl ClientSession {
                     }
                 }
             }
+            // A7：每拍复核注入时钟口径的鉴权超时窗口。
+            let now_us = u64::from((self.clock)());
+            if let AuthPhase::Authenticating(ref mut auth) = self.auth_phase {
+                if auth.poll_timeout(now_us) {
+                    let timeout = Duration::from_micros(self.cfg.auth.auth_timeout_us);
+                    eprintln!(
+                        "[rc-session/auth] client authentication timed out after {timeout:?}"
+                    );
+                    return Err(self.handshake_fail(Error::Timeout(timeout)));
+                }
+            }
             if rounds_left <= 1 {
-                return Err(Error::Timeout(self.cfg.handshake_timeout));
+                return Err(self.handshake_fail(Error::Timeout(self.cfg.handshake_timeout)));
             }
             rounds_left -= 1;
         }
@@ -830,6 +978,10 @@ impl ClientSession {
                     self.recovery_ms = Some(u64::from(f.at_us.wrapping_sub(since)) / 1_000);
                     self.recovery_pending_since_us = None;
                 }
+            }
+            // T20 剪贴板泵（仅 Streaming 态；未启用时空操作、零开销）。
+            if self.clipboard.is_some() {
+                self.pump_clipboard(u64::from(now))?;
             }
         }
 
@@ -1233,6 +1385,174 @@ impl ClientSession {
         self.recovery_ms
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // T20：剪贴板 UTF-8 纯文本双向同步（与 HostSession 完全对称）
+    // ─────────────────────────────────────────────────────────────
+
+    /// 启用剪贴板同步（默认禁用，CB1：敏感面须显式开启）。
+    ///
+    /// 替换式：重复调用替换后端并重建 [`ClipboardChannel`]（重置基线与回声状态，
+    /// T17 重连恢复后应重新调用，避免复用断线前纪元的 `last_written` / 变更计数基线）。
+    pub fn enable_clipboard(&mut self, backend: Box<dyn ClipboardBackend>) {
+        self.clipboard = Some((ClipboardChannel::new(ClipboardConfig::default()), backend));
+    }
+
+    /// 重置剪贴板通道的会话纪元态（保留后端与累计统计，H6）。
+    ///
+    /// 在重连恢复（`Resumed`）、全新重建（`Rebuilt`）或驱动器时钟归零时调用，
+    /// 清除旧纪元的变更计数基线、回声基准、挂起槽与节流时间戳。未启用剪贴板时为空操作。
+    pub fn reset_clipboard_epoch(&mut self) {
+        if let Some((channel, _)) = self.clipboard.as_mut() {
+            channel.reset_epoch();
+        }
+    }
+
+    /// 是否已启用剪贴板同步（供报告 JSON `session.clipboard.enabled` 使用）。
+    pub fn clipboard_enabled(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
+    /// 剪贴板本机侧泵（`now_us` = 本端单调会话钟微秒）：
+    ///
+    /// 未启用或非 [`SessionState::Streaming`] 时为空操作（零开销）。
+    /// 产出 [`ClipboardAction::SendToPeer`] 时经 reliable 控制流（Stream A，CB2）
+    /// 发送 `ClipboardNotify`。后端错误记 stderr 继续，不拆会话。
+    pub fn pump_clipboard(&mut self, now_us: u64) -> Result<()> {
+        if self.state != SessionState::Streaming {
+            return Ok(());
+        }
+        let action = {
+            let Some((channel, backend)) = self.clipboard.as_mut() else {
+                return Ok(());
+            };
+            match channel.pump_local(backend.as_mut(), now_us) {
+                Ok(act) => act,
+                Err(e) => {
+                    eprintln!("rc-session client: 剪贴板后端轮询失败（不拆会话）: {e}");
+                    return Ok(());
+                }
+            }
+        };
+        if let ClipboardAction::SendToPeer(text) = action {
+            match ControlMessage::clipboard_notify(text) {
+                Ok(msg) => {
+                    let mut buf = Vec::new();
+                    msg.encode(&mut buf);
+                    if let Some(t) = self.transport.as_mut() {
+                        if let Err(e) = t.send_reliable(&buf) {
+                            eprintln!(
+                                "rc-session client: 发送 ClipboardNotify 失败（不拆会话）: {e}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("rc-session client: 构造 ClipboardNotify 失败（不拆会话）: {e}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 控制分发臂（0x0F，T20）：处理对端发来的 `ClipboardNotify`。
+    ///
+    /// 未启用时只递增 `received_while_disabled`、不写本机剪贴板、不拆会话（CB1）；
+    /// 启用时交由 [`ClipboardChannel::on_peer_text`] 写入并记录回声基准（后端错误
+    /// 仅记 stderr，不拆会话）。
+    pub fn on_clipboard_notify(&mut self, text: &str) -> Result<()> {
+        let Some((channel, backend)) = self.clipboard.as_mut() else {
+            self.clipboard_received_while_disabled += 1;
+            return Ok(());
+        };
+        if let Err(e) = channel.on_peer_text(backend.as_mut(), text) {
+            eprintln!("rc-session client: 剪贴板后端写入失败（不拆会话）: {e}");
+        }
+        Ok(())
+    }
+
+    /// 剪贴板同步统计快照（含未启用期间收到的 `received_while_disabled`）。
+    pub fn clipboard_stats(&self) -> ClipboardStats {
+        let mut stats = match &self.clipboard {
+            Some((ch, _)) => ch.stats(),
+            None => ClipboardStats::default(),
+        };
+        stats.received_while_disabled = stats
+            .received_while_disabled
+            .saturating_add(self.clipboard_received_while_disabled);
+        stats
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 工具复用通道（0x10）与音频帧通道（0x11）非阻塞收发接口
+    // ─────────────────────────────────────────────────────────────
+
+    /// 发送一条工具复用消息（0x10，经 Stream A reliable 控制流写出）。
+    ///
+    /// 仅 [`SessionState::Streaming`] 允许调用；校验 `channel` 在 `1..=4` 且
+    /// `payload.len() <= MAX_TOOL_PAYLOAD_BYTES`。
+    pub fn send_tool_message(&mut self, channel: u8, payload: Vec<u8>) -> Result<()> {
+        match self.state {
+            SessionState::Streaming => {}
+            other => {
+                return Err(Error::InvalidConfig(format!(
+                    "send_tool_message requires Streaming state, got {other:?}"
+                )))
+            }
+        }
+        let msg = ControlMessage::tool_channel(channel, payload)?;
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        self.transport
+            .as_mut()
+            .ok_or_else(|| {
+                Error::InvalidConfig("send_tool_message requires a live transport".into())
+            })?
+            .send_reliable(&buf)
+    }
+
+    /// 排空本端已收到的全部工具复用消息 `(channel, payload)`（可靠子通道按到达顺序，
+    /// 独立隔离的 `TOOL_CHANNEL_AUDIO_CTRL` 最新控制指令一并附尾排空）。
+    pub fn drain_tool_messages(&mut self) -> Vec<(u8, Vec<u8>)> {
+        let mut out: Vec<(u8, Vec<u8>)> = self.tool_rx.drain(..).collect();
+        if let Some(ctrl) = self.audio_ctrl_rx.take() {
+            out.push((crate::proto::TOOL_CHANNEL_AUDIO_CTRL, ctrl));
+        }
+        out
+    }
+
+    /// 工具复用接收队列溢出计数（可靠子通道满触发 `Error::Protocol` 的次数）。
+    pub fn tool_rx_overflow_dropped(&self) -> u64 {
+        self.tool_rx_overflow_dropped
+    }
+
+    /// 发送一帧音频数据包（0x11，经 Stream A reliable 控制流写出）。
+    ///
+    /// 仅 [`SessionState::Streaming`] 允许调用；校验采样率、声道数、编解码与大小上限。
+    pub fn send_audio_frame(&mut self, packet: AudioFramePacket) -> Result<()> {
+        match self.state {
+            SessionState::Streaming => {}
+            other => {
+                return Err(Error::InvalidConfig(format!(
+                    "send_audio_frame requires Streaming state, got {other:?}"
+                )))
+            }
+        }
+        let msg = ControlMessage::audio_frame(packet)?;
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        self.transport
+            .as_mut()
+            .ok_or_else(|| {
+                Error::InvalidConfig("send_audio_frame requires a live transport".into())
+            })?
+            .send_reliable(&buf)
+    }
+
+    /// 排空本端已收到的全部音频帧（按到达顺序；接收队列满时自动丢弃最旧帧）。
+    pub fn drain_audio_frames(&mut self) -> Vec<AudioFramePacket> {
+        self.audio_rx.drain(..).collect()
+    }
+
     /// 组装 client 会话报告的全部原始观测（铁律 4：只吃会话内已记账的
     /// 注入数据，不读任何时钟；`duration_us` 是请求的测量时长——fps
     /// 分母，不含排空；`connect_to_first_frame_us` 由驱动器（CLI 组合根）
@@ -1241,7 +1561,7 @@ impl ClientSession {
     /// 停机后调用（Closed 状态管线仍在，账目可查）。
     pub fn observations(
         &self,
-        duration_us: u32,
+        duration_us: u64,
         connect_to_first_frame_us: Option<u64>,
     ) -> crate::report::SessionObservations {
         let snapshot = self.probe_snapshot();
@@ -1255,13 +1575,13 @@ impl ClientSession {
                     .map(|f| {
                         let seq = f.seq().0;
                         // Captured 标记写入的就是包头 host 域 capture_ts（坑 1）；
-                        // encode_done 取自包头记录表（被容量淘汰的旧帧退化为
-                        // captured——encode 段记 0，诚实可解释）。
+                        // encode_done 取自包头记录表元组第 2 项（H8：.1 是 encode_done_ts，
+                        // 被容量淘汰的旧帧退化为 captured——encode 段记 0，诚实可解释）。
                         let captured = f.at(rc_trace::Mark::Captured).map(|ts| ts.0).unwrap_or(0);
                         let encode_done = self
                             .frame_headers
                             .get(&seq)
-                            .map(|(e, _)| *e)
+                            .map(|(_, e)| *e)
                             .unwrap_or(captured);
                         crate::report::FrameObservation {
                             seq: f.seq(),
@@ -1276,10 +1596,15 @@ impl ClientSession {
                     .collect()
             })
             .unwrap_or_default();
+        let current_displayed = self.pipeline.as_ref().map(|p| p.displayed()).unwrap_or(0);
+        let total_displayed = self
+            .prev_pipelines_displayed
+            .saturating_add(current_displayed);
         let rs = self.reconnect_stats();
         crate::report::SessionObservations {
             frames,
             duration_us,
+            total_displayed: Some(total_displayed),
             connect_to_first_frame_us,
             rtt_us: snapshot.rtt_us_median.and_then(|v| u32::try_from(v).ok()),
             clock_offset_us: snapshot.offset_us_median,
@@ -1290,12 +1615,17 @@ impl ClientSession {
             max_reassembly_depth: self.max_reassembly_depth,
             net: self.net_stats_cache,
             reconnect: crate::report::ReconnectStats {
-                // 触发的重连次数 = 被动断线 + 饱和刷新演练（两者都进
-                // Reconnecting 状态机）。
-                attempts: u64::from(rs.disconnects) + u64::from(rs.refreshes),
+                // H5：attempts 仅计意外断线重连（含主动演练）；饱和刷新 Bye(Refresh)
+                // 属预期纪元重建，单列 refreshes，不触发 resumed=false 误判。
+                attempts: u64::from(rs.disconnects),
                 resumed: rs.resumes > 0,
                 recovery_ms: self.recovery_ms,
+                refreshes: u64::from(rs.refreshes),
             },
+            clipboard: crate::report::ClipboardReport::from_stats(
+                self.clipboard_enabled(),
+                self.clipboard_stats(),
+            ),
             session_id: self.session_id_current,
         }
     }
@@ -1314,6 +1644,10 @@ impl ClientSession {
         }
         self.rstats.disconnects += 1;
         self.transport = None; // 死连接即弃；重连开新连接
+        self.auth_phase = AuthPhase::Idle;
+        self.tool_rx.clear();
+        self.audio_ctrl_rx = None;
+        self.audio_rx.clear();
         self.state = SessionState::Reconnecting;
         self.refresh_pending = false;
         self.reconnect_phase = ReconnectPhase::ResumePending;
@@ -1357,10 +1691,17 @@ impl ClientSession {
                     return Err(e);
                 }
             };
-            for ev in events {
+            let mut ev_iter = events.into_iter();
+            while let Some(ev) = ev_iter.next() {
                 match ev {
                     NetEvent::Reliable(msg) => {
                         if let Some(outcome) = self.on_reconnect_message(&msg, now_us)? {
+                            if matches!(
+                                outcome,
+                                ReconnectOutcome::Resumed | ReconnectOutcome::Rebuilt
+                            ) {
+                                self.drain_post_welcome_events(ev_iter)?;
+                            }
                             return Ok(outcome);
                         }
                         // 其余消息：忽略（等 Welcome），继续 poll 本批。
@@ -1369,9 +1710,10 @@ impl ClientSession {
                     NetEvent::PathChanged => {
                         self.rstats.path_changes += 1;
                     }
-                    // 连接又断：按一次失败退避（阶段回到 Pending）。
+                    // 连接又断：按一次失败退避（阶段回到 Pending，清鉴权子态）。
                     NetEvent::Disconnected { .. } => {
                         self.transport = None;
+                        self.auth_phase = AuthPhase::Idle;
                         self.reconnect_phase = if self.refresh_pending {
                             ReconnectPhase::FreshPending
                         } else {
@@ -1384,6 +1726,23 @@ impl ClientSession {
                         self.early_events_dropped += 1;
                     }
                     NetEvent::Connected => {}
+                }
+            }
+            // A7：重连全新握手鉴权期间每拍复核超时（注入时钟口径）。
+            if let AuthPhase::Authenticating(ref mut auth) = self.auth_phase {
+                if auth.poll_timeout(now_us) {
+                    let timeout = Duration::from_micros(self.cfg.auth.auth_timeout_us);
+                    eprintln!(
+                        "[rc-session/auth] client authentication timed out during reconnect after {timeout:?}"
+                    );
+                    self.auth_phase = AuthPhase::Idle;
+                    self.stop_with(
+                        StopReason::Disconnected(format!(
+                            "auth timed out while reconnecting after {timeout:?}"
+                        )),
+                        None,
+                    );
+                    return Err(Error::Timeout(timeout));
                 }
             }
             // 本批无裁定：继续等（驱动循环靠 poll 分片防自旋）。
@@ -1400,7 +1759,7 @@ impl ClientSession {
             let attempt = self.open_connection().and_then(|t| {
                 self.transport = Some(t);
                 match self.reconnect_phase {
-                    ReconnectPhase::FreshPending => self.send_fresh_hello(),
+                    ReconnectPhase::FreshPending => self.send_fresh_hello(now_us),
                     _ => self.send_reconnect_request(),
                 }
             });
@@ -1412,7 +1771,11 @@ impl ClientSession {
                     };
                     return Ok(ReconnectOutcome::Connecting);
                 }
-                Err(_) => return Ok(self.on_attempt_failure(now_us)),
+                Err(_) => {
+                    self.transport = None;
+                    self.auth_phase = AuthPhase::Idle;
+                    return Ok(self.on_attempt_failure(now_us));
+                }
             }
         }
         // ③ 未到点：退避等待。
@@ -1451,6 +1814,10 @@ impl ClientSession {
             p.shutdown();
         }
         self.transport = None; // host 已关：丢弃残余连接
+        self.auth_phase = AuthPhase::Idle;
+        self.tool_rx.clear();
+        self.audio_ctrl_rx = None;
+        self.audio_rx.clear();
         self.session_id_current = self.session_id_current.wrapping_add(1);
         self.refresh_pending = true;
         self.reconnect_phase = ReconnectPhase::FreshPending;
@@ -1527,14 +1894,20 @@ impl ClientSession {
                     // T18：恢复计时起点——首个完整到达的 IDR 帧结出
                     // recovery_ms（上面强制的 IdrRequest 的响应）。
                     self.recovery_pending_since_us = Some(now_us);
+                    // H6：resume 恢复重置剪贴板纪元态（避免复用断线前的基线与回声状态）。
+                    self.reset_clipboard_epoch();
+                    self.tool_rx.clear();
+                    self.audio_ctrl_rx = None;
+                    self.audio_rx.clear();
                     Ok(Some(ReconnectOutcome::Resumed))
                 } else {
                     // bit0=0 → 同连接降级：换新 session_id 补发全新 Hello
-                    //（管线重建等下一个 Welcome，届时首帧天然 IDR）。
+                    //（T19 A2：构造全新 ClientAuthenticator 走全新挑战应答；
+                    // 管线重建等终局 Welcome{Ok}，届时首帧天然 IDR）。
                     self.session_id_current = self.session_id_current.wrapping_add(1);
                     // 修复卡 B-1：降级 Hello 发送失败不再裸上抛——完整停机
                     // 后返回 Err（sid 已自增无所谓：会话按红线终结）。
-                    if let Err(e) = self.send_fresh_hello() {
+                    if let Err(e) = self.send_fresh_hello(now_us) {
                         let stop = StopReason::Disconnected(format!(
                             "send fresh Hello after resume rejected failed: {e}"
                         ));
@@ -1548,68 +1921,191 @@ impl ClientSession {
                 }
             }
             (ControlMessage::Welcome(w), ReconnectPhase::AwaitingFresh) => {
-                // 修复卡 B-1：校验失败不裸上抛——完整停机后返回 Err。
-                let granted = match self.validate_welcome(&w) {
-                    Ok(g) => g,
-                    Err(e) => {
-                        let stop = StopReason::Disconnected(format!(
-                            "welcome rejected while rebuilding: {e}"
-                        ));
-                        self.stop_with(stop, None);
-                        return Err(e);
-                    }
-                };
-                if self.refresh_pending && !w.host_flags.clock_epoch_reset() {
+                // T19：session_id 回显校验（S3）+ ClientAuthenticator 状态机裁定。
+                if w.session_id != self.session_id_current {
                     let e = Error::Protocol {
                         offset: 0,
-                        msg: "refresh rebuild requires Welcome host_flags bit1 (clock epoch \
-                              reset) to be set, refusing to mix epochs"
-                            .into(),
+                        msg: format!(
+                            "welcome session_id {} does not echo local {} (refusing)",
+                            w.session_id, self.session_id_current
+                        ),
                     };
-                    let stop = StopReason::Disconnected(format!("{e}"));
+                    let stop =
+                        StopReason::Disconnected(format!("welcome rejected while rebuilding: {e}"));
                     self.stop_with(stop, None);
                     return Err(e);
                 }
-                // 全新重建：经工厂建管线（FrameSeq / 双端时钟归零由新会话
-                // 语义保证——驱动器随后把注入钟归零），纪元相关的估计全部
-                // 清零重建（坑 10：两段不可混进同一分位数）。
-                // 修复卡 B-1：管线构建失败不再裸上抛——完整停机后返回 Err。
-                let mut pipeline = match self.build_controller_pipeline(granted) {
-                    Ok(p) => p,
-                    Err(e) => {
+                let action = match &mut self.auth_phase {
+                    AuthPhase::Authenticating(auth) => auth.on_welcome(&w),
+                    AuthPhase::Idle => ClientAuthAction::Failed(
+                        "protocol violation: received Welcome without active auth state".into(),
+                    ),
+                };
+                match action {
+                    ClientAuthAction::Waiting => {
+                        // 过程 Welcome{ChallengeRequired}：显式忽略 granted（坑 5），
+                        // 不建管线（A6），返回 Ok(None) 以继续消费同批后续 AuthChallenge。
+                        Ok(None)
+                    }
+                    ClientAuthAction::Failed(reason) => {
+                        eprintln!(
+                            "[rc-session/auth] client authentication failed during reconnect: {reason}"
+                        );
+                        let e = Error::Protocol {
+                            offset: 0,
+                            msg: reason,
+                        };
+                        let stop =
+                            StopReason::Disconnected(format!("auth failed while rebuilding: {e}"));
+                        self.stop_with(stop, None);
+                        Err(e)
+                    }
+                    ClientAuthAction::Respond(_) | ClientAuthAction::RespondOwner(_) => {
+                        let e = Error::Protocol {
+                            offset: 0,
+                            msg: "unexpected Respond action from on_welcome".into(),
+                        };
+                        let stop = StopReason::Disconnected(format!("{e}"));
+                        self.stop_with(stop, None);
+                        Err(e)
+                    }
+                    ClientAuthAction::Done => {
+                        self.auth_phase = AuthPhase::Idle;
+                        let granted = w.granted;
+                        if self.refresh_pending && !w.host_flags.clock_epoch_reset() {
+                            let e = Error::Protocol {
+                                offset: 0,
+                                msg:
+                                    "refresh rebuild requires Welcome host_flags bit1 (clock epoch \
+                                      reset) to be set, refusing to mix epochs"
+                                        .into(),
+                            };
+                            let stop = StopReason::Disconnected(format!("{e}"));
+                            self.stop_with(stop, None);
+                            return Err(e);
+                        }
+                        // 全新重建：经工厂建管线（FrameSeq / 双端时钟归零由新会话
+                        // 语义保证——驱动器随后把注入钟归零），纪元相关的估计全部
+                        // 清零重建（坑 10：两段不可混进同一分位数）。
+                        // 修复卡 B-1：管线构建失败不再裸上抛——完整停机后返回 Err。
+                        let mut pipeline = match self.build_controller_pipeline(granted) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                let stop = StopReason::Disconnected(format!(
+                                    "rebuild controller pipeline failed: {e}"
+                                ));
+                                self.stop_with(stop, None);
+                                return Err(e);
+                            }
+                        };
+                        pipeline.set_clock(Arc::clone(&self.clock));
+                        // H4：替换管线前累加旧管线的无界上屏帧数。
+                        if let Some(old_p) = self.pipeline.as_ref() {
+                            self.prev_pipelines_displayed = self
+                                .prev_pipelines_displayed
+                                .saturating_add(old_p.displayed());
+                        }
+                        self.pipeline = Some(pipeline);
+                        self.negotiated = Some(granted);
+                        self.state = SessionState::Streaming;
+                        self.reconnect_phase = ReconnectPhase::Idle;
+                        self.pipeline_generation += 1;
+                        self.last_displayed = 0; // 新管线从 0 计
+                        self.probe = crate::probe::ProbeEngine::new(); // 偏移估计清零
+                        self.bw = crate::probe::BwEstimator::new();
+                        self.bw_probe_started = false;
+                        self.tracker = DeliveryTracker::new(); // FrameSeq 重启，旧水位作废
+                        self.idr = IdrController::new(IdrControllerConfig::default());
+                        self.watchdog.arm(u32::try_from(now_us).unwrap_or(u32::MAX));
+                        self.refresh_pending = false;
+                        self.backoff.reset();
+                        self.rstats.rebuilds += 1;
+                        // 修复卡 B-2：全新会话的关键批记账归零——在途回执表清空
+                        // + 序号重计（下一批 = 1）。对齐策略：host 侧全新会话把
+                        // key_batches_total 复位 0（发现 8 已落地，host_session.rs
+                        // 与 client_rebuild_resets_key_batch_accounting /
+                        // key_batch_counter_reset_on_fresh_session_only 两侧测试
+                        // 互证），client 从 1 重新计数，两侧序号对齐；旧表跨会话
+                        // 无效（seq 空间已重启，残留只会错配出伪样本）。
+                        self.pending_input_acks.clear();
+                        self.key_batch_seq_next = 0;
+                        // H6：全新重建重置剪贴板纪元态（时钟归零后不卡死节流窗口）。
+                        self.reset_clipboard_epoch();
+                        self.tool_rx.clear();
+                        self.audio_ctrl_rx = None;
+                        self.tool_rx_overflow_dropped = 0;
+                        self.audio_rx.clear();
+                        Ok(Some(ReconnectOutcome::Rebuilt))
+                    }
+                }
+            }
+            (ControlMessage::AuthChallenge(ch), ReconnectPhase::AwaitingFresh) => {
+                let action = match &mut self.auth_phase {
+                    AuthPhase::Authenticating(auth) => auth.on_challenge(&ch),
+                    AuthPhase::Idle => ClientAuthAction::Failed(
+                        "protocol violation: received AuthChallenge without active auth state"
+                            .into(),
+                    ),
+                };
+                match action {
+                    ClientAuthAction::Respond(resp) => {
+                        let mut buf = Vec::new();
+                        ControlMessage::AuthResponse(resp).encode(&mut buf);
+                        if let Err(e) = self
+                            .transport
+                            .as_mut()
+                            .expect("Reconnecting 期发送前必有连接")
+                            .send_reliable(&buf)
+                        {
+                            let stop = StopReason::Disconnected(format!(
+                                "send AuthResponse while rebuilding failed: {e}"
+                            ));
+                            self.stop_with(stop, None);
+                            return Err(e);
+                        }
+                        Ok(None)
+                    }
+                    ClientAuthAction::RespondOwner(signature) => {
+                        let mut buf = Vec::new();
+                        ControlMessage::OwnerAuthResponse { signature }.encode(&mut buf);
+                        if let Err(e) = self
+                            .transport
+                            .as_mut()
+                            .expect("Reconnecting 期发送前必有连接")
+                            .send_reliable(&buf)
+                        {
+                            let stop = StopReason::Disconnected(format!(
+                                "send OwnerAuthResponse while rebuilding failed: {e}"
+                            ));
+                            self.stop_with(stop, None);
+                            return Err(e);
+                        }
+                        Ok(None)
+                    }
+                    ClientAuthAction::Failed(reason) => {
+                        eprintln!(
+                            "[rc-session/auth] client authentication failed during reconnect: {reason}"
+                        );
+                        let e = Error::Protocol {
+                            offset: 0,
+                            msg: reason,
+                        };
                         let stop = StopReason::Disconnected(format!(
-                            "rebuild controller pipeline failed: {e}"
+                            "auth challenge failed while rebuilding: {e}"
                         ));
                         self.stop_with(stop, None);
-                        return Err(e);
+                        Err(e)
                     }
-                };
-                pipeline.set_clock(Arc::clone(&self.clock));
-                self.pipeline = Some(pipeline);
-                self.negotiated = Some(granted);
-                self.state = SessionState::Streaming;
-                self.reconnect_phase = ReconnectPhase::Idle;
-                self.pipeline_generation += 1;
-                self.last_displayed = 0; // 新管线从 0 计
-                self.probe = crate::probe::ProbeEngine::new(); // 偏移估计清零
-                self.bw = crate::probe::BwEstimator::new();
-                self.bw_probe_started = false;
-                self.tracker = DeliveryTracker::new(); // FrameSeq 重启，旧水位作废
-                self.idr = IdrController::new(IdrControllerConfig::default());
-                self.watchdog.arm(u32::try_from(now_us).unwrap_or(u32::MAX));
-                self.refresh_pending = false;
-                self.backoff.reset();
-                self.rstats.rebuilds += 1;
-                // 修复卡 B-2：全新会话的关键批记账归零——在途回执表清空
-                // + 序号重计（下一批 = 1）。对齐策略：host 侧全新会话把
-                // key_batches_total 复位 0（发现 8 已落地，host_session.rs
-                // 与 client_rebuild_resets_key_batch_accounting /
-                // key_batch_counter_reset_on_fresh_session_only 两侧测试
-                // 互证），client 从 1 重新计数，两侧序号对齐；旧表跨会话
-                // 无效（seq 空间已重启，残留只会错配出伪样本）。
-                self.pending_input_acks.clear();
-                self.key_batch_seq_next = 0;
-                Ok(Some(ReconnectOutcome::Rebuilt))
+                    ClientAuthAction::Done | ClientAuthAction::Waiting => {
+                        let e = Error::Protocol {
+                            offset: 0,
+                            msg: "unexpected action from on_challenge".into(),
+                        };
+                        let stop = StopReason::Disconnected(format!("{e}"));
+                        self.stop_with(stop, None);
+                        Err(e)
+                    }
+                }
             }
             (
                 ControlMessage::Bye {
@@ -1666,13 +2162,19 @@ impl ClientSession {
     }
 
     /// 发送全新 Hello（当前会话号——重建路径已先自增；reliable 流）。
-    fn send_fresh_hello(&mut self) -> Result<()> {
+    ///
+    /// T19（A1/A2）：构造全新 [`ClientAuthenticator`]，鉴权位来自 `hello_auth()`
+    /// （密码绝不进 Hello），并记录 `on_hello_sent(now_us)` 启动超时窗口。
+    fn send_fresh_hello(&mut self, now_us: u64) -> Result<()> {
+        let mut auth =
+            ClientAuthenticator::with_session_id(self.cfg.auth.clone(), self.session_id_current);
+        let (auth_method, auth_payload) = auth.hello_auth();
         let hello = ControlMessage::Hello(Hello {
             version: proto::PROTOCOL_VERSION,
             session_id: self.session_id_current,
             requested: self.cfg.requested,
-            auth_method: proto::AuthMethod::None,
-            auth_payload: vec![],
+            auth_method,
+            auth_payload,
         });
         let mut buf = Vec::new();
         hello.encode(&mut buf);
@@ -1680,6 +2182,8 @@ impl ClientSession {
             .as_mut()
             .expect("Reconnecting 期发送前必有连接")
             .send_reliable(&buf)?;
+        auth.on_hello_sent(now_us);
+        self.auth_phase = AuthPhase::Authenticating(auth);
         Ok(())
     }
 
@@ -1741,20 +2245,100 @@ impl ClientSession {
         Ok(())
     }
 
-    /// 校验并消费一条 Welcome（S3），成功时建管线并迁移到 Streaming。
-    fn consume_welcome(&mut self, msg: &[u8]) -> Result<SessionParams> {
-        let welcome = match ControlMessage::decode(msg)? {
-            ControlMessage::Welcome(w) => w,
-            other => {
-                return Err(Error::Protocol {
-                    offset: 0,
-                    msg: format!(
-                        "expected Welcome as first reliable message, got {other:?} (refusing)"
+    /// 握手期（Authenticating 子态）收到一条 reliable 控制消息的处理（T19）。
+    fn handle_handshake_reliable(&mut self, msg: &[u8]) -> Result<ClientHandshakeStep> {
+        let decoded = ControlMessage::decode(msg)?;
+        match decoded {
+            ControlMessage::Welcome(welcome) => {
+                // S3：session_id 必须回显当前会话号（含过程 Welcome）。
+                if welcome.session_id != self.session_id_current {
+                    return Err(Error::Protocol {
+                        offset: 0,
+                        msg: format!(
+                            "welcome session_id {} does not echo local {} (refusing)",
+                            welcome.session_id, self.session_id_current
+                        ),
+                    });
+                }
+                let action = match &mut self.auth_phase {
+                    AuthPhase::Authenticating(auth) => auth.on_welcome(&welcome),
+                    AuthPhase::Idle => ClientAuthAction::Failed(
+                        "protocol violation: received Welcome without active auth state".into(),
                     ),
-                })
+                };
+                match action {
+                    ClientAuthAction::Done => Ok(ClientHandshakeStep::Done(welcome.granted)),
+                    ClientAuthAction::Waiting => {
+                        // 过程 Welcome{ChallengeRequired}：显式忽略 granted（坑 5），
+                        // 不建管线（A6），保持 Authenticating 子态。
+                        Ok(ClientHandshakeStep::Authenticating)
+                    }
+                    ClientAuthAction::Failed(reason) => {
+                        eprintln!("[rc-session/auth] client authentication failed: {reason}");
+                        Err(Error::Protocol {
+                            offset: 0,
+                            msg: reason,
+                        })
+                    }
+                    ClientAuthAction::Respond(_) | ClientAuthAction::RespondOwner(_) => {
+                        Err(Error::Protocol {
+                            offset: 0,
+                            msg: "unexpected Respond action from on_welcome".into(),
+                        })
+                    }
+                }
             }
-        };
-        let granted = self.validate_welcome(&welcome)?;
+            ControlMessage::AuthChallenge(ch) => {
+                let action = match &mut self.auth_phase {
+                    AuthPhase::Authenticating(auth) => auth.on_challenge(&ch),
+                    AuthPhase::Idle => ClientAuthAction::Failed(
+                        "protocol violation: received AuthChallenge without active auth state"
+                            .into(),
+                    ),
+                };
+                match action {
+                    ClientAuthAction::Respond(resp) => {
+                        let mut buf = Vec::new();
+                        ControlMessage::AuthResponse(resp).encode(&mut buf);
+                        self.transport
+                            .as_mut()
+                            .expect("Connected implies transport")
+                            .send_reliable(&buf)?;
+                        Ok(ClientHandshakeStep::Authenticating)
+                    }
+                    ClientAuthAction::RespondOwner(signature) => {
+                        let mut buf = Vec::new();
+                        ControlMessage::OwnerAuthResponse { signature }.encode(&mut buf);
+                        self.transport
+                            .as_mut()
+                            .expect("Connected implies transport")
+                            .send_reliable(&buf)?;
+                        Ok(ClientHandshakeStep::Authenticating)
+                    }
+                    ClientAuthAction::Failed(reason) => {
+                        eprintln!("[rc-session/auth] client authentication failed: {reason}");
+                        Err(Error::Protocol {
+                            offset: 0,
+                            msg: reason,
+                        })
+                    }
+                    ClientAuthAction::Done | ClientAuthAction::Waiting => Err(Error::Protocol {
+                        offset: 0,
+                        msg: "unexpected action from on_challenge".into(),
+                    }),
+                }
+            }
+            other => Err(Error::Protocol {
+                offset: 0,
+                msg: format!(
+                    "expected Welcome or AuthChallenge during handshake, got {other:?} (refusing)"
+                ),
+            }),
+        }
+    }
+
+    /// 鉴权终局通过后建管线并迁移到 Streaming（A6：管线只在此处启动）。
+    fn finalize_handshake(&mut self, granted: SessionParams) -> Result<()> {
         let mut pipeline = self.build_controller_pipeline(granted)?;
         pipeline.set_clock(Arc::clone(&self.clock));
 
@@ -1766,7 +2350,11 @@ impl ClientSession {
         // T16（W1）：进入 Streaming 即锚定看门狗基线——首帧迟到（如首个
         // IDR 被丢）同样能触发恢复，不等首帧到达才武装。
         self.watchdog.arm((self.clock)());
-        Ok(granted)
+        self.tool_rx.clear();
+        self.audio_ctrl_rx = None;
+        self.tool_rx_overflow_dropped = 0;
+        self.audio_rx.clear();
+        Ok(())
     }
 
     /// Welcome 校验（S3）：session_id 必须回显当前会话号、auth_status
@@ -1826,8 +2414,12 @@ impl ClientSession {
         ControllerPipeline::with_backends(pcfg, decoder, renderer)
     }
 
-    /// 握手失败的收尾：关闭连接并返回原错误。
+    /// 握手失败的收尾：清空鉴权子态、关闭连接并返回原错误。
     fn handshake_fail(&mut self, e: Error) -> Error {
+        self.auth_phase = AuthPhase::Idle;
+        self.tool_rx.clear();
+        self.audio_ctrl_rx = None;
+        self.audio_rx.clear();
         if self.state != SessionState::Closed {
             self.state = SessionState::Closed;
             self.closed_reason = Some(StopReason::Disconnected(format!("handshake failed: {e}")));
@@ -1837,31 +2429,32 @@ impl ClientSession {
     }
 
     /// reliable 控制消息的单点分发（S4/S8；client 视角）。
+    ///
+    /// Err = 脏消息 / 协议违规（含 A11：Streaming 期收到鉴权消息一律致命断开）。
     fn dispatch_control(&mut self, msg: &[u8]) -> Result<ControlFlow> {
-        // S8：预留号（T19/T20）在 decode 前按类型字节放行（proto 显式拒收）。
-        if let Some(&first) = msg.first() {
-            if matches!(
-                first,
-                proto::TYPE_AUTH_CHALLENGE
-                    | proto::TYPE_AUTH_RESPONSE
-                    | proto::TYPE_CLIPBOARD_NOTIFY
-            ) {
-                self.log_ignore_once("reserved(auth/clipboard, T19/T20)");
-                return Ok(ControlFlow::Handled);
-            }
-        }
         let decoded = ControlMessage::decode(msg)?;
-        match &decoded {
-            ControlMessage::Bye { reason } => Ok(ControlFlow::Bye(*reason)),
+        match decoded {
+            // A11：鉴权消息（AuthChallenge/AuthResponse/OwnerAuthResponse/Welcome）仅握手期有效，
+            // Streaming 期到达一律致命 Error::Protocol 断开。
+            other @ (ControlMessage::AuthChallenge(_)
+            | ControlMessage::AuthResponse(_)
+            | ControlMessage::OwnerAuthResponse { .. }
+            | ControlMessage::Welcome(_)) => Err(Error::Protocol {
+                offset: 0,
+                msg: format!(
+                    "auth/handshake message {other:?} is forbidden in Streaming state (A11)"
+                ),
+            }),
+            ControlMessage::Bye { reason } => Ok(ControlFlow::Bye(reason)),
             // T15（0x06）：ProbePong → 探测引擎（t2 = 会话钟零扩展，B9）。
-            ControlMessage::ProbePong { .. } => {
-                self.on_pong(&decoded, u64::from((self.clock)()));
+            msg @ ControlMessage::ProbePong { .. } => {
+                self.on_pong(&msg, u64::from((self.clock)()));
                 Ok(ControlFlow::Handled)
             }
             // T16（0x04）：IdrAck → IdrController 关联确认（帧先到时立即
             // 闭环；否则转等该 IDR 帧完整到达）。
             ControlMessage::IdrAck { frame_seq } => {
-                self.idr.on_ack(FrameSeq(*frame_seq), (self.clock)());
+                self.idr.on_ack(FrameSeq(frame_seq), (self.clock)());
                 Ok(ControlFlow::Handled)
             }
             // T18（0x0A）：InputAck → 输入单向延迟采样。换算：host 注入完成
@@ -1871,11 +2464,57 @@ impl ClientSession {
                 key_batch_seq,
                 inject_done_us,
             } => {
-                self.on_input_ack(*key_batch_seq, *inject_done_us);
+                self.on_input_ack(key_batch_seq, inject_done_us);
+                Ok(ControlFlow::Handled)
+            }
+            // T20（0x0F）：ClipboardNotify → 剪贴板文本同步（双向；未启用只计数不写本机不拆会话，CB1）。
+            ControlMessage::ClipboardNotify { text } => {
+                if let Err(e) = self.on_clipboard_notify(&text) {
+                    eprintln!("rc-session client: ClipboardNotify 处理失败（不拆会话）: {e}");
+                }
+                Ok(ControlFlow::Handled)
+            }
+            // 0x10 ToolChannel → `TOOL_CHANNEL_AUDIO_CTRL` 独立最新值隔离；其余可靠子通道入
+            // 有界接收队列（上限 MAX_PENDING_TOOL_MESSAGES），满时绝不静默丢帧，返回协议错误。
+            ControlMessage::ToolChannel { channel, payload } => {
+                if channel == crate::proto::TOOL_CHANNEL_AUDIO_CTRL {
+                    self.audio_ctrl_rx = Some(payload);
+                    Ok(ControlFlow::Handled)
+                } else if self.tool_rx.len() < MAX_PENDING_TOOL_MESSAGES {
+                    self.tool_rx.push_back((channel, payload));
+                    Ok(ControlFlow::Handled)
+                } else {
+                    self.tool_rx_overflow_dropped += 1;
+                    Err(Error::Protocol {
+                        offset: 0,
+                        msg: "tool channel queue overflow".into(),
+                    })
+                }
+            }
+            // 0x11 AudioFrame → 入有界音频接收队列（上限 32，满时丢弃最旧帧保低延迟）。
+            ControlMessage::AudioFrame {
+                seq,
+                timestamp_us,
+                sample_rate,
+                channels,
+                codec,
+                data,
+            } => {
+                while self.audio_rx.len() >= MAX_PENDING_AUDIO_FRAMES {
+                    self.audio_rx.pop_front();
+                }
+                self.audio_rx.push_back(AudioFramePacket {
+                    seq,
+                    timestamp_us,
+                    sample_rate,
+                    channels,
+                    codec,
+                    data,
+                });
                 Ok(ControlFlow::Handled)
             }
             other => {
-                self.log_ignore_once(ignore_tag_client(other));
+                self.log_ignore_once(ignore_tag_client(&other));
                 Ok(ControlFlow::Handled)
             }
         }
@@ -1895,6 +2534,7 @@ impl ClientSession {
         if self.state == SessionState::Closed {
             return;
         }
+        self.auth_phase = AuthPhase::Idle;
         if let Some(why) = send_bye {
             if !self.bye_sent {
                 let mut buf = Vec::new();
@@ -1949,6 +2589,9 @@ impl ClientSession {
             p.finish_in_flight();
             p.shutdown();
         }
+        self.tool_rx.clear();
+        self.audio_ctrl_rx = None;
+        self.audio_rx.clear();
         self.closed_reason = Some(reason);
         self.state = SessionState::Closed;
         self.transport = None;
@@ -1957,8 +2600,11 @@ impl ClientSession {
     /// 组装运行摘要。
     fn summary(&self, stop_reason: StopReason) -> ClientRunSummary {
         let (displayed, unfinished) = match &self.pipeline {
-            Some(p) => (p.displayed(), p.trace().summary().unfinished),
-            None => (0, 0),
+            Some(p) => (
+                self.prev_pipelines_displayed.saturating_add(p.displayed()),
+                p.trace().summary().unfinished,
+            ),
+            None => (self.prev_pipelines_displayed, 0),
         };
         ClientRunSummary {
             stop_reason,
@@ -2015,6 +2661,9 @@ fn ignore_tag_client(m: &ControlMessage) -> &'static str {
         // InputAck（T18）已接入分发臂；此分支不再可达。
         ControlMessage::InputAck { .. } => "InputAck(已接入，此分支不可达)",
         ControlMessage::ReconnectRequest { .. } => "ReconnectRequest(方向错误)",
+        ControlMessage::ClipboardNotify { .. } => "ClipboardNotify(非 Streaming 态到达，忽略)",
+        ControlMessage::ToolChannel { .. } => "ToolChannel(非 Streaming 态到达，忽略)",
+        ControlMessage::AudioFrame { .. } => "AudioFrame(非 Streaming 态到达，忽略)",
         _ => "未知方向消息",
     }
 }
@@ -2142,6 +2791,7 @@ mod tests {
             handshake_timeout: Duration::from_millis(500),
             capture: Box::new(ScriptedCapture { scripted }),
             input_window: rc_input::DEFAULT_WINDOW,
+            auth: ClientAuthConfig::default(),
         }
     }
 
@@ -3512,5 +4162,619 @@ mod tests {
             0,
             "停机序列完整收口"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // T19 Phase 4：ClientAuthenticator 集成测试（A1/A2/A5/A6/A7/A11/坑 5）
+    // ─────────────────────────────────────────────────────────────
+
+    /// T19（A1 + 坑 5 + A6）：密码握手 Hello 载荷恒空、过程 Welcome.granted 被忽略、
+    /// 收到 AuthChallenge 后回发正确 PBKDF2 proof，仅终局 Welcome{Ok} 后建管线。
+    #[test]
+    fn client_password_handshake_sends_empty_hello_payload_and_responds_to_challenge() {
+        let salt = [0x42u8; proto::AUTH_SALT_LEN];
+        let iterations = 64u32;
+        let process_granted = SessionParams {
+            width: 16,
+            height: 16,
+            fps: 10,
+            bitrate_bps: 100_000,
+        };
+        let final_granted = SessionParams {
+            width: 32,
+            height: 32,
+            fps: 24,
+            bitrate_bps: 500_000,
+        };
+
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&welcome_msg(
+            7,
+            process_granted,
+            proto::AuthStatus::ChallengeRequired,
+        ));
+        mock.deliver_reliable(&ControlMessage::AuthChallenge(proto::AuthChallenge {
+            salt,
+            iterations,
+        }));
+        mock.deliver_reliable(&welcome_msg(7, final_granted, proto::AuthStatus::Ok));
+        let handle = mock.clone();
+
+        let mut c = cfg(Vec::new());
+        c.auth = ClientAuthConfig {
+            password: Some("hunter2".into()),
+            auth_timeout_us: crate::auth::DEFAULT_AUTH_TIMEOUT_US,
+            ..ClientAuthConfig::default()
+        };
+        let mut client = ClientSession::with_parts(
+            c,
+            Box::new(mock),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        let granted = client.handshake().expect("password handshake succeeds");
+        assert_eq!(
+            granted, final_granted,
+            "坑 5：必须采用终局 Welcome.granted，忽略过程 Welcome"
+        );
+        assert_eq!(client.negotiated(), Some(final_granted));
+        assert_eq!(client.state(), SessionState::Streaming);
+        assert_eq!(client.pipeline_generation(), 1);
+
+        let msgs = handle.reliable_decoded();
+        assert_eq!(msgs.len(), 2, "client 应发 Hello + AuthResponse 两条消息");
+        match &msgs[0] {
+            ControlMessage::Hello(h) => {
+                assert_eq!(h.auth_method, proto::AuthMethod::Password);
+                assert!(h.auth_payload.is_empty(), "A1：Hello 绝不携带密码");
+            }
+            other => panic!("首条应为 Hello，实际 {other:?}"),
+        }
+        let expected_proof = crate::auth::compute_proof(b"hunter2", &salt, iterations);
+        match &msgs[1] {
+            ControlMessage::AuthResponse(resp) => {
+                assert_eq!(
+                    resp.proof, expected_proof,
+                    "proof 须与 compute_proof 逐字节一致"
+                );
+            }
+            other => panic!("第二条应为 AuthResponse，实际 {other:?}"),
+        }
+    }
+
+    /// T19（A6）：未收过程 Welcome{ChallengeRequired} 先收 AuthChallenge → 协议违规断开、零管线启动。
+    #[test]
+    fn client_auth_challenge_before_process_welcome_fails_protocol() {
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&ControlMessage::AuthChallenge(proto::AuthChallenge {
+            salt: [0x11u8; proto::AUTH_SALT_LEN],
+            iterations: 64,
+        }));
+        let mut c = cfg(Vec::new());
+        c.auth = ClientAuthConfig {
+            password: Some("hunter2".into()),
+            auth_timeout_us: crate::auth::DEFAULT_AUTH_TIMEOUT_US,
+            ..ClientAuthConfig::default()
+        };
+        let mut client = ClientSession::with_parts(
+            c,
+            Box::new(mock),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        let err = client.handshake().expect_err("乱序 AuthChallenge 必须报错");
+        assert!(matches!(err, Error::Protocol { .. }), "{err}");
+        assert_eq!(client.state(), SessionState::Closed);
+        assert!(client.negotiated().is_none());
+        assert_eq!(client.pipeline_generation(), 0, "A6：鉴权失败不得启动管线");
+    }
+
+    /// T19（A5 + A6）：挑战后 host 返回 Welcome{Rejected} → 断开、Closed、零管线启动。
+    #[test]
+    fn client_auth_rejected_after_challenge_closes_without_pipeline() {
+        let mut mock = MockTransport::new();
+        mock.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::ChallengeRequired));
+        mock.deliver_reliable(&ControlMessage::AuthChallenge(proto::AuthChallenge {
+            salt: [0x22u8; proto::AUTH_SALT_LEN],
+            iterations: 64,
+        }));
+        mock.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::Rejected));
+
+        let mut c = cfg(Vec::new());
+        c.auth = ClientAuthConfig {
+            password: Some("wrong".into()),
+            auth_timeout_us: crate::auth::DEFAULT_AUTH_TIMEOUT_US,
+            ..ClientAuthConfig::default()
+        };
+        let mut client = ClientSession::with_parts(
+            c,
+            Box::new(mock),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        let err = client
+            .handshake()
+            .expect_err("Rejected 必须返回 Protocol 错误");
+        assert!(matches!(err, Error::Protocol { .. }), "{err}");
+        assert_eq!(client.state(), SessionState::Closed);
+        assert!(client.negotiated().is_none());
+        assert_eq!(client.pipeline_generation(), 0, "A6：鉴权拒绝不得启动管线");
+    }
+
+    /// T19（A7 + A6）：注入时钟越过 `auth_timeout_us` → `poll_timeout` 触发 Timeout 并断开。
+    #[test]
+    fn client_auth_timeout_via_injected_clock() {
+        let step = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let step_clone = std::sync::Arc::clone(&step);
+        // 第 1 次（on_hello_sent）返回 0；后续轮询返回 2_000_000 µs > 1_000_000 µs 超时窗口。
+        let clock: SessionClock = Arc::new(move || {
+            let n = step_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                0
+            } else {
+                2_000_000
+            }
+        });
+
+        let mut mock = MockTransport::new();
+        // 只投递过程 Welcome，不投终局 Welcome → 等待超时。
+        mock.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::ChallengeRequired));
+
+        let mut c = cfg(Vec::new());
+        c.handshake_timeout = Duration::from_secs(10);
+        c.auth = ClientAuthConfig {
+            password: Some("hunter2".into()),
+            auth_timeout_us: 1_000_000,
+            ..ClientAuthConfig::default()
+        };
+        let mut client =
+            ClientSession::with_parts(c, Box::new(mock), fake_decoder(0), fake_renderer(), clock)
+                .expect("with_parts");
+        let err = client
+            .handshake()
+            .expect_err("越过 auth_timeout_us 必须超时");
+        assert!(
+            matches!(err, Error::Timeout(d) if d == Duration::from_secs(1)),
+            "应为 auth_timeout_us 对应的 Timeout，实际 {err:?}"
+        );
+        assert_eq!(client.state(), SessionState::Closed);
+        assert_eq!(client.pipeline_generation(), 0, "A6：超时不得启动管线");
+    }
+
+    /// T19（A11）：Streaming 期收到 AuthChallenge / AuthResponse / Welcome 一律致命 Error::Protocol 断开。
+    #[test]
+    fn client_mid_stream_auth_messages_are_fatal_protocol_error() {
+        let cases = [
+            ControlMessage::AuthChallenge(proto::AuthChallenge {
+                salt: [0x33u8; proto::AUTH_SALT_LEN],
+                iterations: 64,
+            }),
+            ControlMessage::AuthResponse(proto::AuthResponse {
+                proof: [0x44u8; proto::AUTH_PROOF_LEN],
+            }),
+            welcome_msg(7, req(), proto::AuthStatus::Ok),
+        ];
+        for msg in cases {
+            let (mut client, mut handle) = handshaken(Vec::new());
+            handle.deliver_reliable(&msg);
+            let err = client
+                .tick(Duration::from_millis(0), Instant::now())
+                .expect_err("A11：Streaming 期鉴权/Welcome 消息必须致命报错");
+            assert!(matches!(err, Error::Protocol { .. }), "{err}");
+            assert!(err.is_fatal(), "Error::Protocol 必须 is_fatal()");
+            assert_eq!(
+                client.state(),
+                SessionState::Closed,
+                "致命协议错误必须断开并停机"
+            );
+        }
+    }
+
+    /// T19（A2 + A5）：T17 重连降级全新 Hello 走全新 ClientAuthenticator 与新盐挑战应答；
+    /// 重连鉴权被拒时直接停机（Closed），不陷入无限重连循环。
+    #[test]
+    fn client_reconnect_fresh_hello_runs_fresh_password_auth() {
+        let salt1 = [0x10u8; proto::AUTH_SALT_LEN];
+        let salt2 = [0x20u8; proto::AUTH_SALT_LEN];
+        let iterations = 64u32;
+
+        // 首次密码握手（salt1）
+        let mut mock1 = MockTransport::new();
+        mock1.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::ChallengeRequired));
+        mock1.deliver_reliable(&ControlMessage::AuthChallenge(proto::AuthChallenge {
+            salt: salt1,
+            iterations,
+        }));
+        mock1.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::Ok));
+
+        let mut c = cfg(Vec::new());
+        c.auth = ClientAuthConfig {
+            password: Some("hunter2".into()),
+            auth_timeout_us: crate::auth::DEFAULT_AUTH_TIMEOUT_US,
+            ..ClientAuthConfig::default()
+        };
+        let mut client = ClientSession::with_parts(
+            c,
+            Box::new(mock1),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        client.handshake().expect("initial password handshake");
+        assert_eq!(client.pipeline_generation(), 1);
+
+        // 重连：resume 被拒（bit0=0）→ 同连接降级全新 Hello（sid=8）→ salt2 挑战应答 → Rebuilt。
+        let mock2 = MockTransport::new();
+        let mut handle2 = mock2.clone();
+        handle2.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::Ok)); // bit0=0
+        let mut slot = Some(mock2);
+        client.set_connect_factory(Box::new(move || {
+            Ok(Box::new(slot.take().expect("one reconnect transport")))
+        }));
+        client.set_pipeline_factory(Box::new(|| {
+            ControllerPipeline::with_backends(pcfg(), fake_decoder(0), fake_renderer())
+        }));
+
+        client.on_disconnected(1_000_000);
+        // 首次退避 0.5s → 到点 connect 发 ReconnectRequest
+        let out = client.tick_reconnect(2_000_000).expect("connect");
+        assert_eq!(out, ReconnectOutcome::Connecting);
+        // 收到 Welcome{bit0=0} → 同连接补发全新 Hello（sid=8）
+        let out = client
+            .tick_reconnect(2_010_000)
+            .expect("fallback to fresh hello");
+        assert_eq!(
+            out,
+            ReconnectOutcome::Waiting {
+                next_attempt_in_ms: 0
+            }
+        );
+
+        // 投递过程 Welcome（哑 granted）+ 新盐 salt2 挑战 + 终局 Welcome{Ok}
+        let dummy_granted = SessionParams {
+            width: 16,
+            height: 16,
+            fps: 10,
+            bitrate_bps: 100_000,
+        };
+        handle2.deliver_reliable(&welcome_msg(
+            8,
+            dummy_granted,
+            proto::AuthStatus::ChallengeRequired,
+        ));
+        handle2.deliver_reliable(&ControlMessage::AuthChallenge(proto::AuthChallenge {
+            salt: salt2,
+            iterations,
+        }));
+        handle2.deliver_reliable(&welcome_msg(8, req(), proto::AuthStatus::Ok));
+
+        let out = client
+            .tick_reconnect(2_020_000)
+            .expect("rebuilt after fresh auth");
+        assert_eq!(out, ReconnectOutcome::Rebuilt);
+        assert_eq!(client.state(), SessionState::Streaming);
+        assert_eq!(client.pipeline_generation(), 2);
+        assert_eq!(
+            client.negotiated(),
+            Some(req()),
+            "坑 5：忽略过程 Welcome.granted"
+        );
+
+        // 校验新连接发出的消息序列：ReconnectRequest → Hello{Password, 空 payload} → AuthResponse{salt2 proof}
+        let sent = handle2.reliable_decoded();
+        assert_eq!(
+            sent.len(),
+            3,
+            "应依次发 ReconnectRequest / Hello / AuthResponse: {sent:?}"
+        );
+        match &sent[1] {
+            ControlMessage::Hello(h) => {
+                assert_eq!(h.session_id, 8);
+                assert_eq!(h.auth_method, proto::AuthMethod::Password);
+                assert!(h.auth_payload.is_empty(), "A1：重连 Hello 同样绝不携带密码");
+            }
+            other => panic!("第二条应为全新 Hello，实际 {other:?}"),
+        }
+        let expected_proof2 = crate::auth::compute_proof(b"hunter2", &salt2, iterations);
+        let old_proof1 = crate::auth::compute_proof(b"hunter2", &salt1, iterations);
+        assert_ne!(expected_proof2, old_proof1);
+        match &sent[2] {
+            ControlMessage::AuthResponse(resp) => {
+                assert_eq!(
+                    resp.proof, expected_proof2,
+                    "A2：必须用新盐 salt2 重新计算 proof"
+                );
+            }
+            other => panic!("第三条应为 AuthResponse，实际 {other:?}"),
+        }
+
+        // 再验证重连鉴权被拒：Bye(Refresh) 触发全新重建，host 回 Welcome{Rejected} → 致命 Err + Closed（不无限重试）
+        let mut mock3 = MockTransport::new();
+        mock3.deliver_reliable(&welcome_msg(9, req(), proto::AuthStatus::Rejected));
+        let mut slot3 = Some(mock3);
+        client.set_connect_factory(Box::new(move || {
+            Ok(Box::new(slot3.take().expect("one refresh transport")))
+        }));
+        client.on_bye_refresh(3_000_000).expect("on_bye_refresh");
+        assert_eq!(
+            client.tick_reconnect(0).expect("connect refresh"),
+            ReconnectOutcome::Connecting
+        );
+        let err = client
+            .tick_reconnect(10_000)
+            .expect_err("重连鉴权被拒必须致命失败");
+        assert!(matches!(err, Error::Protocol { .. }), "{err}");
+        assert_eq!(
+            client.state(),
+            SessionState::Closed,
+            "鉴权失败直接 Closed，不无限重连"
+        );
+    }
+
+    /// H8 回归：`observations()` 从 `frame_headers` 读元组 `.1`（`encode_done_ts`）而非
+    /// `.0`（`capture_ts`），使 `SessionReport` 算出真实非零 `breakdown_ms.encode`。
+    #[test]
+    fn client_observations_reads_encode_done_ts_for_breakdown_encode() {
+        let now_us = Arc::new(std::sync::atomic::AtomicU32::new(20_000));
+        let clock: SessionClock = {
+            let now = Arc::clone(&now_us);
+            Arc::new(move || now.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let mut t = MockTransport::new();
+        t.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::Ok));
+        let mut handle = t.clone();
+        let mut client = ClientSession::with_parts(
+            cfg(vec![]),
+            Box::new(t),
+            fake_decoder(0),
+            fake_renderer(),
+            clock,
+        )
+        .expect("with_parts");
+        client.handshake().expect("handshake");
+
+        // 构造一帧 capture_ts=1_000, encode_done_ts=6_000（编码耗时 5ms）的媒体数据报
+        let payload = vec![0xABu8; 64];
+        let datagrams = split_frame(
+            FrameSeq(1),
+            FrameKind::Idr,
+            Timestamp(1_000),
+            Timestamp(6_000),
+            0,
+            &payload,
+            MAX_PAYLOAD,
+        );
+        for d in datagrams {
+            handle.deliver(NetEvent::Datagram(d));
+        }
+        client
+            .tick(Duration::from_millis(0), std::time::Instant::now())
+            .expect("tick");
+
+        let obs = client.observations(1_000_000, Some(20_000));
+        let frame = obs
+            .frames
+            .iter()
+            .find(|f| f.seq == FrameSeq(1))
+            .expect("frame 1 in observations");
+        assert_eq!(frame.captured_us, 1_000);
+        assert_eq!(
+            frame.encode_done_us, 6_000,
+            "H8：encode_done_us 必须取自 tuple.1 (encode_done_ts)"
+        );
+
+        let snap = crate::report::SessionConfigSnapshot {
+            resolution: rc_types::Resolution::new(64, 64),
+            fps: 30,
+            duration_s: 1.0,
+            backend: "fake".into(),
+            connect_addr: "127.0.0.1:9901".parse().unwrap(),
+            input_mode: "none",
+        };
+        let report = crate::report::SessionReport::from_observations(&snap, &obs);
+        let json = report.to_json();
+        assert!(
+            json.contains("\"breakdown_ms\":{\"encode\":5,"),
+            "H8：breakdown_ms.encode 应为 5ms，实际 JSON={json}"
+        );
+        client.close(ByeReason::Normal).expect("close");
+    }
+
+    /// H4 + H5 回归：经 `Bye(Refresh)` 重建 `ControllerPipeline` 后，
+    /// 1) `observations()` 跨重建累计 `total_displayed`（旧管线 + 新管线之和）；
+    /// 2) `observations().reconnect` 将饱和刷新单列 `refreshes=1` 且 `attempts=0`，
+    ///    不触发 `resumed=false` 误判。
+    #[test]
+    fn client_observations_accumulates_displayed_and_separates_refreshes_across_rebuild() {
+        let now_us = Arc::new(std::sync::atomic::AtomicU32::new(10_000));
+        let clock: SessionClock = {
+            let now = Arc::clone(&now_us);
+            Arc::new(move || now.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let mut t1 = MockTransport::new();
+        t1.deliver_reliable(&welcome_msg(7, req(), proto::AuthStatus::Ok));
+        let mut handle1 = t1.clone();
+        let mut client = ClientSession::with_parts(
+            cfg(vec![]),
+            Box::new(t1),
+            fake_decoder(0),
+            fake_renderer(),
+            clock,
+        )
+        .expect("with_parts");
+        client.handshake().expect("handshake");
+        let payload = vec![0xCDu8; 64];
+
+        // 纪元 1：投递 3 帧并上屏
+        for seq in 1..=3u64 {
+            now_us.store(16_667 * seq as u32, std::sync::atomic::Ordering::Relaxed);
+            let dgs = split_frame(
+                FrameSeq(seq),
+                FrameKind::Idr,
+                Timestamp(1_000 * seq as u32),
+                Timestamp(1_000 * seq as u32 + 500),
+                0,
+                &payload,
+                MAX_PAYLOAD,
+            );
+            for d in dgs {
+                handle1.deliver(NetEvent::Datagram(d));
+            }
+            client
+                .tick(Duration::from_millis(0), std::time::Instant::now())
+                .expect("tick epoch 1");
+        }
+        assert_eq!(client.pipeline().displayed(), 3);
+
+        // Bye(Refresh) 重建管线
+        let mut mock2 = MockTransport::new();
+        let mut handle2 = mock2.clone();
+        mock2.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 8,
+            granted: req(),
+            auth_status: proto::AuthStatus::Ok,
+            host_flags: HostFlags(HostFlags::CLOCK_EPOCH_RESET),
+        }));
+        let mut slot = Some(mock2);
+        client.set_connect_factory(Box::new(move || {
+            Ok(Box::new(slot.take().expect("rebuild transport")))
+        }));
+        client.set_pipeline_factory(Box::new(|| {
+            ControllerPipeline::with_backends(pcfg(), fake_decoder(0), fake_renderer())
+        }));
+        client.on_bye_refresh(4_200_000_000).expect("refresh");
+        now_us.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            client.tick_reconnect(0).expect("connect"),
+            ReconnectOutcome::Connecting
+        );
+        assert_eq!(
+            client.tick_reconnect(1_000).expect("rebuilt"),
+            ReconnectOutcome::Rebuilt
+        );
+
+        // 纪元 2：投递 2 帧并上屏
+        for seq in 1..=2u64 {
+            now_us.store(16_667 * seq as u32, std::sync::atomic::Ordering::Relaxed);
+            let dgs = split_frame(
+                FrameSeq(seq),
+                FrameKind::Idr,
+                Timestamp(1_000 * seq as u32),
+                Timestamp(1_000 * seq as u32 + 500),
+                0,
+                &payload,
+                MAX_PAYLOAD,
+            );
+            for d in dgs {
+                handle2.deliver(NetEvent::Datagram(d));
+            }
+            client
+                .tick(Duration::from_millis(0), std::time::Instant::now())
+                .expect("tick epoch 2");
+        }
+        assert_eq!(client.pipeline().displayed(), 2);
+
+        let obs = client.observations(5_000_000_000u64, Some(10_000));
+        assert_eq!(obs.duration_us, 5_000_000_000u64);
+        assert_eq!(
+            obs.total_displayed,
+            Some(5),
+            "H4：应累加重建前(3)+重建后(2)=5 帧"
+        );
+        assert_eq!(
+            obs.reconnect.attempts, 0,
+            "H5：饱和刷新不计入意外断线 attempts"
+        );
+        assert_eq!(obs.reconnect.refreshes, 1, "H5：饱和刷新单列 refreshes");
+        assert!(!obs.reconnect.resumed);
+        client.close(ByeReason::Normal).expect("close");
+    }
+
+    /// H6 回归：ClientSession 在 `Rebuilt` 后自动重置剪贴板纪元态，
+    /// 驱动器时钟归零到 0 后本地剪贴板变更仍可立即同步。
+    #[test]
+    fn client_reset_clipboard_epoch_on_rebuild_allows_sync_after_clock_reset() {
+        let (mut client, _handle1) = handshaken(vec![]);
+        let cb = crate::testkit::SharedFakeClipboard::new();
+        let cb_ctrl = cb.clone();
+        client.enable_clipboard(Box::new(cb));
+
+        // 旧纪元高位时刻基线 + 发送 1 条
+        client.pump_clipboard(4_000_000_000).expect("baseline");
+        cb_ctrl.simulate_local_copy(Some("old-epoch-client"));
+        client.pump_clipboard(4_000_010_000).expect("send 1");
+        assert_eq!(client.clipboard_stats().sent, 1);
+
+        // Bye(Refresh) 重建（自动 reset_clipboard_epoch）
+        let mut mock2 = MockTransport::new();
+        mock2.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 8,
+            granted: req(),
+            auth_status: proto::AuthStatus::Ok,
+            host_flags: HostFlags(HostFlags::CLOCK_EPOCH_RESET),
+        }));
+        let mut slot = Some(mock2);
+        client.set_connect_factory(Box::new(move || {
+            Ok(Box::new(slot.take().expect("rebuild transport")))
+        }));
+        client.set_pipeline_factory(Box::new(|| {
+            ControllerPipeline::with_backends(pcfg(), fake_decoder(0), fake_renderer())
+        }));
+        client.on_bye_refresh(4_200_000_000).expect("refresh");
+        assert_eq!(
+            client.tick_reconnect(0).expect("connect"),
+            ReconnectOutcome::Connecting
+        );
+        assert_eq!(
+            client.tick_reconnect(1_000).expect("rebuilt"),
+            ReconnectOutcome::Rebuilt
+        );
+
+        // 新纪元时钟归零到 0 → 首拍基线，随后变更立发
+        client.pump_clipboard(0).expect("new baseline");
+        cb_ctrl.simulate_local_copy(Some("new-epoch-client"));
+        client.pump_clipboard(1_000).expect("send 2");
+        assert_eq!(client.clipboard_stats().sent, 2);
+        client.close(ByeReason::Normal).expect("close");
+    }
+
+    #[test]
+    fn trailing_tool_channel_in_welcome_poll_batch_is_preserved() {
+        let mock = MockTransport::new();
+        let mut handle = mock.clone();
+        let mut client = ClientSession::with_parts(
+            cfg(vec![]),
+            Box::new(mock),
+            fake_decoder(0),
+            fake_renderer(),
+            zero_clock(),
+        )
+        .expect("with_parts");
+        handle.deliver_reliable(&ControlMessage::Welcome(proto::Welcome {
+            session_id: 7,
+            granted: req(),
+            auth_status: proto::AuthStatus::Ok,
+            host_flags: HostFlags(0),
+        }));
+        let payload = b"{\"kind\":\"capabilities\"}".to_vec();
+        handle.deliver_reliable(
+            &ControlMessage::tool_channel(proto::TOOL_CHANNEL_DISPLAY_CTRL, payload.clone())
+                .unwrap(),
+        );
+
+        client.handshake().expect("handshake");
+        assert_eq!(client.state(), SessionState::Streaming);
+        assert_eq!(
+            client.drain_tool_messages(),
+            vec![(proto::TOOL_CHANNEL_DISPLAY_CTRL, payload)]
+        );
+        client.close(ByeReason::Normal).expect("close");
     }
 }

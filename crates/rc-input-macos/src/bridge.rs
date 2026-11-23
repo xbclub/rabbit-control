@@ -53,6 +53,13 @@ impl InputBridge<crate::ffi::CgPoster> {
         let injector = Injector::new()?;
         Ok(Self::from_injector(injector))
     }
+
+    /// 生产构造（主显示器模式）：走 [`Injector::for_main_display`]，使归一化坐标
+    /// `0..=65535` 精确映射到主显示器边界（与 `SckConfig { display: 0 }` 对齐）。
+    pub fn for_main_display() -> Result<Self, InputError> {
+        let injector = Injector::for_main_display()?;
+        Ok(Self::from_injector(injector))
+    }
 }
 
 impl<P: EventPoster + Send> InputBridge<P> {
@@ -178,7 +185,11 @@ impl<P: EventPoster + Send> InputInjector for InputBridge<P> {
     }
 
     fn set_screen_size(&mut self, w: u32, h: u32) {
-        self.size = (f64::from(w), f64::from(h));
+        let wf = f64::from(w);
+        let hf = f64::from(h);
+        self.size = (wf, hf);
+        self.injector
+            .set_screen_bounds(ScreenBounds::new(self.origin.0, self.origin.1, wf, hf));
     }
 }
 
@@ -287,6 +298,58 @@ mod tests {
         assert!(
             (x - 99.0).abs() < 0.01 && (y - 199.0).abs() < 0.01,
             "({x},{y})"
+        );
+    }
+
+    /// 放大分辨率（1512x982 -> 1800x1169）后，set_screen_size 必须同步更新
+    /// Injector::screen_bounds，点击右下角附近 (1799, 1168) 不得被旧边界钳制。
+    #[test]
+    fn bridge_set_screen_size_updates_injector_bounds_without_clamping() {
+        let (mut bridge, recorded) = bridge_with(ScreenBounds::new(0.0, 0.0, 1512.0, 982.0));
+        bridge.set_screen_size(1800, 1169);
+        assert_eq!(
+            bridge.screen_bounds(),
+            ScreenBounds::new(0.0, 0.0, 1800.0, 1169.0)
+        );
+        assert_eq!(
+            bridge.injector.screen_bounds(),
+            ScreenBounds::new(0.0, 0.0, 1800.0, 1169.0)
+        );
+        bridge
+            .inject(&[
+                InputEvent::MouseMove {
+                    x: u16::MAX,
+                    y: u16::MAX,
+                },
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: true,
+                },
+            ])
+            .expect("inject near expanded bottom-right");
+        let posted = recorded.lock().expect("posted");
+        assert_eq!(posted.len(), 2);
+        let PlannedEvent::Mouse { x: mx, y: my, .. } = posted[0] else {
+            panic!("must be MouseMove");
+        };
+        assert!(
+            (mx - 1799.0).abs() < 0.01 && (my - 1168.0).abs() < 0.01,
+            "放大分辨率后移动坐标不得被旧 1512x982 边界钳制，实际 ({mx},{my})"
+        );
+        let PlannedEvent::Mouse {
+            kind,
+            button,
+            x: bx,
+            y: by,
+        } = posted[1]
+        else {
+            panic!("must be MouseButton");
+        };
+        assert_eq!(kind, PlannedMouseKind::Down);
+        assert_eq!(button, PointerButtonKind::Left);
+        assert!(
+            (bx - 1799.0).abs() < 0.01 && (by - 1168.0).abs() < 0.01,
+            "放大分辨率后点击坐标不得被旧 1512x982 边界钳制，实际 ({bx},{by})"
         );
     }
 

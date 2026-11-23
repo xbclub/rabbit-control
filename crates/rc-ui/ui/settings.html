@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>设置 — RabbitControl</title>
+  <link rel="stylesheet" href="assets/css/tokens.css" />
+  <link rel="stylesheet" href="assets/css/base.css" />
+  <link rel="stylesheet" href="assets/css/pages/overlay.css" />
+  <link rel="stylesheet" href="assets/css/pages/settings.css" />
+</head>
+<body data-page="settings">
+  <!-- Tauri 真窗口：给 body 打 .is-tauri，隐藏自绘交通灯（原生灯已由窗口提供） -->
+  <script src="assets/js/tauri-detect.js"></script>
+  <!-- W1 设置窗口：660×640 不可调（08 §2 / §6 W1） -->
+  <div class="rc-window" id="settings-window">
+    <!-- 标题栏：交通灯左 12，标题「设置」居中（§3.6 / §6 W1） -->
+    <header class="rc-window__titlebar" data-tauri-drag-region>
+      <div class="rc-traffic" aria-hidden="true" data-tauri-drag-region>
+        <span class="rc-traffic__dot rc-traffic__dot--close" data-rc-close title="关闭"></span>
+        <span class="rc-traffic__dot rc-traffic__dot--min" data-tauri-drag-region></span>
+        <span class="rc-traffic__dot rc-traffic__dot--zoom" data-tauri-drag-region></span>
+      </div>
+      <h1 class="rc-window__title" data-tauri-drag-region>设置</h1>
+    </header>
+
+    <!-- TabsTop：区高 88，底部 1px DIVIDER 通栏（§6 W1 / §4） -->
+    <div class="rc-tabs" role="tablist" aria-label="设置分类">
+      <button type="button" class="rc-tab is-active" role="tab" id="tab-general"
+              aria-selected="true" aria-controls="panel-general" tabindex="0"
+              data-tab="general" data-icon="settings">常规</button>
+      <button type="button" class="rc-tab" role="tab" id="tab-security"
+              aria-selected="false" aria-controls="panel-security" tabindex="-1"
+              data-tab="security" data-icon="lock">安全</button>
+      <button type="button" class="rc-tab" role="tab" id="tab-keyboard"
+              aria-selected="false" aria-controls="panel-empty" tabindex="-1"
+              data-tab="keyboard" data-icon="keyboard">键盘</button>
+      <button type="button" class="rc-tab" role="tab" id="tab-network"
+              aria-selected="false" aria-controls="panel-network" tabindex="-1"
+              data-tab="network" data-icon="globe">网络</button>
+    </div>
+
+    <!-- 内容区：距 tab 分隔线 24，整体宽 600 居中（§3.6 / §6 W1） -->
+    <div class="rc-settings">
+      <div class="rc-settings__stack" id="panel-general" role="tabpanel"
+           aria-labelledby="tab-general">
+        <!-- G1 常规 -->
+        <section class="rc-group" aria-label="常规">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-autostart">开机自启动</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <label class="rc-switch">
+                <input type="checkbox" id="opt-autostart" aria-labelledby="row-autostart" checked />
+                <span class="rc-switch__knob"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-awake">让这台 Mac 保持唤醒状态</div>
+              <div class="rc-setting-row__desc">防止电脑进入睡眠状态，导致无法远程访问（合盖状态下建议连接电源适配器）。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <span class="rc-select">
+                <select id="opt-awake" aria-labelledby="row-awake">
+                  <option value="never" selected>永不</option>
+                  <option value="10m">10 分钟</option>
+                  <option value="30m">30 分钟</option>
+                  <option value="1h">1 小时</option>
+                </select>
+                <svg class="rc-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </span>
+            </div>
+          </div>
+
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-close-window">关闭窗口时</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <span class="rc-select">
+                <select id="opt-close-window" aria-labelledby="row-close-window">
+                  <option value="tray" selected>隐藏到菜单栏</option>
+                  <option value="quit">退出程序</option>
+                </select>
+                <svg class="rc-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </span>
+            </div>
+          </div>
+        </section>
+
+        <!-- G2 -->
+        <section class="rc-group" aria-label="文件">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-drag-send">被控时拖拽文件显示发送浮窗</div>
+              <div class="rc-setting-row__desc">开启后，可在被控时向主控端发送文件。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <label class="rc-switch">
+                <input type="checkbox" id="opt-drag-send" aria-labelledby="row-drag-send" checked />
+                <span class="rc-switch__knob"></span>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <!-- G3 -->
+        <section class="rc-group" aria-label="存储路径">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title">移动设备传输文件存储路径</div>
+              <div class="rc-setting-row__path" id="opt-download-path">/Users/yii/Library/Application Support/RabbitControl/Download</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <button type="button" class="rc-btn rc-btn--secondary" data-toast="功能开发中">修改路径</button>
+              <button type="button" class="rc-btn rc-btn--secondary" data-toast="功能开发中">打开文件夹</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- G4 -->
+        <section class="rc-group" aria-label="账户">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title">实名认证</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <span class="rc-setting-row__static">已通过账号实名认证</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- 安全 tab：mTLS 加密连接、免密自控与本机设备证书 -->
+      <div class="rc-settings__stack" id="panel-security" role="tabpanel"
+           aria-labelledby="tab-security" hidden>
+        <section class="rc-group" aria-label="安全连接与自控">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-default-mtls">默认开启加密连接 (mTLS)</div>
+              <div class="rc-setting-row__desc">新建远程控制会话时默认启用 mTLS 1.3 双向证书验证与端到端加密。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <label class="rc-switch">
+                <input type="checkbox" id="opt-default-mtls" aria-labelledby="row-default-mtls" checked />
+                <span class="rc-switch__knob"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-owner-self-control">允许本人其他设备免密自控本机</div>
+              <div class="rc-setting-row__desc">同账号下通过设备证书验证的本人设备，可直接远控本机无需临时验证码。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <label class="rc-switch">
+                <input type="checkbox" id="opt-owner-self-control" aria-labelledby="row-owner-self-control" checked />
+                <span class="rc-switch__knob"></span>
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="rc-group" aria-label="本机设备证书">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title">本机 mTLS 设备证书</div>
+              <div class="rc-status-badge rc-status-badge--disabled" id="cert-status-badge"
+                   role="status" aria-live="polite">
+                <span class="rc-status-badge__dot" aria-hidden="true"></span>
+                <span class="rc-status-badge__text" id="cert-status-text">未签发</span>
+              </div>
+              <div class="rc-setting-row__detail" id="cert-status-detail" hidden></div>
+            </div>
+            <div class="rc-setting-row__control">
+              <button type="button" class="rc-btn rc-btn--secondary" id="btn-cert-renew">立即续签</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- 网络 tab：信令与中继服务器配置 -->
+      <div class="rc-settings__stack" id="panel-network" role="tabpanel"
+           aria-labelledby="tab-network" hidden>
+        <!-- G1 信令与中继服务器 -->
+        <section class="rc-group" aria-label="信令与中继服务器">
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-server-enabled">启用中继服务器</div>
+              <div class="rc-setting-row__desc">开启后连接到信令与中继服务器，支持跨网络远程控制。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <label class="rc-switch">
+                <input type="checkbox" id="opt-server-enabled" aria-labelledby="row-server-enabled" />
+                <span class="rc-switch__knob"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-server-host">服务器地址</div>
+              <div class="rc-setting-row__desc">支持 IP、域名或 host:port 格式。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <input type="text" class="rc-input rc-input--host" id="opt-server-host"
+                     aria-labelledby="row-server-host" placeholder="请输入服务器域名或 IP"
+                     autocomplete="off" spellcheck="false" />
+            </div>
+          </div>
+
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title" id="row-server-ports">信令端口 / 中继端口</div>
+              <div class="rc-setting-row__desc">默认信令端口 21116，中继端口 21117。</div>
+            </div>
+            <div class="rc-setting-row__control">
+              <div class="rc-port-pair" aria-labelledby="row-server-ports">
+                <label class="rc-port-field">
+                  <span class="rc-port-field__label">信令</span>
+                  <input type="text" inputmode="numeric" pattern="[0-9]*"
+                         class="rc-input rc-input--port" id="opt-signal-port"
+                         aria-label="信令端口" value="21116"
+                         autocomplete="off" spellcheck="false" />
+                </label>
+                <span class="rc-port-sep" aria-hidden="true">/</span>
+                <label class="rc-port-field">
+                  <span class="rc-port-field__label">中继</span>
+                  <input type="text" inputmode="numeric" pattern="[0-9]*"
+                         class="rc-input rc-input--port" id="opt-relay-port"
+                         aria-label="中继端口" value="21117"
+                         autocomplete="off" spellcheck="false" />
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="rc-setting-row">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title">连接状态</div>
+              <div class="rc-status-badge rc-status-badge--disabled" id="server-status-badge"
+                   role="status" aria-live="polite">
+                <span class="rc-status-badge__dot" id="server-status-dot" aria-hidden="true"></span>
+                <span class="rc-status-badge__text" id="server-status-text">未配置</span>
+              </div>
+              <div class="rc-setting-row__detail" id="server-status-detail" hidden></div>
+            </div>
+            <div class="rc-setting-row__control">
+              <button type="button" class="rc-btn rc-btn--secondary" id="btn-server-test">测试连通性</button>
+              <button type="button" class="rc-btn rc-btn--primary" id="btn-server-save">保存配置</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- G2 说明 -->
+        <section class="rc-group" aria-label="说明">
+          <div class="rc-setting-row rc-setting-row--note">
+            <div class="rc-setting-row__main">
+              <div class="rc-setting-row__title">说明</div>
+              <div class="rc-setting-row__desc">配置并启用信令与中继服务器后，本机将自动获取永久 9 位设备码，用于跨网络远程控制（优先 P2P 直连，自动回退 TCP 中继）。</div>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- 非「常规 / 网络」tab 的居中灰字空态（§6 W1） -->
+      <div class="rc-empty" id="panel-empty" role="tabpanel" aria-label="暂无配置" hidden>
+        暂无可配置项
+      </div>
+    </div>
+  </div>
+
+  <script src="assets/js/bridge.js"></script>
+  <script src="assets/js/overlay.js"></script>
+  <script>
+    (function () {
+      "use strict";
+
+      var RCO = window.RCOverlay;
+      var Bridge = window.RCBridge;
+      var IS_TAURI = Boolean(Bridge && Bridge.isTauri);
+      var win = document.getElementById("settings-window");
+
+      /* Toast 落点在窗口内（距窗口底缘 24，§3.6） */
+      if (RCO) RCO.toastHost = win;
+
+      function toast(text) {
+        if (RCO && typeof RCO.toast === "function") RCO.toast(text);
+      }
+
+      /* tabs 图标（Lucide 内联，size 16） */
+      Array.prototype.forEach.call(document.querySelectorAll(".rc-tab[data-icon]"), function (tab) {
+        if (!RCO) return;
+        tab.insertAdjacentHTML("afterbegin", RCO.icon(tab.getAttribute("data-icon"), 16));
+      });
+
+      /* ── Tab 切换（§7：常规 / 安全 / 网络有内容，键盘为空态）──── */
+      var tabs = Array.prototype.slice.call(document.querySelectorAll(".rc-tab"));
+      var panels = {
+        general: document.getElementById("panel-general"),
+        security: document.getElementById("panel-security"),
+        network: document.getElementById("panel-network")
+      };
+      var panelEmpty = document.getElementById("panel-empty");
+
+      function activateTab(target) {
+        var key = target.getAttribute("data-tab");
+        tabs.forEach(function (tab) {
+          var active = tab === target;
+          tab.classList.toggle("is-active", active);
+          tab.setAttribute("aria-selected", active ? "true" : "false");
+          tab.tabIndex = active ? 0 : -1;
+        });
+        Object.keys(panels).forEach(function (panelKey) {
+          if (panels[panelKey]) panels[panelKey].hidden = panelKey !== key;
+        });
+        panelEmpty.hidden = Boolean(panels[key]);
+      }
+
+      tabs.forEach(function (tab, i) {
+        tab.addEventListener("click", function () {
+          activateTab(tab);
+        });
+        tab.addEventListener("keydown", function (e) {
+          var next = i;
+          if (e.key === "ArrowRight") next = (i + 1) % tabs.length;
+          else if (e.key === "ArrowLeft") next = (i - 1 + tabs.length) % tabs.length;
+          else if (e.key === "Home") next = 0;
+          else if (e.key === "End") next = tabs.length - 1;
+          else return;
+          e.preventDefault();
+          activateTab(tabs[next]);
+          tabs[next].focus();
+        });
+      });
+
+      /* 支持 #network / #security 直达对应设置 tab */
+      var initHash = (window.location.hash || "").replace(/^#/, "");
+      if (initHash === "network") {
+        var networkTab = document.getElementById("tab-network");
+        if (networkTab) activateTab(networkTab);
+      } else if (initHash === "security") {
+        var securityTab = document.getElementById("tab-security");
+        if (securityTab) activateTab(securityTab);
+      }
+
+      /* ── 本地持久化（§8.4 W1 设置 → localStorage）────────────── */
+      var STORE_KEY = "rc.settings.v1";
+      var SWITCHES = ["opt-autostart", "opt-drag-send"];
+      var SELECTS = ["opt-awake", "opt-close-window"];
+
+      function load() {
+        var saved = null;
+        try {
+          saved = JSON.parse(window.localStorage.getItem(STORE_KEY) || "null");
+        } catch (err) {
+          saved = null;
+        }
+        if (!saved) return;
+        SWITCHES.forEach(function (id) {
+          if (typeof saved[id] === "boolean") document.getElementById(id).checked = saved[id];
+        });
+        SELECTS.forEach(function (id) {
+          if (typeof saved[id] === "string") document.getElementById(id).value = saved[id];
+        });
+      }
+
+      function save() {
+        var data = {};
+        SWITCHES.forEach(function (id) {
+          data[id] = document.getElementById(id).checked;
+        });
+        SELECTS.forEach(function (id) {
+          data[id] = document.getElementById(id).value;
+        });
+        try {
+          window.localStorage.setItem(STORE_KEY, JSON.stringify(data));
+        } catch (err) {
+          /* 隐私模式 / file:// 下不可写：静默降级，不影响交互 */
+        }
+      }
+
+      load();
+
+      SWITCHES.forEach(function (id) {
+        document.getElementById(id).addEventListener("change", save);
+      });
+      SELECTS.forEach(function (id) {
+        document.getElementById(id).addEventListener("change", save);
+      });
+
+      /* ── 安全设置：mTLS 默认开关、免密自控与设备证书状态 ────── */
+      var SEC_STORE_KEY = "rc.settings.security.v1";
+      var optDefaultMtls = document.getElementById("opt-default-mtls");
+      var optOwnerSelfControl = document.getElementById("opt-owner-self-control");
+      var certStatusBadge = document.getElementById("cert-status-badge");
+      var certStatusText = document.getElementById("cert-status-text");
+      var certStatusDetail = document.getElementById("cert-status-detail");
+      var btnCertRenew = document.getElementById("btn-cert-renew");
+
+      function formatExpiryUnix(sec) {
+        var n = Number(sec);
+        if (!isFinite(n) || n <= 0) return "--";
+        try {
+          return new Date(n * 1000).toLocaleString("zh-CN", { hour12: false });
+        } catch (err) {
+          return String(n);
+        }
+      }
+
+      function applyCertStatus(cert) {
+        if (!certStatusBadge || !certStatusText || !certStatusDetail) return;
+        certStatusBadge.classList.remove(
+          "rc-status-badge--disabled",
+          "rc-status-badge--connected",
+          "rc-status-badge--error"
+        );
+        if (cert && cert.issued && (!cert.expiresAtUnixSec || cert.expiresAtUnixSec * 1000 > Date.now())) {
+          certStatusBadge.classList.add("rc-status-badge--connected");
+          certStatusText.textContent = "mTLS 设备证书有效";
+          var parts = [];
+          if (cert.serialHex) parts.push("序列号 " + String(cert.serialHex).slice(0, 12) + "…");
+          if (cert.expiresAtUnixSec) parts.push("有效期至 " + formatExpiryUnix(cert.expiresAtUnixSec));
+          certStatusDetail.textContent = parts.join(" · ");
+          certStatusDetail.hidden = parts.length === 0;
+        } else if (cert && cert.issued && cert.expiresAtUnixSec && cert.expiresAtUnixSec * 1000 <= Date.now()) {
+          certStatusBadge.classList.add("rc-status-badge--error");
+          certStatusText.textContent = "mTLS 设备证书已过期";
+          certStatusDetail.textContent = "请点击右侧立即续签设备证书";
+          certStatusDetail.hidden = false;
+        } else {
+          certStatusBadge.classList.add("rc-status-badge--disabled");
+          certStatusText.textContent = IS_TAURI ? "未签发（请先登录）" : "预览模式（已就绪）";
+          certStatusDetail.textContent = "";
+          certStatusDetail.hidden = true;
+        }
+      }
+
+      function applySecurityPrefs(snap) {
+        if (!snap) return;
+        if (optDefaultMtls && typeof snap.defaultEncryptConnection === "boolean") {
+          optDefaultMtls.checked = snap.defaultEncryptConnection;
+        }
+        if (optOwnerSelfControl && typeof snap.allowOwnerSelfControl === "boolean") {
+          optOwnerSelfControl.checked = snap.allowOwnerSelfControl;
+        }
+        applyCertStatus(snap.certStatus);
+      }
+
+      function loadLocalSecurityPrefs() {
+        var saved = null;
+        try {
+          saved = JSON.parse(window.localStorage.getItem(SEC_STORE_KEY) || "null");
+        } catch (err) {
+          saved = null;
+        }
+        applySecurityPrefs({
+          defaultEncryptConnection: saved && typeof saved.defaultEncryptConnection === "boolean"
+            ? saved.defaultEncryptConnection : true,
+          allowOwnerSelfControl: saved && typeof saved.allowOwnerSelfControl === "boolean"
+            ? saved.allowOwnerSelfControl : true,
+          certStatus: { issued: false }
+        });
+      }
+
+      function saveSecurityPatch(patch) {
+        if (!IS_TAURI || typeof Bridge.saveSecurityPrefs !== "function") {
+          try {
+            window.localStorage.setItem(SEC_STORE_KEY, JSON.stringify({
+              defaultEncryptConnection: Boolean(optDefaultMtls && optDefaultMtls.checked),
+              allowOwnerSelfControl: Boolean(optOwnerSelfControl && optOwnerSelfControl.checked)
+            }));
+          } catch (err) { /* ignore */ }
+          toast("已更新安全偏好");
+          return;
+        }
+        Bridge.saveSecurityPrefs(patch)
+          .then(function (snap) {
+            applySecurityPrefs(snap);
+            toast("已保存安全设置");
+          })
+          .catch(function (err) {
+            if (optDefaultMtls && typeof patch.defaultEncryptConnection === "boolean") {
+              optDefaultMtls.checked = !patch.defaultEncryptConnection;
+            }
+            if (optOwnerSelfControl && typeof patch.allowOwnerSelfControl === "boolean") {
+              optOwnerSelfControl.checked = !patch.allowOwnerSelfControl;
+            }
+            toast("保存安全设置失败：" + String(err));
+          });
+      }
+
+      if (IS_TAURI && typeof Bridge.getSecurityPrefs === "function") {
+        Bridge.getSecurityPrefs()
+          .then(applySecurityPrefs)
+          .catch(function () {
+            applyCertStatus({ issued: false });
+          });
+        if (typeof Bridge.onGateStatus === "function") {
+          Bridge.onGateStatus(function (snap) {
+            applyCertStatus(snap && snap.certStatus ? snap.certStatus : { issued: false });
+          });
+        }
+      } else {
+        loadLocalSecurityPrefs();
+      }
+
+      if (optDefaultMtls) {
+        optDefaultMtls.addEventListener("change", function () {
+          saveSecurityPatch({ defaultEncryptConnection: Boolean(optDefaultMtls.checked) });
+        });
+      }
+      if (optOwnerSelfControl) {
+        optOwnerSelfControl.addEventListener("change", function () {
+          saveSecurityPatch({ allowOwnerSelfControl: Boolean(optOwnerSelfControl.checked) });
+        });
+      }
+      if (btnCertRenew) {
+        btnCertRenew.addEventListener("click", function () {
+          if (!IS_TAURI || typeof Bridge.renewDeviceCert !== "function") {
+            toast("浏览器预览模式，请在桌面端续签设备证书");
+            return;
+          }
+          btnCertRenew.disabled = true;
+          btnCertRenew.textContent = "续签中…";
+          Bridge.renewDeviceCert()
+            .then(function (cert) {
+              applyCertStatus(cert);
+              toast("设备证书续签成功");
+            })
+            .catch(function (err) {
+              toast("续签设备证书失败：" + String(err));
+            })
+            .then(function () {
+              btnCertRenew.disabled = false;
+              btnCertRenew.textContent = "立即续签";
+            });
+        });
+      }
+
+      /* ── 网络设置：信令与中继服务器 ──────────────────────────── */
+      var NET_STORE_KEY = "rc.settings.network.v1";
+      var DEFAULT_SIGNAL_PORT = 21116;
+      var DEFAULT_RELAY_PORT = 21117;
+
+      var optServerEnabled = document.getElementById("opt-server-enabled");
+      var optServerHost = document.getElementById("opt-server-host");
+      var optSignalPort = document.getElementById("opt-signal-port");
+      var optRelayPort = document.getElementById("opt-relay-port");
+      var serverStatusBadge = document.getElementById("server-status-badge");
+      var serverStatusText = document.getElementById("server-status-text");
+      var serverStatusDetail = document.getElementById("server-status-detail");
+      var btnServerTest = document.getElementById("btn-server-test");
+      var btnServerSave = document.getElementById("btn-server-save");
+      var networkBusy = false;
+      var lastServerRev = -1;
+      var detailSource = "status";
+
+      function setNetworkBusy(busy) {
+        networkBusy = Boolean(busy);
+        btnServerTest.disabled = networkBusy;
+        btnServerSave.disabled = networkBusy;
+      }
+
+      function syncSaveButtonLabel() {
+        btnServerSave.textContent = optServerEnabled.checked ? "保存并连接" : "保存配置";
+      }
+
+      function setStatusDetail(text, variant, source) {
+        var msg = text ? String(text).trim() : "";
+        detailSource = source || "status";
+        serverStatusDetail.classList.remove(
+          "rc-setting-row__detail--error",
+          "rc-setting-row__detail--ok"
+        );
+        if (!msg) {
+          serverStatusDetail.textContent = "";
+          serverStatusDetail.title = "";
+          serverStatusDetail.hidden = true;
+          return;
+        }
+        if (variant === "error") {
+          serverStatusDetail.classList.add("rc-setting-row__detail--error");
+        } else if (variant === "ok") {
+          serverStatusDetail.classList.add("rc-setting-row__detail--ok");
+        }
+        serverStatusDetail.textContent = msg;
+        serverStatusDetail.title = msg;
+        serverStatusDetail.hidden = false;
+      }
+
+      function parsePortInput(input, fallback) {
+        if (input && input.validity && input.validity.badInput) return null;
+        var raw = String((input && input.value) || "").trim();
+        if (!raw) return fallback;
+        if (!/^\d+$/.test(raw)) return null;
+        var num = Number(raw);
+        if (!Number.isInteger(num) || num < 1 || num > 65535) return null;
+        return num;
+      }
+
+      function applyServerStatus(snap, syncFields) {
+        if (!snap) return;
+        if (syncFields) {
+          optServerEnabled.checked = Boolean(snap.enabled);
+          optServerHost.value = typeof snap.serverHost === "string" ? snap.serverHost : "";
+          optSignalPort.value = String(snap.signalPort || DEFAULT_SIGNAL_PORT);
+          optRelayPort.value = String(snap.relayPort || DEFAULT_RELAY_PORT);
+          syncSaveButtonLabel();
+        }
+
+        if (typeof snap.revision === "number" && snap.revision > 0 && snap.revision < lastServerRev) {
+          return;
+        }
+        if (typeof snap.revision === "number" && snap.revision > lastServerRev) {
+          lastServerRev = snap.revision;
+        }
+
+        var st = snap.state || "disabled";
+        serverStatusBadge.classList.remove(
+          "rc-status-badge--disabled",
+          "rc-status-badge--connecting",
+          "rc-status-badge--connected",
+          "rc-status-badge--error"
+        );
+
+        var label = "未配置";
+        var badgeTitle = "";
+        if (st === "connected") {
+          serverStatusBadge.classList.add("rc-status-badge--connected");
+          var code = snap.deviceIdFormatted || snap.deviceId || "";
+          label = code ? "已连接 · 设备码 " + code : "已连接";
+          if (detailSource === "status") setStatusDetail("", null, "status");
+        } else if (st === "connecting") {
+          serverStatusBadge.classList.add("rc-status-badge--connecting");
+          label = "连接中…";
+          if (detailSource === "status") setStatusDetail("", null, "status");
+        } else if (st === "error") {
+          serverStatusBadge.classList.add("rc-status-badge--error");
+          var errMsg = snap.errorMessage || "未知错误";
+          label = "连接失败";
+          badgeTitle = "连接失败：" + errMsg;
+          setStatusDetail(errMsg, "error", "status");
+        } else {
+          serverStatusBadge.classList.add("rc-status-badge--disabled");
+          var hasHost = Boolean(snap.serverHost && String(snap.serverHost).trim());
+          label = snap.enabled ? "未连接" : (hasHost ? "已停用" : "未配置");
+          if (detailSource === "status") setStatusDetail("", null, "status");
+        }
+
+        serverStatusText.textContent = label;
+        serverStatusBadge.title = badgeTitle || label;
+      }
+
+      function loadLocalNetworkConfig() {
+        var saved = null;
+        try {
+          saved = JSON.parse(window.localStorage.getItem(NET_STORE_KEY) || "null");
+        } catch (err) {
+          saved = null;
+        }
+        if (!saved) {
+          applyServerStatus({
+            enabled: false,
+            serverHost: "",
+            signalPort: DEFAULT_SIGNAL_PORT,
+            relayPort: DEFAULT_RELAY_PORT,
+            state: "disabled"
+          }, true);
+          return;
+        }
+        applyServerStatus({
+          enabled: Boolean(saved.enabled),
+          serverHost: typeof saved.serverHost === "string" ? saved.serverHost : "",
+          signalPort: Number(saved.signalPort) || DEFAULT_SIGNAL_PORT,
+          relayPort: Number(saved.relayPort) || DEFAULT_RELAY_PORT,
+          state: "disabled"
+        }, true);
+      }
+
+      function saveLocalNetworkConfig(cfg) {
+        try {
+          window.localStorage.setItem(NET_STORE_KEY, JSON.stringify(cfg));
+        } catch (err) {
+          /* 隐私模式 / file:// 下不可写：静默降级 */
+        }
+      }
+
+      function readNetworkForm(requireHost) {
+        var enabled = optServerEnabled.checked;
+        var serverHost = optServerHost.value.trim();
+        var signalPort = parsePortInput(optSignalPort, DEFAULT_SIGNAL_PORT);
+        if (signalPort == null) {
+          toast("端口号需为 1–65535 之间的整数");
+          optSignalPort.focus();
+          return null;
+        }
+        var relayPort = parsePortInput(optRelayPort, DEFAULT_RELAY_PORT);
+        if (relayPort == null) {
+          toast("端口号需为 1–65535 之间的整数");
+          optRelayPort.focus();
+          return null;
+        }
+        if (requireHost && !serverHost) {
+          toast("请填写服务器地址");
+          optServerHost.focus();
+          return null;
+        }
+        return {
+          enabled: enabled,
+          serverHost: serverHost,
+          signalPort: signalPort,
+          relayPort: relayPort
+        };
+      }
+
+      optServerEnabled.addEventListener("change", syncSaveButtonLabel);
+      syncSaveButtonLabel();
+
+      function fetchInitialServerConfig() {
+        if (typeof Bridge.getServerConfig !== "function") return;
+        Bridge.getServerConfig()
+          .then(function (snap) {
+            applyServerStatus(snap, true);
+          })
+          .catch(function (err) {
+            toast("读取服务器配置失败：" + String(err));
+          });
+      }
+
+      if (IS_TAURI && typeof Bridge.getServerConfig === "function") {
+        if (typeof Bridge.onServerStatus === "function") {
+          Bridge.onServerStatus(function (snap) {
+            applyServerStatus(snap, false);
+          }).then(fetchInitialServerConfig, fetchInitialServerConfig);
+        } else {
+          fetchInitialServerConfig();
+        }
+      } else {
+        loadLocalNetworkConfig();
+      }
+
+      btnServerTest.addEventListener("click", function () {
+        if (networkBusy) return;
+        var form = readNetworkForm(true);
+        if (!form) return;
+
+        if (!IS_TAURI || typeof Bridge.testServerConnection !== "function") {
+          toast("浏览器预览模式，请在桌面端测试服务器连通性");
+          return;
+        }
+
+        setNetworkBusy(true);
+        btnServerTest.textContent = "测试中…";
+        Bridge.testServerConnection(form.serverHost, form.signalPort, form.relayPort)
+          .then(function (msg) {
+            var fullMsg = msg ? String(msg) : "服务器连通正常";
+            setStatusDetail(fullMsg, "ok", "test");
+            toast("服务器连通正常");
+          })
+          .catch(function (err) {
+            var errMsg = String(err || "未知错误");
+            setStatusDetail("连通性测试失败：" + errMsg, "error", "test");
+            toast("连通性测试失败");
+          })
+          .then(function () {
+            btnServerTest.textContent = "测试连通性";
+            setNetworkBusy(false);
+          });
+      });
+
+      btnServerSave.addEventListener("click", function () {
+        if (networkBusy) return;
+        var form = readNetworkForm(optServerEnabled.checked);
+        if (!form) return;
+
+        if (!IS_TAURI || typeof Bridge.saveServerConfig !== "function") {
+          saveLocalNetworkConfig(form);
+          setStatusDetail("", null, "status");
+          applyServerStatus({
+            enabled: form.enabled,
+            serverHost: form.serverHost,
+            signalPort: form.signalPort,
+            relayPort: form.relayPort,
+            state: "disabled"
+          }, true);
+          toast("已保存服务器配置（浏览器预览模式）");
+          return;
+        }
+
+        setNetworkBusy(true);
+        setStatusDetail("", null, "status");
+        Bridge.saveServerConfig(form)
+          .then(function (snap) {
+            applyServerStatus(snap, true);
+            toast(form.enabled ? "已保存配置，正在连接服务器" : "已保存配置并停用中继服务器");
+          })
+          .catch(function (err) {
+            toast("保存服务器配置失败：" + String(err));
+          })
+          .then(function () {
+            setNetworkBusy(false);
+          });
+      });
+
+      [optServerHost, optSignalPort, optRelayPort].forEach(function (input) {
+        input.addEventListener("keydown", function (e) {
+          if (e.isComposing || e.keyCode === 229) return;
+          if (e.key === "Enter") {
+            e.preventDefault();
+            btnServerSave.click();
+          }
+        });
+      });
+
+      /* ── Toast 占位交互（修改路径 / 打开文件夹）────────────── */
+      Array.prototype.forEach.call(document.querySelectorAll("[data-toast]"), function (btn) {
+        btn.addEventListener("click", function () {
+          toast(btn.getAttribute("data-toast"));
+        });
+      });
+
+      /* ── 交通灯关闭（浏览器预览时关闭本窗口；Tauri 下由原生按钮负责）── */
+      var closeDot = document.querySelector("[data-rc-close]");
+      if (closeDot) {
+        closeDot.addEventListener("click", function () {
+          window.close();
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

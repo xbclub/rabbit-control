@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RabbitControl",
+  "version": "0.1.0",
+  "identifier": "com.rabbitcontrol.dev",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "RabbitControl",
+        "url": "index.html",
+        "width": 1000,
+        "height": 660,
+        "minWidth": 820,
+        "minHeight": 540,
+        "resizable": true,
+        "center": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data: asset:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Utility",
+    "shortDescription": "低延迟远程桌面控制软件",
+    "longDescription": "RabbitControl 是一款基于 Rust 的低延迟远程桌面控制工具，支持局域网直连、P2P UDP 打洞、TCP 零拷贝中继、音频同步、剪贴板、文件传输、远程终端与端口映射。",
+    "macOS": {
+      "minimumSystemVersion": "13.0",
+      "dmg": {
+        "appPosition": { "x": 180, "y": 170 },
+        "applicationFolderPosition": { "x": 480, "y": 170 },
+        "windowSize": { "width": 660, "height": 400 }
+      }
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  }
+}

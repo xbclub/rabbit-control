@@ -1,6 +1,8 @@
 # 08 — UI 设计规范（rc-ui）
 
-> 状态：设计稿（未实现）。实现载体：**GPUI（zed 官方 crate v0.2.2）+ gpui-kit（longbridge，v0.10.0）**，框架决策记录见 TASK.md §13。
+> 状态：设计稿（未实现）。实现载体：**Tauri v2（2.12.7 stable）+ 纯静态 HTML/CSS/JS 前端（不上前端框架）**，框架决策记录见 TASK.md §13。
+> 选型沿革：GPUI → Dioxus → **Tauri v2**（2026-11-21 用户裁决，依据见 §8.0）。
+> **未完成项与后续工作清单见 [08-ui-open-items.md](08-ui-open-items.md)**（打包/CSP/后端接线/视频接入等，逐条带证据）。
 > 本文是 rc-ui（M2-6 控制端 UI）的唯一视觉与交互依据；**本文自包含：实现者不需要参考图即可实现**，全部 mock 数据见 §6.0。
 > 视觉风格来源：UU 远控 macOS 客户端 12 张截图（2026-11-21 收集，留档于设计轮记录）。下文以 P1–P3（主窗口页面）、O1–O3（浮层）、W1–W4（独立窗口）、S1–S4（会话中）编号引用。
 
@@ -49,7 +51,7 @@
 
 ## 3. 设计规范（Design Tokens）
 
-实现位置约定：`crates/rc-ui/src/theme.rs`，本文 token 名即代码常量名。**业务代码禁止裸写色值/字号，一律引用 token。**
+实现位置约定：`crates/rc-ui/ui/assets/css/tokens.css` 的 `:root` CSS 自定义属性，本文 token 名即 CSS 变量名（如 `ACCENT` ⇔ `--accent`，小写连字符）。**业务样式禁止裸写色值/字号，一律引用 `var(--*)`。**
 
 ### 3.1 色彩
 
@@ -125,7 +127,7 @@
 
 ### 3.5 图标
 
-gpui-kit 内置 **Lucide** 图标集（`gpui-kit-assets`），本期全部用 Lucide，不引自定义 SVG。**注意：Lucide 无品牌图标（没有 apple / Android 机器人 / Windows 徽标），设备类型一律用形状图标表达**；§3.5 名称按 Lucide 现行命名书写，实现时以 gpui-kit `IconName` 实际枚举为准（如个别改名以枚举为准并在实现记录中回填本文）。
+图标统一用 **Lucide** 图标集（Web 端经 `lucide-static` 或内联 SVG sprite 引入，不引自定义 SVG 文件）。**注意：Lucide 无品牌图标（没有 apple / Android 机器人 / Windows 徽标），设备类型一律用形状图标表达**；下表名称按 Lucide 现行命名书写，实现时以所用图标包的 class/文件名实际为准（如个别改名以实际为准并在实现记录中回填本文）。
 
 | 界面语义 | Lucide 图标名 |
 |---|---|
@@ -232,11 +234,13 @@ gpui-kit 内置 **Lucide** 图标集（`gpui-kit-assets`），本期全部用 Lu
 
 **设备（侧栏 3 台，全部在线=绿点）**：
 
-| 名称 | 类型 | 图标 |
-|---|---|---|
-| DESKTOP-Q5Q8E8R | Windows | `app-window` |
-| yii's MacBook Pro | Mac（默认选中） | `laptop` |
-| Y 的 Mac mini | Mac | `laptop` |
+| 名称 | 类型 | 图标 | 预览卡态（本期） |
+|---|---|---|---|
+| DESKTOP-Q5Q8E8R | Windows | `app-window` | B 无快照 |
+| yii's MacBook Pro | Mac（默认选中） | `laptop` | B 无快照 |
+| Y 的 Mac mini | Mac | `laptop` | B 无快照 |
+
+> 三台均走态 B（从未连接），如实表达；`snapshotUrl` 字段留空，态 A/C 代码路径保留待 M2-6 接真数据（见 §6 P1 三态表）。
 
 **P3 全部设备（电脑 4）**：Y的 MacBook Pro（+「本机」pill）、DESKTOP-Q5Q8E8R、yii's MacBook Pro、Y 的 Mac mini。
 **P3（手机/平板 4）**：iPhone 17 Pro Max（`smartphone`）、iQOO Pad2 Pro（`tablet`）、OnePlusPGP110（`smartphone`）、一加 Ace Pro 全网通版（`smartphone`）。
@@ -296,10 +300,9 @@ gpui-kit 内置 **Lucide** 图标集（`gpui-kit-assets`），本期全部用 Lu
 
 ```
 │         ┌──────────────────────────────────────────┐        │
-│         │                                          │        │
-│         │            预览卡（占位图填充）           │        │
+│         │        （态 A：远端桌面快照）             │        │
+│         │        （态 B：设备图标 + 设备名）        │        │
 │         │            中央：「进入桌面  →」          │        │
-│         │                                          │        │
 │         └──────────────────────────────────────────┘        │
 │         ┌──────────────────────────────────────────┐        │
 │         │ ⧉ 文件传输 │ ▶ 观看模式 │ ⌗ 终端 │ ⛓ 端口映射 │ ⋮ │
@@ -308,7 +311,18 @@ gpui-kit 内置 **Lucide** 图标集（`gpui-kit-assets`），本期全部用 Lu
 
 | 区域 | 规格 |
 |---|---|
-| 预览卡 | 内容区水平居中，宽 = 内容区−2×48，高 480；`R_CARD`+`SHADOW_CARD`；填充 `STAGE_BG` 纯色+居中 `TEXT_SECONDARY` 13px 设备名水印（占位图来源未决，见 §10）；中央白色 16px semibold「进入桌面」+右箭头，整体可点击（悬停时箭头右移 4px）→ 打开 S1 |
+| 预览卡 | 内容区水平居中，宽 = 内容区−2×48，高 480；`R_CARD`+`SHADOW_CARD`。**预览卡语义 = 远端设备最近一次连接时缓存的桌面快照**（不是装饰配图、不随本机壁纸变化）。三态见下表；中央恒为白色 16px semibold「进入桌面」+右箭头（悬停箭头右移 4px），整体可点击 → 打开 S1 |
+
+**预览卡三态（★ 核心语义，实现不得混淆）**：
+
+| 态 | 触发条件 | 填充 | 卡内附加文字 |
+|---|---|---|---|
+| **A 有缓存快照** | 该设备曾成功连接过，本地存有上次会话的桌面快照 | 快照图 `object-fit: cover`，覆盖一层 `rgba(0,0,0,0.28)` 暗化以保证白色文字可读 | 仅中央「进入桌面 →」 |
+| **B 无快照（从未连接）** | 首次添加/从未成功建连 | `STAGE_BG` 底色 + 居中 96×96 `TEXT_DISABLED` 设备类型图标（`laptop`/`app-window`/`smartphone`/`tablet`）+ 其下 15px `TEXT_SECONDARY` 设备名 | 图标组下方 20px 处「尚未连接过该设备」13px `TEXT_DISABLED`；「进入桌面 →」仍在正中 |
+| **C 设备离线** | 有快照但设备当前离线 | 同 A 的快照，但整体 `opacity: 0.55` + 覆盖 `rgba(0,0,0,0.45)` | 左上角 16px 边距处「离线」灰 Pill（`BG_HOVER` 底 `TEXT_SECONDARY` 字）；「进入桌面 →」改为「唤醒并连接 →」，点击语义=先唤起再连 |
+
+> **禁止**：用风景照片、渐变装饰图、本机壁纸作为填充——预览卡承载的是「对方桌面」这一信息的真实性，假图会误导用户对连接状态的判断。
+> **本期（mock 原型）**：三台 mock 设备均为「无快照」态（B），如实表达「从未连接」；快照态 A/C 的代码路径保留（`snapshotUrl` 字段为空则走 B），M2-6 接真数据时写入即可。
 | 底部工具条 | 紧贴预览卡底部，白底 `R_CARD`+`SHADOW_CARD`，高 56；五组「20px 图标+14px 文字」等宽均分，组间 1px `DIVIDER` 竖线；第五组仅 `ellipsis` 图标 → 打开 O1 |
 | 交互 | 文件传输→W2；观看模式→S1 只读变体；终端→W3；端口映射→W4 |
 
@@ -452,7 +466,7 @@ Popover 宽 300 高 220，**顶部箭头朝上指向锚点**，`POPOVER_BG` 毛�
 - 计时器 `FONT_MONO` HH:MM:SS（注入时钟）；
 - 右侧「控制中心」ButtonGhost（`layout-dashboard`）→ S3。
 
-**内容区**：`STAGE_BG` 铺满 + 居中 `TEXT_SECONDARY` 13px「画面接入将在 M2-6 桥接 MetalRenderer」。真实帧接入路径预留：`rc-render-macos::MetalRenderer::from_raw_layer` 与 GPUI 窗口原生层桥接（本期不实现）。
+**内容区**：`STAGE_BG` 铺满 + 居中 `TEXT_SECONDARY` 13px「画面接入将在 M2-6 桥接视频层」。真实帧接入路径见 §8.5（首选原生 Metal 层叠加，fallback 为帧转 Web 渲染）。
 
 **观看模式变体**：同一 S1 的只读态——工具栏相同，画面区左上角 16px 边距处常驻「观看模式」Pill（灰）；本变体下无鼠标/键盘注入（本期本来也无注入，仅状态标记）。
 
@@ -532,7 +546,7 @@ UDP LAN
 
 ## 7. 交互与状态规格
 
-### 7.1 输入校验（唯一纯逻辑校验，W4 添加映射；可单测，放 `model.rs`）
+### 7.1 输入校验（唯一纯逻辑校验，W4 添加映射；可单测，放 `ui/assets/js/mock.js` 同级的 `validate.js`）
 
 - 本地端口/目标端口：1–65535 整数；非法（0、70000、非数字、空）→ 该 Input 错误态（`DANGER` 描边）+ 行下方 12px `DANGER`「端口需为 1–65535 的整数」。
 - 目标地址：非空，否则「目标地址不能为空」；IPv4/IPv6/域名严格校验留 TODO。
@@ -566,58 +580,161 @@ UDP LAN
 
 ---
 
-## 8. GPUI / gpui-kit 实现映射建议
+## 8. Tauri v2 实现映射
 
-> 仅为映射建议；gpui-kit API 迭代快，实现时以其实际 examples 为准（遵 onboarding §5「照抄风格」）。
+### 8.0 选型结论与依据
 
-| 设计组件 | gpui-kit 对应（建议） |
+**实现载体：Tauri v2（2.12.7 stable，2026-11-18 发布）+ 纯静态 HTML/CSS/JS 前端（不上前端框架）。**
+
+| 候选 | 结论 | 淘汰/采纳理由 |
+|---|---|---|
+| GPUI 0.2.2 + gpui-kit 0.10 | 淘汰 | 内存最优（实测 90MB vs webview 系 129MB），但：gpui-kit 三个月内 0.6→0.10 高频破坏式迭代；无头测试平台 `draw()` 为空实现（`gpui-0.2.1/src/platform/test/window.rs:269`），视觉验收无法自动化；macOS 构建默认强制 `xcrun metal`（需完整 Xcode，本机仅有 CLT）；三平台各需特殊构建链 |
+| Dioxus 0.7.10 | 淘汰 | `dioxus-desktop` 自述即「WebView renderer」，内存与 Tauri 同档（实测 129MB），无内存优势；且已推进到 0.8.0-alpha.3 破窗期，界面写完即面临大版本迁移；开机自启/剪贴板/文件对话框/更新等桌面能力无官方一等支持，需零散拼 crate |
+| **Tauri v2 2.12.7** | **采纳** | ① 2.x 稳定线 API 面长期冻结（2.12.7 仍在活跃维护）；② 本项目所需桌面能力全部有官方插件：`autostart`（W1 开机自启）、`clipboard-manager`（P2 复制并分享）、`dialog`（W1 修改路径）、`updater`（O2 检查更新）、`single-instance`、`opener`；③ HTML/CSS 对 12 屏设计稿 1:1 还原，毛玻璃可用原生 `backdrop-filter`（**优于 gpui 的半透明近似方案**）；④ 跨平台 mac/Win/Linux 同一套前端，构建门槛低于 gpui（无需 Xcode metal / fxc） |
+
+**内存实测基线（本机 macOS arm64，release 构建，最小空窗口，两次复测一致）**：
+
+| 框架 | 二进制 | 主进程 RSS | WebView 内容进程 | 实际总计 |
+|---|---|---|---|---|
+| GPUI（原生 GPU） | 4.0 MB | 90 MB | — | **90 MB** |
+| Dioxus desktop（webview） | 4.6 MB | 97 MB | +32 MB | **129 MB** |
+| Tauri v2（webview，同类架构） | 预计 3–5 MB | 预计 ≈97 MB | ≈+32 MB | **预计 ≈129 MB** |
+
+> 用户裁决（2026-11-21）：100 多 MB 内存可接受，故内存不再是决定性因素；工程确定性优先。Tauri 相比 GPUI 多付出的约 39MB，换来稳定 API、官方桌面能力插件与可自动化的视觉验收。
+
+**版本状态核实（2026-11-21，crates.io API 实查）**：
+
+| 字段 | 值 | 说明 |
+|---|---|---|
+| `max_stable_version` | **2.12.7** | 采用线 |
+| `newest_version` | **2.12.7** | 最新发布版 |
+| `max_version` | 3.0.0-alpha.6 | 含预发布的最大号 |
+
+- **Tauri v3 无正式版**：3.0.0 全部为 `alpha` 预发布（alpha.0 2026-09-13 → alpha.6 2026-11-06），**无 beta、无 rc**。
+- 因此 **v2.12.7 是当前唯一可用的稳定线**，且维护活跃（2026-11-18 刚发布），非停更旧版。
+- **升级预期**：v3 alpha 已启动，正式版可能在未来一年内到来。届时属官方主版本迁移（通常附迁移指南），风险远低于 Dioxus 0.x 的破窗式变动；本设计文档的 §3 tokens、§4 组件规格、§6 逐屏规格与框架无关，迁移时只需重写 §8。
+
+### 8.1 技术栈与目录结构
+
+```
+crates/rc-ui/            # Rust 侧：Tauri 应用 crate（src-tauri 等价物）
+├── Cargo.toml           # tauri = "2.12", tauri-build = "2.12", 官方插件
+├── build.rs             # tauri_build::build()
+├── tauri.conf.json      # 窗口定义 / CSP / 打包配置
+├── src/
+│   ├── main.rs          # 入口：Builder + 插件注册 + 命令注册
+│   ├── commands.rs      # #[tauri::command] 全部 IPC 命令（接线点见 §8.4）
+│   ├── state.rs         # 应用状态（本期 mock 数据源）
+│   └── window.rs        # 多窗口创建（W1–W4 / S1）
+└── ui/                  # 纯静态前端，无构建步骤
+    ├── index.html       # 主窗口（P1–P3，SPA 内路由）
+    ├── settings.html    # W1
+    ├── transfer.html    # W2
+    ├── terminal.html    # W3
+    ├── portmap.html     # W4
+    ├── session.html     # S1（含 S2/S3/S4 浮层）
+    └── assets/
+        ├── css/tokens.css    # §3 全部 Design Tokens（CSS 变量）
+        ├── css/base.css      # §4 基础组件样式
+        ├── css/pages/*.css   # 逐屏样式
+    ├── js/app.js         # 路由 / 状态 / 事件
+    ├── js/bridge.js      # Tauri invoke 封装（统一 IPC 出口）
+    ├── js/validate.js    # §7.1 端口/名称校验（纯逻辑，可单测）
+    ├── js/mock.js        # §6.0 mock 数据（单一数据源）
+        └── icons/            # Lucide 图标（sprite 或内联）
+```
+
+**不上前端框架的理由**：12 屏为静态原型，交互复杂度低；纯静态 HTML/CSS/JS 无 node 构建链、产物最小、调试最直接（浏览器直接预览），且这层资产在任何 Web 系框架间可复用。
+
+### 8.2 设计组件 → 实现映射
+
+前端不用组件库，按下表用 CSS 类 + 少量 JS 实现（`base.css` 定义）：
+
+| 设计组件（§4） | 实现方式 |
 |---|---|
-| Button 系 | `Button`（`.primary()` / secondary / 自定义 danger 色） |
-| Switch | `Switch` |
-| Checkbox | `Checkbox`（若无则自绘 div） |
-| Input / Select | `Input` / `SelectInput`（或 Input+Popover 组合） |
-| DataTable | `Table`（虚拟滚动、列宽/排序） |
-| TabsTop | `Tab`/`TabBar` 变体 + 自定义白卡胶囊样式 |
-| ListRow | `List`/`ListItem` |
-| Modal / ConfirmDialog / Popover | `Modal` / `Popover` / `PopupCard` |
-| NativeMenu | `ContextMenu` 风格定制（或自绘 div 栈） |
-| 图标 | `Icon`（`IconName`，Lucide） |
-| Pill / StatusDot / Toast / ProgressBar / Hud / Badge | 无对应，自绘（div + 文本，theme token 直映） |
+| `Pill` / `StatusDot` / `Badge` | `<span class="pill pill--online">`，CSS 变量着色 |
+| `ButtonPrimary` / `ButtonSecondary` / `ButtonDanger` / `ButtonGhost` | `.btn .btn--primary/secondary/danger/ghost`，`:hover`/`:active`/`:disabled` 伪类 |
+| `Switch` / `Checkbox` | 原生 `<input type="checkbox">` + 自定义外观（`appearance: none`），保留可访问性 |
+| `ProgressBar` | `<progress>` 或 div 宽度百分比 |
+| `Input` / `Select` | 原生 `<input>` / `<select>` + 统一样式类 |
+| `TabsTop` | 一组 `<button role="tab">` + `.is-active` |
+| `ListRow` / `DataTable` | `<ul>/<li>` 与 `<table>`，CSS Grid 定列宽 |
+| `Popover` / `Modal` / `ConfirmDialog` | `<dialog>` 元素（原生模态 + `::backdrop`）或绝对定位 div |
+| `Toast` | 固定定位容器 + JS 定时移除 |
+| `Hud` | 绝对定位块 + `font-family: var(--font-mono)` |
+| `NativeMenu`（S3） | 绝对定位 div 栈 + `.is-checked` / `.is-danger` / 子菜单 hover 展开 |
+| 图标 | Lucide SVG（内联或 sprite `<use>`） |
 
-实现注意：
+**毛玻璃实现（相对 gpui 的关键改进）**：popover/菜单直接用原生 CSS：
 
-1. **毛玻璃近似**：GPUI 无 backdrop-filter。`POPOVER_BG` 用 `rgba(255,255,255,0.88)` 半透明 + `SHADOW_POPOVER`；若观感不足，备选=对锚点背景预烘焙高斯模糊贴底（本期不做）。
-2. **theme.rs**：§3 全部 token 一比一落为常量；禁止在业务代码写裸色值。
-3. **时钟**：HUD/终端计时器的时间由外部注入（onboarding R7），mock 数据走逻辑时钟。
-4. **测试边界**：仅纯逻辑可测（§7.1 校验、路由状态机、token 不变量）；窗口渲染不进单测，走 §9 截图验收。
-5. **窗口管理**：主窗口+四个独立工具窗口各自 `open_window`；macOS 交通灯走原生 titlebar；S1 用自绘工具栏替代。
-6. **视频接入预留**：S1 画面区后续经 `rc-render-macos::MetalRenderer::from_raw_layer` 与 GPUI 窗口原生层桥接（M2-6，本期 mock）。
+```css
+.popover {
+  background: rgba(255, 255, 255, 0.88);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-radius: var(--r-popover);
+  box-shadow: var(--shadow-popover);
+}
+```
 
-### 8.1 接线点清单（并行开工策略：mock 先行 → 后接线）
+macOS WKWebView 与 Windows WebView2 均支持 `backdrop-filter`，可达到参考图的真实毛玻璃观感——**这是 gpui 方案无法实现的**。
 
-本文界面可与任务书其他工作**并行开工**（rc-ui 本期零 `rc-*` 依赖，单测不碰窗口）；接线时按下表逐项替换 mock，无需重新设计：
+### 8.3 窗口与多窗口
+
+| 窗口 | Tauri 实现 |
+|---|---|
+| 主窗口 | `tauri.conf.json` 的 `app.windows[0]`：1440×900 / 最小 1120×720 |
+| W1 设置 | 独立窗口，`resizable: false`，660×640 |
+| W2 文件传输 / W3 终端 / W4 端口映射 | 独立窗口，可调 |
+| S1 会话 | 独立窗口，支持全屏；观看模式为同窗口只读态（URL 参数区分） |
+| O1–O3 / S2–S4 | 同窗口内浮层，**不**开新窗口 |
+
+- 交通灯：macOS 保留原生 titlebar（`titleBarStyle: "Transparent"` 或默认），前端标题栏内容与原生按钮区留白对齐（§3.6 `PAD_TITLEBAR_X`）。
+- 多窗口用 `tauri::WebviewWindowBuilder` 从 Rust 侧创建，或前端 `WebviewWindow` API。
+
+### 8.4 接线点清单（并行开工策略：mock 先行 → 后接线）
+
+本文界面可与任务书其他工作**并行开工**（rc-ui 本期零 `rc-*` 依赖，mock 数据全在 `ui/assets/js/mock.js`）；接线时按表逐项把 mock 换成 `invoke()` 调用，无需重新设计：
 
 | 界面元素 | 本期 mock | 接线目标 | 前置条件 |
 |---|---|---|---|
-| 侧栏/P3 设备列表 | §6.0 mock 设备 | 设备注册与发现 | 会话层卡（待建） |
+| 侧栏/P3 设备列表 | `mock.js` 设备表 | 设备注册与发现 | 会话层卡（待建） |
 | P2 本设备 ID/验证码 | 静态值 | 鉴权/信令（临时码生成与刷新） | 鉴权卡（待建） |
 | P1 进入桌面 / P2 连接 | 打开静态 S1 / Toast | 发起会话（打洞/中继；传输层 T09 已就绪） | 会话层卡 |
-| **S1 画面** | `STAGE_BG` 占位 | `MetalRenderer::from_raw_layer` ↔ GPUI 窗口层桥接 | **桥接 spike（应最先做）** |
-| S1 计时器 / S4 HUD | 注入时钟/静态值 | 会话开始时间与统计（字段已对齐 `LoopbackReport` 语义） | 会话层卡 |
+| **S1 画面** | `STAGE_BG` 占位 | **视频帧送入 Web 渲染层**（见 §8.5） | **桥接 spike（应最先做）** |
+| S1 计时器 / S4 HUD | 逻辑时钟/静态值 | 会话开始时间与统计（字段已对齐 `LoopbackReport` 语义） | 会话层卡 |
 | S3 画质/帧率/中转 | 勾选+Toast | 编码参数下发 | 会话层卡或 M3 |
 | S2 安全状态 | mock | 被控端状态上报 | 会话层卡 |
 | W2 文件传输 | mock 列表+假队列 | 文件通道（rc-net reliable stream） | 需建卡（目前没有） |
 | W3 终端 | 静态壳 | PTY 会话 | 需建卡 |
 | W4 端口映射 | mock | QUIC 端口转发 | 需建卡 |
-| W1 设置 | 内存态 | 本地持久化 | 低优先 |
+| W1 设置 | localStorage | 本地持久化（`tauri-plugin-store`） | 低优先 |
+| O2「检查更新」 | Toast | `tauri-plugin-updater` | 发布通道就绪 |
+| W1 开机自启 | 内存态 | `tauri-plugin-autostart` | 可立即接真 |
 
-> 并行开工的唯一例外：**S1 视频桥接是全项目技术未知数**（GPUI 自带 Metal 渲染器与外部 CAMetalLayer 的合成方式未验证），UI 开工第一件事应做一个最小 spike（只验证层桥接、不做界面），确认可行后再按本文落地 S1，避免接线期返工布局。次要影响：gpui 冷编译较重，首次接入吃一次冷构建预算；此后 `just c rc-ui` 增量独立，不拖累其他 crate。
+### 8.5 S1 视频画面接入路径（本期仍为占位）
+
+Tauri 方案下画面接入有明确的两条路，**开工首项 spike 应先验证其中一条**：
+
+| 路径 | 做法 | 优劣 |
+|---|---|---|
+| **A. 原生层叠加**（推荐先验证） | Tauri 窗口 `window.hwnd()/ns_window()` 取原生句柄，把 `rc-render-macos::MetalRenderer` 的 `CAMetalLayer` 作为子层插入视频容器区域；前端用透明占位容器定位 | 零拷贝、延迟最低，与 M1 Gate 的呈现路径一致；但需处理层叠加顺序与窗口 resize 同步 |
+| B. 帧数据转 Web | 解码帧经 IPC/共享内存送到前端，Canvas/WebGL/WebGPU 上屏 | 纯 Web 实现简单；但多一次内存拷贝、IPC 开销与延迟，不适合低延迟目标 |
+
+> 与本项目的性能纪律一致（TASK.md §13 用户裁决「非常在乎性能」），优先走 A；B 仅作 fallback。**spike 只验证「原生 Metal 层能否正确嵌入 Tauri 窗口并随窗口缩放」这一件事，不做界面。**
+
+### 8.6 其他实现注意
+
+1. **tokens.css 是唯一色值来源**：§3 全部 token 落为 CSS 自定义属性（`:root { --accent: #3370FF; ... }`），业务样式禁止写裸色值。
+2. **时钟注入**：终端计时器/HUD 的时间由 JS 统一时钟源提供（一期为逻辑时钟），便于后续替换为 Rust 侧会话时间。
+3. **CSP**：`tauri.conf.json` 配严格 CSP；本期无远程资源，`default-src 'self'` 即可。
+4. **视觉验收可自动化（相对 gpui 的核心改进）**：WKWebView/WebView2 支持无头截图（`tauri-driver` + WebDriver，或 Playwright 连本地起的前端页面），12 屏截图可脚本化，风险与成本大幅低于 gpui 的「必须开真窗口人工看」。
 
 ---
 
 ## 9. 视觉验收清单
 
-实现后逐窗截图（`screencapture`）与本文规格比对：
+实现后逐窗截图与本文规格比对。**Tauri 方案的截图可脚本化**（见 §8.6.4），推荐用 Playwright / `tauri-driver` 自动出图存 `target/ui-shots/`，再由人或 visual-judge 子代理判定：
 
 - [ ] 初始状态：主窗口打开即 P1、选中 yii's MacBook Pro、无浮层
 - [ ] P1：侧栏选中切换正确；工具条五组等分；预览卡比例与「进入桌面」悬停动效
@@ -630,7 +747,8 @@ UDP LAN
 - [ ] W3：prompt 元素、光标闪烁、计时刷新
 - [ ] W4：三态映射行、Switch 关闭置灰、添加 Modal 校验（0/70000/空名称均红框）
 - [ ] S1：工具栏五区、观看模式 Pill 变体、S2 气泡（含箭头与「需关注」判定：防窥=关闭 或 自动锁屏=关 时显示）、S3 菜单勾选态与快捷键对齐、退出远控回 P1、S4 HUD 七行
-- [ ] 全局：`just f` 与 `just t rc-ui` 通过（实现阶段）；本文 token 与 theme.rs 无漂移
+- [ ] **毛玻璃**：O3/S2/S3 popover 的 `backdrop-filter` 在 WKWebView 下生效（gpui 方案无法达成，Tauri 应作为加分验收项）
+- [ ] 全局：`cargo check -p rc-ui`、`cargo test -p rc-ui`、clippy/fmt 通过（实现阶段）；本文 token 与 `tokens.css` 无漂移
 
 **元素级抽查法（验收人自测用）**：对任意元素追问四要素——位置/颜色/尺寸/内容——都应能在本文直接查出，无需猜测。样例（P2「连接」按钮）：位置=卡 2 表单行、Input 右侧间距 24、整行左对齐（§3.6 P2 布局）；颜色=`ACCENT`，禁用=`STROKE` 底 `TEXT_DISABLED`（§4 ButtonPrimary）；尺寸=高 36×宽 152、圆角 `R_ROW`（§4/§6 P2）；内容=「连接」（§6 P2）。验收时随机抽 5 个元素重复此抽查，查不到的视为文档缺陷并回填。
 
@@ -643,10 +761,12 @@ UDP LAN
 | 1 | 品牌主色是否沿用参考来源蓝 `#3370FF` | 全局 token | 暂沿用；品牌色确定后只改 `ACCENT` 一处 |
 | 2 | 深色模式 | token 全集 | 来源全浅色，本期不做，token 已按语义命名预留 |
 | 3 | Windows 端 chrome 差异（交通灯→Win 标题栏） | W1–W4/S1 框架 | P1 平台再定，本文只覆盖 macOS |
-| 4 | P1 预览卡占位图（现为纯色+水印） | P1 | 后续定静态本地图片或渐变 |
+| 4 | ~~P1 预览卡占位图~~ **已澄清（2026-11-21）**：预览卡 = 远端设备缓存桌面快照，非装饰图；三态规格见 §6 P1。本期 mock 一律走「态 B 无快照」，不造假图。真实快照的采集/缓存/失效策略属 M2-6 | P1 | 已闭环 |
 | 5 | W2 双栏联动滚动/排序 | W2 | 先独立后联动（M2-6 前不必做） |
 | 6 | 设备类型品牌徽标（Lucide 无 apple/Android） | 侧栏/P3 图标 | 本期形状图标；如需品牌观感再引入自定义 SVG 资产 |
-| 7 | gpui-kit 具体组件 API 版本差 | 实现细节 | 实现首轮以 examples 校准后回填本文 §8 |
+| 7 | S1 视频接入走 A（原生层叠加）还是 B（帧转 Web） | 延迟与实现复杂度 | 开工首项 spike 定；A 优先（见 §8.5） |
+| 8 | 是否引入前端构建链（Vite/TS） | 前端工程化 | 本期不引入，纯静态；若复杂度上升再评估 |
+| 9 | Windows 端 WebView2 运行时依赖 | 分发 | WebView2 已预装于 Win10+；旧系统需引导安装，属打包期事项 |
 
 ---
 
@@ -654,6 +774,7 @@ UDP LAN
 
 | 日期 | 变更 |
 |---|---|
-| 2026-11-21 | 初版（12 屏 + tokens + 组件规格） |
-| 2026-11-21 | 自查修订：mock 数据全量内联（§6.0，清除对参考图的依赖）；补 Checkbox/ProgressBar/Toast/ConfirmDialog/ButtonDanger/Badge 五组件规格；修正 Lucide 无品牌图标的设备映射；统一字号 token（SIZE_H1=20、新增 SIZE_TITLE）；补 App 初始状态、S2「需关注」判定规则、发送/退出远控等交互定义；§2 窗口表补 S4 与最小尺寸；修正 O3/S2 气泡箭头方向 |
+| 2026-11-21 | 初版（12 屏 + tokens + 组件规格），实现载体 GPUI |
+| 2026-11-21 | 自查修订：mock 数据全量内联（§6.0，清除对参考图的依赖）；补 Checkbox/ProgressBar/Toast/ConfirmDialog/ButtonDanger/Badge 五组件规格；修正 Lucide 无品牌图标的设备映射；统一字号 token（SIZE_H1=20、新增 SIZE_TITLE）；补 App 初始状态、S2「需关注」判定规则、发送/退出远控等交互定义；§2 窗口表补 S4 与最小窗尺寸；修正 O3/S2 气泡箭头方向 |
 | 2026-11-21 | 元素级审查修订：新增 §3.6 布局定位参数（标题栏/侧栏/各屏容器间距、图标默认尺寸与颜色、popover/modal/toast 定位规则），补齐「位置」要素；§9 增元素级抽查法（四要素：位置/颜色/尺寸/内容） |
+| 2026-11-21 | **框架改选 Tauri v2（2.12.7）+ 纯静态前端**，全面重写 §8：新增 §8.0 选型依据（含 GPUI/Dioxus/Tauri 三方对比与内存实测数据）、§8.1 目录结构、§8.2 CSS 组件映射、§8.3 多窗口、§8.4 接线点、§8.5 S1 视频接入双路径、§8.6 实现注意；§3.5 图标来源改为 Web 侧 Lucide；§9 验收改为可脚本化截图 + 毛玻璃加分项；§10 未决项更新 |

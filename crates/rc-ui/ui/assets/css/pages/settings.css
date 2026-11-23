@@ -1,0 +1,414 @@
+/* settings.css —— W1 设置窗口
+ *
+ * 唯一依据：docs/reference/design/08-ui-design.md §2 / §6 W1
+ * 约束：色值一律引用 tokens.css 的 var(--*)，禁止裸写 #xxx / rgb / rgba。
+ * 共用组件（Switch / Select / Button / Toast / 交通灯）唯一实现在 base.css。
+ */
+
+body[data-page="settings"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: var(--bg-canvas);
+}
+
+.rc-window {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 660px;
+  height: 640px;
+  overflow: hidden;
+  background: var(--bg-canvas);
+  border: 1px solid var(--stroke-popover);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-popover);
+  color: var(--text-primary);
+}
+
+/* ── 顶栏 + TabsTop：紧凑原生系统设置质感 ────────────────────── */
+.rc-window__titlebar {
+  height: 44px;
+  padding: 0 var(--sp-page) 0 var(--pad-titlebar-x);
+  background: var(--bg-canvas);
+}
+
+.rc-tabs {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  gap: 6px;
+  height: 52px;
+  padding-bottom: 6px;
+  background: var(--bg-canvas);
+  border-bottom: 1px solid var(--divider);
+}
+
+.rc-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 16px;
+  border: 1px solid transparent;
+  border-radius: var(--r-row);
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.rc-tab .rc-icon {
+  color: var(--text-secondary);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.rc-tab:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.rc-tab.is-active:hover {
+  background: var(--bg-window);
+}
+
+.rc-tab:focus {
+  outline: none;
+}
+
+.rc-tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.rc-tab.is-active {
+  background: var(--bg-window);
+  border-color: var(--stroke-soft);
+  box-shadow: var(--shadow-row);
+  color: var(--text-primary);
+}
+
+.rc-tab.is-active .rc-icon {
+  color: var(--accent);
+}
+
+/* ── 内容区：冷灰画布上的纯白分层卡片 ──────────────────────────── */
+.rc-settings {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1;
+  min-height: 0;
+  padding: 20px 28px 28px;
+  overflow-y: auto;
+}
+
+.rc-settings__stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 600px;
+  max-width: 100%;
+}
+
+.rc-group {
+  overflow: hidden;
+  background: var(--bg-window);
+  border: 1px solid var(--stroke-soft);
+  border-radius: var(--r-card);
+  box-shadow: var(--shadow-card);
+}
+
+.rc-setting-row {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  min-height: 48px;
+  padding: 12px 18px;
+}
+
+.rc-setting-row + .rc-setting-row {
+  border-top: 1px solid var(--divider);
+}
+
+.rc-setting-row__main {
+  flex: 1;
+  min-width: 0;
+}
+
+.rc-setting-row__title {
+  color: var(--text-primary);
+  font-size: var(--size-body);
+  font-weight: var(--font-weight-medium);
+  line-height: 20px;
+}
+
+.rc-setting-row__desc {
+  margin-top: 3px;
+  color: var(--text-secondary);
+  font-size: var(--size-secondary);
+  line-height: 18px;
+}
+
+.rc-setting-row__path {
+  margin-top: 4px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--size-caption);
+  line-height: 18px;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.rc-setting-row__control {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 8px;
+}
+
+.rc-setting-row__static {
+  flex: none;
+  color: var(--text-secondary);
+  font-size: var(--size-secondary);
+  line-height: 20px;
+  cursor: default;
+  user-select: none;
+}
+
+.rc-setting-row--note {
+  align-items: flex-start;
+}
+
+/* ── 网络设置控件：文本输入 / 端口对 / 连接状态徽标 ─────────────── */
+.rc-input {
+  height: var(--control-h);
+  padding: 0 11px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-row);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  line-height: normal;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.rc-input::placeholder {
+  color: var(--text-secondary);
+}
+
+.rc-input:hover {
+  border-color: var(--stroke-hover);
+}
+
+.rc-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.rc-input:disabled {
+  background: var(--fill-disabled);
+  border-color: var(--stroke-soft);
+  box-shadow: none;
+  color: var(--text-disabled);
+  cursor: default;
+}
+
+.rc-input--host {
+  width: 248px;
+}
+
+.rc-port-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rc-port-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rc-port-field__label {
+  color: var(--text-secondary);
+  font-size: var(--size-caption);
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.rc-input--port {
+  width: 82px;
+  padding: 0 8px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  -moz-appearance: textfield;
+}
+
+.rc-input--port::-webkit-outer-spin-button,
+.rc-input--port::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.rc-port-sep {
+  color: var(--text-disabled);
+  font-size: var(--size-secondary);
+  user-select: none;
+}
+
+.rc-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin-top: 5px;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  font-size: var(--size-caption);
+  font-weight: var(--font-weight-medium);
+  line-height: 18px;
+}
+
+.rc-status-badge__dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+}
+
+.rc-status-badge__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.rc-status-badge--disabled {
+  background: var(--bg-card);
+  color: var(--text-secondary);
+}
+
+.rc-status-badge--disabled .rc-status-badge__dot {
+  background: var(--text-disabled);
+}
+
+.rc-status-badge--connecting {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.rc-status-badge--connecting .rc-status-badge__dot {
+  background: var(--warning);
+}
+
+.rc-status-badge--connected {
+  background: var(--success-bg);
+  color: var(--success-fg);
+}
+
+.rc-status-badge--connected .rc-status-badge__dot {
+  background: var(--online);
+  box-shadow: var(--online-glow);
+}
+
+.rc-status-badge--error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.rc-status-badge--error .rc-status-badge__dot {
+  background: var(--danger);
+}
+
+.rc-setting-row__detail {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  margin-top: 6px;
+  color: var(--text-secondary);
+  font-size: var(--size-caption);
+  line-height: 18px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.rc-setting-row__detail[hidden] {
+  display: none;
+}
+
+.rc-setting-row__detail--error {
+  color: var(--danger);
+}
+
+.rc-setting-row__detail--ok {
+  color: var(--success-fg);
+}
+
+.rc-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  color: var(--text-secondary);
+  font-size: var(--size-body);
+}
+
+body.rc-preview-mode {
+  display: block;
+  min-height: 0;
+  background: var(--bg-window);
+}
+
+body.rc-preview-mode .rc-window {
+  display: none;
+}
+
+.rc-settings__stack[hidden],
+.rc-empty[hidden] {
+  display: none;
+}
+
+/* Tauri 真窗口内铺满视口 */
+body.is-tauri {
+  display: block;
+  min-height: 0;
+  background: var(--bg-canvas);
+}
+
+body.is-tauri .rc-window {
+  width: 100%;
+  height: 100vh;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rc-tab,
+  .rc-tab .rc-icon,
+  .rc-input {
+    transition: none;
+  }
+}

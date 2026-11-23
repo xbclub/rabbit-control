@@ -1,0 +1,58 @@
+[package]
+name = "rc-host-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "RabbitControl macOS 被控端驻留 UI：菜单栏托盘与连接审批弹窗（T22 / M2-7）。"
+
+# state 与 bridge 为无 AppKit 依赖的纯逻辑模块，全平台编译可测；
+# AppKit 实现本体（appkit.rs）仅在 macOS 编译。
+[dependencies]
+rc-session = { path = "../rc-session" }
+
+# 版本线与 rc-render-macos 严格一致（objc2 0.6 / 平台绑定 0.3），
+# 保持 default-features = false + 精确 feature 列表，避免双份 objc2 与无用绑定。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSDate",
+    "NSGeometry",
+    "NSObject",
+    "NSRunLoop",
+    "NSString",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSAlert",
+    "NSApplication",
+    "NSButton",
+    "NSControl",
+    "NSEvent",
+    "NSImage",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+    "NSWindow",
+    "objc2-core-foundation",
+] }
+
+[features]
+# 真机托盘基准（需要 macOS GUI 登录会话，无需 TCC 权限；非默认开启）。
+tray-bench = []
+
+# NSStatusItem / NSAlert 为 MainThreadOnly 类型：harness = false 让 fn main
+# 运行在主线程（libtest 的测试体永远在工作线程）。required-features 让默认
+# `cargo test --workspace` 完全跳过本目标；显式 --features tray-bench 才编译。
+[[test]]
+name = "tray_bench"
+harness = false
+required-features = ["tray-bench"]

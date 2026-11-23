@@ -1,0 +1,162 @@
+/* tokens.css —— 统一视觉 Design Tokens（对齐 UU 远控 macOS 原生质感）
+ *
+ * 唯一依据：docs/reference/design/08-ui-design.md §3
+ * 铁律：本文件的 :root 是全站唯一色值来源；base.css 与 pages/*.css 严禁裸写
+ *       #xxx / rgb(...) / rgba(...)，一律引用 var(--*)。
+ */
+
+:root {
+  /* ── 1. 三层表面体系（画布冷灰 → 卡片纯白 → 内嵌浅灰）─────────────── */
+  --bg-canvas: #F5F6F8;
+  --bg-window: #FFFFFF;
+  --bg-sidebar: #F5F6F8;
+  --bg-card: #F7F8FA;
+  --bg-hover: rgba(0, 0, 0, 0.045);
+  --bg-active: rgba(0, 0, 0, 0.08);
+  --bg-tool-tile: #F2F6FF;
+  --bg-tool-tile-hover: #E6EEFF;
+  --bg-tool-tile-stroke: rgba(51, 112, 255, 0.12);
+  --bg-zebra: #FAFAFC;
+
+  /* 控件实底（Switch 关态 / 进度条槽 / 禁用按钮） */
+  --fill-off: #E2E4E9;
+  --fill-disabled: #F0F1F4;
+
+  /* ── 2. 品牌与语义色 ───────────────────────────────────────────── */
+  --accent: #3370FF;
+  --accent-hover: #2962E8;
+  --accent-pressed: #2254CC;
+  --accent-soft: rgba(51, 112, 255, 0.10);
+  --accent-ring: rgba(51, 112, 255, 0.18);
+  --accent-shadow: 0 1px 3px rgba(51, 112, 255, 0.28);
+
+  --text-primary: #1D2129;
+  --text-secondary: #6E7685;
+  --text-display-num: #3A4250;
+  --text-disabled: #B4B9C4;
+  --on-accent: #FFFFFF;
+
+  --online: #23C343;
+  --online-glow: 0 0 0 2.5px rgba(35, 195, 67, 0.18);
+
+  --success-bg: #E8F9EE;
+  --success-fg: #00A83F;
+  --local-pill-bg: #EBF2FF;
+  --local-pill-fg: #2B65F5;
+
+  --danger: #F53F3F;
+  --danger-hover: #E03131;
+  --danger-soft: rgba(245, 63, 63, 0.10);
+  --warning: #E87000;
+  --warning-bg: #FFF4E5;
+
+  --pill-online-bg: #1D2129;
+  --pill-online-fg: #FFFFFF;
+
+  /* ── 3. 发丝分割与描边 ─────────────────────────────────────────── */
+  --divider: rgba(0, 0, 0, 0.06);
+  --divider-sidebar: rgba(0, 0, 0, 0.075);
+  --stroke: rgba(0, 0, 0, 0.10);
+  --stroke-hover: rgba(0, 0, 0, 0.18);
+  --stroke-soft: rgba(0, 0, 0, 0.06);
+  --stroke-popover: rgba(0, 0, 0, 0.09);
+  --stroke-control: rgba(0, 0, 0, 0.18);
+  --scroll-thumb: rgba(0, 0, 0, 0.16);
+  --scroll-thumb-hover: rgba(0, 0, 0, 0.28);
+
+  /* ── 4. 深色区 Token（预览台 / 终端 / HUD / 毛玻璃 / 遮罩）───────── */
+  --stage-bg: #1F2229;
+  --stage-bg-center: #272B34;
+  --stage-rim: rgba(255, 255, 255, 0.07);
+  --stage-fg: rgba(255, 255, 255, 0.92);
+  --stage-muted: rgba(255, 255, 255, 0.48);
+  --stage-emblem-bg: rgba(255, 255, 255, 0.07);
+  --stage-emblem-border: rgba(255, 255, 255, 0.10);
+  --stage-icon: rgba(255, 255, 255, 0.72);
+  --stage-glass: rgba(255, 255, 255, 0.13);
+  --stage-glass-hover: rgba(255, 255, 255, 0.22);
+  --stage-glass-stroke: rgba(255, 255, 255, 0.20);
+  --stage-scrim: rgba(0, 0, 0, 0.30);
+  --stage-scrim-offline: rgba(0, 0, 0, 0.48);
+
+  --terminal-bg: #1A1B1F;
+  --terminal-bar: #24262B;
+  --terminal-border: rgba(255, 255, 255, 0.08);
+  --terminal-tag-bg: rgba(255, 255, 255, 0.06);
+  --terminal-tag-border: rgba(255, 255, 255, 0.14);
+  --terminal-fg: #F2F3F5;
+  --terminal-muted: #8E939E;
+
+  --hud-bg: rgba(20, 22, 26, 0.82);
+  --hud-border: rgba(255, 255, 255, 0.10);
+  --hud-divider: rgba(255, 255, 255, 0.08);
+
+  --popover-bg: rgba(255, 255, 255, 0.90);
+  --mask: rgba(15, 18, 24, 0.34);
+
+  /* ── 5. 字体与桌面端精致字号 ───────────────────────────────────── */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Segoe UI", "Noto Sans SC", sans-serif;
+  --font-mono: "SF Mono", Menlo, monospace;
+
+  --size-display: 40px;
+  --size-h1: 18px;
+  --size-h2: 15px;
+  --size-title: 14px;
+  --size-body: 13.5px;
+  --size-secondary: 12.5px;
+  --size-caption: 12px;
+  --size-micro: 10px;
+  --size-terminal: 13px;
+
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+
+  --icon-stroke: 1.5;
+
+  /* ── 6. 间距与尺寸 ─────────────────────────────────────────────── */
+  --sp-unit: 4px;
+  --sp-page: 24px;
+  --sp-card-in: 20px;
+  --sidebar-w: 228px;
+  --sidebar-row-h: 36px;
+  --sidebar-icon: 24px;
+
+  --titlebar-h: 52px;
+  --pad-titlebar-x: 12px;
+  --traffic-size: 12px;
+  --traffic-gap: 8px;
+  --traffic-close: #FF5F57;
+  --traffic-min: #FEBC2E;
+  --traffic-zoom: #28C840;
+
+  --session-bar-h: 48px;
+  --row-h: 44px;
+  --toolbar-h: 54px;
+  --control-h: 34px;
+
+  --switch-w: 40px;
+  --switch-h: 24px;
+  --switch-knob: 20px;
+
+  /* ── 7. 圆角与分层阴影 ─────────────────────────────────────────── */
+  --r-card: 12px;
+  --r-hero: 14px;
+  --r-row: 8px;
+  --r-control: 7px;
+  --r-popover: 12px;
+  --r-modal: 14px;
+  --r-pill: 999px;
+
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 14px rgba(0, 0, 0, 0.035);
+  --shadow-hero: 0 2px 8px rgba(0, 0, 0, 0.05), 0 14px 36px rgba(0, 0, 0, 0.07);
+  --shadow-row: 0 1px 2px rgba(0, 0, 0, 0.05), 0 0.5px 1px rgba(0, 0, 0, 0.03);
+  --shadow-popover: 0 12px 32px rgba(0, 0, 0, 0.13), 0 2px 8px rgba(0, 0, 0, 0.06);
+  --shadow-inset-highlight: inset 0 0.5px 0 rgba(255, 255, 255, 0.85);
+  --shadow-hud: 0 8px 24px rgba(0, 0, 0, 0.28);
+
+  /* ── 8. 交互动效 ───────────────────────────────────────────────── */
+  --dur-fast: 140ms;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+}

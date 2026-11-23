@@ -1,0 +1,78 @@
+# rc-ui 自定义 IPC 命令权限（Tauri v2 ACL）
+#
+# 主窗口需要调用：
+#   open_tool_window(kind)  → 打开 W1–W4 独立工具窗口（§8.3）
+#   open_session_window()   → 打开 S1 远控会话窗口（§8.3）
+[[permission]]
+identifier = "allow-window-open"
+description = "允许前端打开工具窗口与会话窗口（设计文档 §8.3 多窗口）。"
+commands.allow = ["open_tool_window", "open_session_window"]
+
+[[permission]]
+identifier = "allow-session-ipc"
+description = "允许前端调用 T21 会话控制、输入桥接、表单校验与剪贴板 IPC 命令。"
+commands.allow = [
+  "list_devices",
+  "parse_connect_target",
+  "open_session",
+  "session_command",
+  "session_snapshot",
+  "send_input_event",
+  "stage_rect",
+  "validate_map_form",
+  "copy_text",
+  "get_host_status",
+  "set_host_enabled",
+  "set_host_password",
+  "respond_approval",
+  "disconnect_host_client",
+  "list_lan_devices",
+  "get_server_config",
+  "save_server_config",
+  "test_server_connection",
+  "file_list_local",
+  "file_mkdir_local",
+  "file_list_remote",
+  "file_mkdir_remote",
+  "file_upload",
+  "file_download",
+  "file_cancel",
+  "file_list_transfers",
+  "file_clear_finished",
+  "file_remove_transfer",
+  "terminal_open",
+  "terminal_input",
+  "terminal_resize",
+  "terminal_close",
+  "portmap_list",
+  "portmap_add",
+  "portmap_toggle",
+  "portmap_delete",
+  "check_permissions",
+  "request_screen_recording_permission",
+  "open_permission_settings",
+  "fit_session_window",
+  "focus_session_window",
+  "close_session_window",
+  "get_app_prefs",
+  "save_stream_prefs",
+  "get_device_snapshots",
+  "get_active_session_info",
+  "refresh_device_id",
+  "set_session_relay_mode",
+  "set_session_watch_only",
+  "set_session_mtls_mode",
+  "get_gate_status",
+  "probe_and_save_server",
+  "fetch_auth_config",
+  "auth_register",
+  "auth_login",
+  "auth_logout",
+  "auth_change_password",
+  "list_my_devices",
+  "rename_my_device",
+  "remove_my_device",
+  "get_security_prefs",
+  "save_security_prefs",
+  "renew_device_cert",
+]

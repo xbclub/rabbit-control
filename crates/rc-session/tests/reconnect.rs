@@ -112,6 +112,8 @@ fn new_host(clock: &SessionClock) -> HostSession {
             handshake_timeout: Duration::from_secs(5),
             injector: Box::new(RecordingInjector),
             pace_capture: true, // 工厂假后端必须节流（坑 4）
+            auth: rc_session::HostAuthConfig::default(),
+            approver: Box::new(rc_session::AutoApprover),
         },
         SERVER_CERT_PEM,
         SERVER_KEY_PEM,
@@ -133,6 +135,7 @@ fn new_client(host_addr: SocketAddr, session_id: u64, clock: &SessionClock) -> C
             handshake_timeout: Duration::from_secs(5),
             capture: Box::new(IdleCapture),
             input_window: rc_input::DEFAULT_WINDOW,
+            auth: rc_session::ClientAuthConfig::default(),
         },
         // 本端端点身份（rc-net 的端点构造对 Controller 角色也要求身份；
         // 对端不校验客户端证书，测试两端共用同一份自签身份）。

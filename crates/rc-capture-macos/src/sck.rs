@@ -173,6 +173,16 @@ impl SckBackend {
 
 impl CaptureBackend for SckBackend {
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<CapturedFrame>> {
+        std::thread_local! {
+            static QOS_PROMOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        QOS_PROMOTED.with(|promoted| {
+            if !promoted.get() {
+                crate::promote_current_thread_qos();
+                promoted.set(true);
+            }
+        });
+
         // 已失效：持续返回错误，直到上层 rebuild（C4）。
         if let Some(reason) = self.invalidation {
             return Err(reason.to_capture_error(self.invalidation_msg.clone()));

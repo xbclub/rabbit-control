@@ -61,7 +61,7 @@ rabbitControl/
 │   ├── rc-proto/                 # protobuf 生成 + 手写媒体包头
 │   ├── rc-session/               # 会话状态机（纯逻辑）
 │   ├── rc-loopback/              # 回环测试框架 + 网络损伤注入
-│   ├── rc-ui/                    # 界面（GPUI + gpui-kit，设计规范见 08-ui-design.md）
+│   ├── rc-ui/                    # 界面（Tauri v2 + 静态前端，设计规范见 08-ui-design.md）
 │   └── rc-cli/                   # 二进制入口
 └── xtask/                        # 构建脚本任务（非 workspace 成员可选）
 ```

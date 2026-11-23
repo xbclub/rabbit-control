@@ -106,7 +106,7 @@ pub struct KEYBDINPUT {
 
 /// `INPUT` 的联合体部分。
 #[repr(C)]
-#[allow(non_snake_case)]
+#[allow(non_snake_case, non_camel_case_types)]
 pub union INPUT_UNION {
     /// 鼠标事件。
     pub mi: MOUSEINPUT,

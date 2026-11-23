@@ -64,12 +64,76 @@ pub struct FrameObservation {
 /// 重连观测（T17 机制的结果，`--reconnect-at` 演练时填充）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReconnectStats {
-    /// 触发的重连次数（含主动演练与被动断线）。
+    /// 触发的意外断线重连次数（含主动 `--reconnect-at` 演练与被动断线；
+    /// 不含预期的饱和刷新 `Bye(Refresh)`，见 [`Self::refreshes`]）。
     pub attempts: u64,
     /// 末次重连是否以 resume=true 被接受（Welcome host_flags bit0）。
     pub resumed: bool,
     /// 重连成功到首个 IDR 帧上屏的毫秒数。
     pub recovery_ms: Option<u64>,
+    /// 预期的时钟饱和刷新重建次数（`Bye(Refresh)`，不参与 `resumed` Gate 失败判定）。
+    pub refreshes: u64,
+}
+
+/// 剪贴板同步报告段（T20；嵌入两侧报告 `session.clipboard` 字段，键名只增不改名）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClipboardReport {
+    /// 本次会话是否启用了剪贴板同步。
+    pub enabled: bool,
+    /// 实际发出的通知数。
+    pub sent: u64,
+    /// 收到并接受（写入本机）的通知数。
+    pub received: u64,
+    /// 本地变更 == 自己刚写入的值（回声抑制）。
+    pub echo_suppressed: u64,
+    /// 窗口内被合并进挂起槽的变更数。
+    pub coalesced: u64,
+    /// 超上限被整条丢弃的变更数（绝不截断）。
+    pub oversize_dropped: u64,
+    /// 非文本 / 非 UTF-8 变更数。
+    pub non_text_dropped: u64,
+    /// 被对端后到权威作废的本地挂起值次数。
+    pub superseded_local: u64,
+    /// 未启用时收到的通知数（计数、不写入、不拆会话）。
+    pub received_while_disabled: u64,
+}
+
+impl ClipboardReport {
+    /// 由启用标志与 [`crate::clipboard::ClipboardStats`] 构造报告段。
+    pub fn from_stats(enabled: bool, stats: crate::clipboard::ClipboardStats) -> Self {
+        Self {
+            enabled,
+            sent: stats.sent,
+            received: stats.received,
+            echo_suppressed: stats.echo_suppressed,
+            coalesced: stats.coalesced,
+            oversize_dropped: stats.oversize_dropped,
+            non_text_dropped: stats.non_text_dropped,
+            superseded_local: stats.superseded_local,
+            received_while_disabled: stats.received_while_disabled,
+        }
+    }
+
+    /// 序列化为固定 schema 的 JSON 对象（不含外层 `"clipboard":` 键名）。
+    pub fn to_json(&self) -> String {
+        format!(
+            concat!(
+                "{{\"enabled\":{en},\"sent\":{sent},\"received\":{recv},",
+                "\"echo_suppressed\":{echo},\"coalesced\":{coal},",
+                "\"oversize_dropped\":{over},\"non_text_dropped\":{nont},",
+                "\"superseded_local\":{sup},\"received_while_disabled\":{dis}}}"
+            ),
+            en = self.enabled,
+            sent = self.sent,
+            recv = self.received,
+            echo = self.echo_suppressed,
+            coal = self.coalesced,
+            over = self.oversize_dropped,
+            nont = self.non_text_dropped,
+            sup = self.superseded_local,
+            dis = self.received_while_disabled,
+        )
+    }
 }
 
 /// client 会话驱动循环结束时交出的全部原始观测（铁律 4：报告组装
@@ -78,9 +142,15 @@ pub struct ReconnectStats {
 pub struct SessionObservations {
     /// 全部帧的跨钟域观测（含未上屏帧，供 lost/decode_errors 计数）。
     pub frames: Vec<FrameObservation>,
-    /// 请求的测量时长（微秒）——fps 分母，不含排空（对齐
+    /// 请求的测量时长（微秒，u64 消除 71.6min 饱和）——fps 分母，不含排空（对齐
     /// rc-loopback「fps_uses_measurement_duration_not_drain_time」口径）。
-    pub duration_us: u32,
+    pub duration_us: u64,
+    /// 跨 `ControllerPipeline` 重建的无界累计上屏帧数（H4）。
+    ///
+    /// `Some(n)` 时 `frames.displayed` 与 `fps.displayed` 采用该无界累计值（消除
+    /// trace 环形缓冲 4096 帧上限与管线重建清零失真），同时保留 `frames` 供分位数与
+    /// 分段均值计算；`None` 时回退到 `frames` 统计（兼容手工构造的单元观测）。
+    pub total_displayed: Option<u64>,
     /// 从 client 进程 Endpoint 创建**之前**到首帧 Presented 的微秒数。
     /// None = 全程无帧上屏。计时起点定在 Endpoint 创建之前并写死在这里
     /// （真机 LAN 上主要耗时在证书加载与 Endpoint 建立，坑 3），避免
@@ -106,6 +176,8 @@ pub struct SessionObservations {
     pub net: rc_net::NetStats,
     /// 重连观测。
     pub reconnect: ReconnectStats,
+    /// 剪贴板同步统计快照（T20）。
+    pub clipboard: ClipboardReport,
     /// 会话号。
     pub session_id: u64,
 }
@@ -174,6 +246,7 @@ struct SessionSection {
     bytes_sent: u64,
     bytes_recv: u64,
     reconnect: ReconnectStats,
+    clipboard: ClipboardReport,
 }
 
 /// client 会话报告。JSON 键名对齐 rc-loopback 报告（40-diagnostics.md §4
@@ -235,22 +308,14 @@ impl SessionReport {
         let latency_p95_ms = percentile(&mut e2e_ms, 95.0);
         let latency_p99_ms = percentile(&mut e2e_ms, 99.0);
 
-        // fps：分母是请求的测量时长（不含排空）。
-        let duration_s = f64::from(obs.duration_us) / 1_000_000.0;
-        let displayed_fps = if duration_s > 0.0 {
-            displayed.len() as f64 / duration_s
-        } else {
-            0.0
-        };
-
         // 帧计数（client 可观测结局）。
-        let mut frames_displayed = 0u64;
+        let mut frames_displayed_from_trace = 0u64;
         let mut frames_lost_in_network = 0u64;
         let mut frames_decode_errors = 0u64;
         let mut frames_unfinished = 0u64;
         for f in &obs.frames {
             match f.outcome {
-                Some(Outcome::Displayed) => frames_displayed += 1,
+                Some(Outcome::Displayed) => frames_displayed_from_trace += 1,
                 Some(Outcome::LostInNetwork) => frames_lost_in_network += 1,
                 Some(Outcome::DecodeError) => frames_decode_errors += 1,
                 None => frames_unfinished += 1,
@@ -258,6 +323,17 @@ impl SessionReport {
                 _ => {}
             }
         }
+        // H4：优先使用跨管线重建的无界累计上屏帧数；未提供时回退到 trace 统计。
+        let frames_displayed = obs.total_displayed.unwrap_or(frames_displayed_from_trace);
+
+        // fps：分母是请求的测量时长（不含排空，u64 消除 71.6min 饱和）。
+        let duration_s = obs.duration_us as f64 / 1_000_000.0;
+        let displayed_fps = if duration_s > 0.0 {
+            let fps_numerator = obs.total_displayed.unwrap_or(displayed.len() as u64);
+            fps_numerator as f64 / duration_s
+        } else {
+            0.0
+        };
 
         // 分段均值（对上屏帧；段缺席的帧不计入该段分母）。
         let mean = |vals: &[f64]| {
@@ -302,8 +378,11 @@ impl SessionReport {
         // 收敛 / 退化（记录但不进 Gate）。
         let mut presented: Vec<u32> = displayed.iter().filter_map(|f| f.presented_us).collect();
         presented.sort_unstable();
-        let (convergence_ms, degradation_ms) =
-            scan_presented_windows(&presented, obs.duration_us, cfg.fps);
+        let (convergence_ms, degradation_ms) = scan_presented_windows(
+            &presented,
+            u32::try_from(obs.duration_us).unwrap_or(u32::MAX),
+            cfg.fps,
+        );
 
         // 输入单向延迟 p50。
         let mut input_samples_ms: Vec<f64> = obs
@@ -330,6 +409,7 @@ impl SessionReport {
             bytes_sent: obs.net.bytes_sent,
             bytes_recv: obs.net.bytes_recv,
             reconnect: obs.reconnect,
+            clipboard: obs.clipboard,
         };
 
         let gate = SessionGateResult {
@@ -484,6 +564,11 @@ impl SessionReport {
         self.session.input_one_way_p50_ms
     }
 
+    /// 剪贴板同步报告段（T20）。
+    pub fn clipboard(&self) -> ClipboardReport {
+        self.session.clipboard
+    }
+
     /// 输出固定 schema 的 JSON（手写，不引 serde；escape 对齐
     /// rc-loopback/src/report.rs 的实现）。
     pub fn to_json(&self) -> String {
@@ -528,7 +613,8 @@ impl SessionReport {
                 "\"input_one_way_p50_ms\":{iow},",
                 "\"idr_requests\":{idrr},\"idr_acks\":{idra},\"watchdog_fires\":{wd},",
                 "\"loss_rate\":{loss},\"bytes_sent\":{bsent},\"bytes_recv\":{brecv},",
-                "\"reconnect\":{{\"attempts\":{rat},\"resumed\":{rres},\"recovery_ms\":{rrec}}}}},",
+                "\"reconnect\":{{\"attempts\":{rat},\"resumed\":{rres},\"recovery_ms\":{rrec},\"refreshes\":{rref}}},",
+                "\"clipboard\":{clip}}},",
                 "\"gate\":{{\"connect_to_first_frame_ms_max\":{gc2f},\"p50_ms_max\":{gp50},",
                 "\"p99_ms_max\":{gp99},\"displayed_fps_min\":{gfps},",
                 "\"input_one_way_margin_ms\":{gmar},\"reconnect_recovery_ms_max\":{grec},",
@@ -572,6 +658,8 @@ impl SessionReport {
             rat = s.reconnect.attempts,
             rres = s.reconnect.resumed,
             rrec = opt_u64(s.reconnect.recovery_ms),
+            rref = s.reconnect.refreshes,
+            clip = s.clipboard.to_json(),
             gc2f = format_f64(g.connect_to_first_frame_ms_max),
             gp50 = format_f64(g.p50_ms_max),
             gp99 = format_f64(g.p99_ms_max),
@@ -661,7 +749,7 @@ fn scan_presented_windows(
         {
             break;
         }
-        end = (end + WINDOW_STEP_US).min(elapsed_us);
+        end = end.saturating_add(WINDOW_STEP_US).min(elapsed_us);
     }
     (convergence, degradation)
 }
@@ -746,6 +834,7 @@ mod tests {
         SessionObservations {
             frames,
             duration_us: 1_000_000,
+            total_displayed: None,
             connect_to_first_frame_us: Some(62_500),
             rtt_us: Some(480),
             clock_offset_us: Some(-35),
@@ -756,6 +845,7 @@ mod tests {
             max_reassembly_depth: 2,
             net: rc_net::NetStats::default(),
             reconnect: ReconnectStats::default(),
+            clipboard: ClipboardReport::default(),
             session_id: 1234567890,
         }
     }
@@ -882,6 +972,16 @@ mod tests {
             "\"bytes_sent\"",
             "\"bytes_recv\"",
             "\"reconnect\"",
+            "\"clipboard\"",
+            "\"enabled\"",
+            "\"sent\"",
+            "\"received\"",
+            "\"echo_suppressed\"",
+            "\"coalesced\"",
+            "\"oversize_dropped\"",
+            "\"non_text_dropped\"",
+            "\"superseded_local\"",
+            "\"received_while_disabled\"",
         ] {
             assert!(json.contains(key), "session 段缺少 {key}：{json}");
         }
@@ -1009,6 +1109,7 @@ mod tests {
             attempts: 1,
             resumed: true,
             recovery_ms: Some(300),
+            refreshes: 0,
         };
         let r = SessionReport::from_observations(&cfg_snapshot(), &obs);
         assert!(r.gate.passed, "{:?}", r.gate.failures);
@@ -1023,6 +1124,7 @@ mod tests {
             attempts: 1,
             resumed: true,
             recovery_ms: Some(600),
+            refreshes: 0,
         };
         let r = SessionReport::from_observations(&cfg_snapshot(), &obs);
         assert!(r.gate.failures.iter().any(|f| f.contains("recovery")));
@@ -1061,7 +1163,11 @@ mod tests {
         let obs = healthy_obs();
         let mut presented: Vec<u32> = obs.frames.iter().filter_map(|f| f.presented_us).collect();
         presented.sort_unstable();
-        let (conv, degr) = scan_presented_windows(&presented, obs.duration_us, 60);
+        let (conv, degr) = scan_presented_windows(
+            &presented,
+            u32::try_from(obs.duration_us).unwrap_or(u32::MAX),
+            60,
+        );
         // 60 帧均匀 16.67ms：任意满 1s 窗口都有 ~60 帧 ≥ 54 → 1000ms 收敛。
         assert_eq!(conv, Some(1000), "满速时间线应 1000ms 收敛");
         assert_eq!(degr, None, "满速不退化");
@@ -1092,6 +1198,61 @@ mod tests {
                 .any(|f| f.contains("输入单向延迟样本")),
             "{:?}",
             report.gate.failures
+        );
+    }
+
+    /// H4 回归：超 71.6min 的 u64 时长（如 2h = 7_200_000_000µs）+ 超 4096 帧
+    /// trace 上限的 `total_displayed` 准确计算 `frames.displayed` 与 `fps.displayed`，
+    /// 分位数与分段均值仍来自 `obs.frames`。
+    #[test]
+    fn report_uses_u64_duration_and_unbounded_total_displayed() {
+        let mut obs = healthy_obs();
+        let two_hours_us: u64 = 7_200_000_000; // > u32::MAX (4_294_967_295)
+        let two_hours_frames: u64 = 7_200 * 60; // 432_000 >> 4096
+        obs.duration_us = two_hours_us;
+        obs.total_displayed = Some(two_hours_frames);
+
+        let mut cfg = cfg_snapshot();
+        cfg.duration_s = 7_200.0;
+        let report = SessionReport::from_observations(&cfg, &obs);
+        assert_eq!(report.frames_displayed, two_hours_frames);
+        assert!(
+            (report.displayed_fps - 60.0).abs() < 0.01,
+            "2h 无界 fps 应为 60.0，实际 {}",
+            report.displayed_fps
+        );
+        assert!(
+            (report.latency_p50_ms - 10.5).abs() < 0.01,
+            "分位数仍由 obs.frames 算出"
+        );
+        assert!(
+            report.gate.passed,
+            "2h 健康 soak 应过 Gate: {:?}",
+            report.gate.failures
+        );
+    }
+
+    /// H5 回归：仅有预期的 `Bye(Refresh)` 纪元重建（`attempts=0, refreshes=1, resumed=false`）
+    /// 不得误触发「重连 resume 被拒（resumed=false）」导致 Gate 失败。
+    #[test]
+    fn refresh_only_reconnect_stats_passes_gate() {
+        let mut obs = healthy_obs();
+        obs.reconnect = ReconnectStats {
+            attempts: 0,
+            resumed: false,
+            recovery_ms: None,
+            refreshes: 1,
+        };
+        let report = SessionReport::from_observations(&cfg_snapshot(), &obs);
+        assert!(
+            report.gate.passed,
+            "纯饱和刷新不应被误判为 resume 被拒：{:?}",
+            report.gate.failures
+        );
+        let json = report.to_json();
+        assert!(
+            json.contains("\"refreshes\":1"),
+            "JSON 应包含 refreshes 字段：{json}"
         );
     }
 }

@@ -43,6 +43,20 @@ impl Injector<CgPoster> {
         let screen = crate::ffi::screen_bounds();
         Ok(Self { poster, screen })
     }
+
+    /// 生产构造（主显示器模式）：辅助功能预检 → `CGEventSource`（HIDSystemState）→
+    /// 主显示器边界（`CGDisplay::main().bounds()`）。
+    ///
+    /// 与 `rc-capture-macos` 默认采集主显示器（`display = 0`）严格对齐，多显示器下
+    /// 不会把主屏归一化坐标映射到包含副屏的联合边界。
+    pub fn for_main_display() -> Result<Self, InputError> {
+        if !crate::ffi::ax_is_process_trusted() {
+            return Err(InputError::NotTrusted);
+        }
+        let poster = CgPoster::new()?;
+        let screen = crate::ffi::main_display_bounds();
+        Ok(Self { poster, screen })
+    }
 }
 
 impl<P: EventPoster> Injector<P> {
@@ -59,9 +73,14 @@ impl<P: EventPoster> Injector<P> {
 
     /// 当前使用的屏幕边界（坐标钳制依据，构造时采样）。
     ///
-    /// 注意：热插拔显示器后边界可能过期，上层应重建注入器。
+    /// 注意：热插拔显示器后边界可能过期，上层应重建注入器或调用 [`Self::set_screen_bounds`]。
     pub fn screen_bounds(&self) -> ScreenBounds {
         self.screen
+    }
+
+    /// 更新坐标钳制使用的屏幕边界（例如分辨率动态切换后）。
+    pub fn set_screen_bounds(&mut self, bounds: ScreenBounds) {
+        self.screen = bounds;
     }
 
     /// 注入一条输入事件：翻译（坐标钳制 + 滚动取整 + 键码映射）→ 投递。

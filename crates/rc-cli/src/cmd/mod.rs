@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use rc_types::Resolution;
 
 /// 子命令执行结果：`Err` 的消息由 `main` 打印后 exit 1。
@@ -124,8 +124,8 @@ pub struct ProbeArgs {
     pub json: bool,
 }
 
-/// `host` 子命令参数（被控端，T18）。
-#[derive(Args)]
+/// `host` 子命令参数（被控端，T18 / T22）。
+#[derive(Args, Clone)]
 pub struct HostArgs {
     /// 监听地址。--duration 是「接受连接后的会话时长」：accept 等待期不消耗
     ///（accept 等待上限 300s，超时报错 exit 1）。
@@ -143,8 +143,9 @@ pub struct HostArgs {
     #[arg(long, default_value_t = 8_000_000)]
     pub bitrate_bps: u32,
     /// 会话时长兜底（client 正常关闭发 Bye；到时未收到则自行优雅收尾）。
-    #[arg(long, default_value = "30s", value_parser = parse_duration)]
-    pub duration: Duration,
+    /// headless 模式省略时默认 30s；`--tray` 模式省略时不兜底（显式传值仍按单会话生效）。
+    #[arg(long, value_parser = parse_duration)]
+    pub duration: Option<Duration>,
     /// 静止画面（铁律 2：静止零编码）。fake 后端下构造 FakeContent::Static
     /// 栈；client 侧将观测到零媒体数据报。
     #[arg(long)]
@@ -158,9 +159,38 @@ pub struct HostArgs {
     pub cert: Option<PathBuf>,
     #[arg(long)]
     pub key: Option<PathBuf>,
+    /// 共享密码（启用后要求 client 经 PBKDF2 挑战应答鉴权；省略则不启用密码，T19）。
+    #[arg(long)]
+    pub password: Option<String>,
+    /// 剪贴板文本同步模式：off = 默认关闭（显式授权原则，CB1）；on = 真后端
+    /// （仅 macOS）；scripted = 确定性脚本假后端（CI 免权限，T20）。
+    #[arg(long, default_value = "off", value_parser = parse_clipboard_mode)]
+    pub clipboard: ClipboardMode,
+    /// 常驻托盘模式（仅 macOS；其他平台运行时报错）：菜单栏图标 + 审批弹窗，
+    /// 进程不随单会话退出——会话结束后回到 accept 等待下一条连接（一次一条，T22 U8）。
+    #[arg(long)]
+    pub tray: bool,
+    /// 审批模式：prompt = 弹窗征询（--tray 默认）；auto = 自动接受（headless 默认，
+    /// 保持 T18 行为不变）；deny = 一律拒绝。prompt 必须与 --tray 同用，否则报错 exit 2。
+    #[arg(long, value_enum)]
+    pub approval: Option<ApprovalMode>,
+    /// 审批等待超时（prompt 模式下无人应答按拒绝断开，T22）。
+    #[arg(long, default_value = "30s", value_parser = parse_duration)]
+    pub approval_timeout: Duration,
     /// host 侧摘要 JSON 输出路径；省略或 `-` 表示 stdout（无 gate 段）。
     #[arg(long)]
     pub report: Option<PathBuf>,
+}
+
+/// `host --approval` 取值（T22）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+pub enum ApprovalMode {
+    /// 弹窗征询机主（`--tray` 默认；headless 下不可用）。
+    Prompt,
+    /// 自动接受（headless 默认）。
+    Auto,
+    /// 一律拒绝（回 `Welcome{Rejected}` 并断开）。
+    Deny,
 }
 
 /// `client` 子命令参数（控制端，T18）。
@@ -194,6 +224,13 @@ pub struct ClientArgs {
     /// 证书 SAN 名（须与证书匹配）。
     #[arg(long, default_value = rc_session::dev_cert::DEV_SERVER_NAME)]
     pub server_name: String,
+    /// 共享密码（启用后以 PBKDF2 挑战应答向 host 鉴权；省略则无密码握手，T19）。
+    #[arg(long)]
+    pub password: Option<String>,
+    /// 剪贴板文本同步模式：off = 默认关闭（显式授权原则，CB1）；on = 真后端
+    /// （仅 macOS）；scripted = 确定性脚本假后端（CI 免权限，T20）。
+    #[arg(long, default_value = "off", value_parser = parse_clipboard_mode)]
+    pub clipboard: ClipboardMode,
     /// 报告 JSON 输出路径；省略或 `-` 表示 stdout（含 gate 段）。
     #[arg(long)]
     pub report: Option<PathBuf>,
@@ -242,6 +279,33 @@ pub fn parse_input_mode(s: &str) -> Result<InputMode, String> {
     }
 }
 
+/// `host` / `client` 共用 `--clipboard` 取值（T20）。
+///
+/// - `Off`：默认关闭（敏感面显式授权原则，03-protocol.md:187，CB1）；
+/// - `On`：真实平台剪贴板后端（仅 macOS，非 macOS 报错退出，不做静默空操作）；
+/// - `Scripted`：脚本化假后端（`ScriptedClipboard`，CI 可跑、不碰真实剪贴板）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClipboardMode {
+    /// 关闭剪贴板同步（默认）。
+    Off,
+    /// 启用真实平台剪贴板后端（仅 macOS）。
+    On,
+    /// 启用脚本化假后端（CI 确定性测试用）。
+    Scripted,
+}
+
+/// 解析 `host` / `client` 的 `--clipboard` 参数。
+pub fn parse_clipboard_mode(s: &str) -> Result<ClipboardMode, String> {
+    match s {
+        "off" => Ok(ClipboardMode::Off),
+        "on" => Ok(ClipboardMode::On),
+        "scripted" => Ok(ClipboardMode::Scripted),
+        other => Err(format!(
+            "无效的剪贴板模式 {other:?}：应为 off / on / scripted 之一（on 仅 macOS 支持）"
+        )),
+    }
+}
+
 /// 解析 `WxH` 分辨率。拒绝非数字、缺 `x`、多段、零尺寸。
 pub fn parse_resolution(s: &str) -> Result<Resolution, String> {
     let (w, h) = s
@@ -276,7 +340,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 mod tests {
     // 纯解析函数的单元测试。跑子进程的 CLI 测试在 tests/cli.rs：assert_cmd
     // 依赖的 `CARGO_BIN_EXE_rc-cli` 环境变量只对集成测试注入。
-    use super::{parse_duration, parse_resolution};
+    use super::{parse_clipboard_mode, parse_duration, parse_resolution, ClipboardMode};
     use std::time::Duration;
 
     #[test]
@@ -331,6 +395,23 @@ mod tests {
                 parse_duration(bad).is_err(),
                 "{bad:?} 必须被拒绝，实际 {:?}",
                 parse_duration(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_clipboard_mode_accepts_valid_and_rejects_invalid() {
+        assert_eq!(parse_clipboard_mode("off"), Ok(ClipboardMode::Off));
+        assert_eq!(parse_clipboard_mode("on"), Ok(ClipboardMode::On));
+        assert_eq!(
+            parse_clipboard_mode("scripted"),
+            Ok(ClipboardMode::Scripted)
+        );
+        for bad in ["", "true", "false", "real", "ON"] {
+            assert!(
+                parse_clipboard_mode(bad).is_err(),
+                "{bad:?} 必须被拒绝，实际 {:?}",
+                parse_clipboard_mode(bad)
             );
         }
     }

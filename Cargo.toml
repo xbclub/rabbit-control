@@ -23,13 +23,14 @@ members = [
     "crates/rc-pipeline",
     "crates/rc-net",
     "crates/rc-session",
+    "crates/rc-host-macos",
+    "crates/rc-audio",
+    "crates/rc-tools",
+    "crates/rc-ui",
 ]
-
-# rc-ui（T21 控制端 UI，Tauri v2）：并行 UI 会话的进行中产物（12 屏已过
-# visual-judge 视觉验收，但尚未经 T21 卡的会话接线与全仓门禁整合）。
-# 在 T21 轮把它按卡接入并过门禁前，明确排除出 workspace（Tauri 依赖会
-# 拖垮全仓构建与测试）。目录留盘。
-exclude = ["crates/rc-ui"]
+# server/ 为独立 Rust 服务端 workspace（含 PostgreSQL / Redis / Axum / Linux splice），
+# 与桌面客户端构建彻底隔离，保持客户端日常 cargo check 亚秒级速度。
+exclude = ["server"]
 
 [workspace.package]
 version = "0.1.0"

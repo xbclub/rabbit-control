@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>RabbitControl 需要屏幕录制权限以在被控端采集本机画面与系统音频。</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>RabbitControl 需要系统音频采集权限以将本机音频传输给控制端。</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>RabbitControl 需要本地网络权限以发现局域网内的设备并建立低延迟直连。</string>
+</dict>
+</plist>

@@ -1,0 +1,553 @@
+/* overlay.css —— O1 更多工具 / O2 右上下拉菜单 / O3 账户气泡
+ *
+ * 唯一依据：docs/reference/design/08-ui-design.md
+ * 约束：色值一律引用 tokens.css 的 var(--*)，禁止裸写 #xxx / rgb / rgba。
+ * 基础件（Button / Switch / Select / Toast / 交通灯）唯一实现在 base.css。
+ */
+
+/* ────────────────────────────────────────────────────────────────
+ * 浮层根容器与图标工具
+ * ──────────────────────────────────────────────────────────────── */
+.rc-overlay-root {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  pointer-events: none;
+}
+
+.rc-icon {
+  display: block;
+  flex: none;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Popover 壳（macOS 毛玻璃 + 发丝外描边 + 内高光）
+ * ──────────────────────────────────────────────────────────────── */
+.rc-popover {
+  position: fixed;
+  z-index: 9020;
+  outline: none;
+  border: 1px solid var(--stroke-popover);
+  border-radius: var(--r-popover);
+  background: var(--popover-bg);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  box-shadow: var(--shadow-popover), var(--shadow-inset-highlight);
+  pointer-events: auto;
+  animation: rc-pop-in var(--dur-fast) var(--ease-out);
+}
+
+@keyframes rc-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * O2 右上下拉菜单（NSMenu 质感：蓝底白字悬停高亮）
+ * ──────────────────────────────────────────────────────────────── */
+.rc-menu {
+  width: 196px;
+  padding: 6px;
+}
+
+.rc-menu__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--r-control);
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  line-height: 1;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.rc-menu__item:focus {
+  outline: none;
+}
+
+.rc-menu__item:hover,
+.rc-menu__item:focus-visible {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.rc-menu__item:active {
+  background: var(--accent-pressed);
+  color: var(--on-accent);
+}
+
+.rc-menu__icon {
+  display: inline-flex;
+  color: var(--text-secondary);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.rc-menu__item:hover .rc-menu__icon,
+.rc-menu__item:focus-visible .rc-menu__icon,
+.rc-menu__item:active .rc-menu__icon {
+  color: var(--on-accent);
+}
+
+.rc-menu__sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--divider);
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * O3 账户气泡（顶部箭头朝上，单一圆环柔和徽章头像）
+ * ──────────────────────────────────────────────────────────────── */
+.rc-account {
+  width: 288px;
+  min-height: 210px;
+  padding: 22px 20px 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.rc-account__arrow {
+  position: absolute;
+  top: -6px;
+  left: calc(var(--rc-arrow-x, 50%) - 6px);
+  width: 12px;
+  height: 6px;
+  background: var(--stroke-popover);
+  clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+}
+
+.rc-account__arrow::after {
+  content: "";
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  bottom: 0;
+  left: 1px;
+  background: var(--popover-bg);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+  clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+}
+
+.rc-account__logout {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+}
+
+.rc-account__avatar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border: 1.5px solid var(--bg-tool-tile-stroke);
+  border-radius: var(--r-pill);
+  background: var(--local-pill-bg);
+  color: var(--accent);
+}
+
+.rc-account__phone {
+  margin-top: 12px;
+  color: var(--text-primary);
+  font-size: var(--size-h1);
+  font-weight: var(--font-weight-semibold);
+  line-height: 26px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rc-account__name {
+  max-width: 100%;
+  margin-top: 10px;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: var(--size-h2);
+  font-weight: var(--font-weight-semibold);
+  line-height: 22px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.rc-account__email {
+  max-width: 100%;
+  margin-top: 2px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--size-caption);
+  line-height: 18px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.rc-account__cert {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 10px;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  font-size: var(--size-caption);
+  font-weight: var(--font-weight-medium);
+  line-height: 18px;
+}
+
+.rc-account__cert--ok {
+  background: var(--success-bg);
+  color: var(--success-fg);
+}
+
+.rc-account__cert--warn {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.rc-account__actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 14px;
+}
+
+.rc-account__action-btn {
+  flex: 1;
+  height: 30px;
+  padding: 0 10px;
+  font-size: var(--size-caption);
+}
+
+.rc-account__action-btn--danger:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.rc-account__link {
+  margin-top: 6px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  font-weight: var(--font-weight-medium);
+  line-height: 20px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.rc-account__link:hover {
+  text-decoration: underline;
+}
+
+.rc-account__link:focus {
+  outline: none;
+}
+
+.rc-account__link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * Modal / ConfirmDialog 层
+ * ──────────────────────────────────────────────────────────────── */
+.rc-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--mask);
+  pointer-events: auto;
+}
+
+.rc-layer--confirm {
+  z-index: 9010;
+}
+
+.rc-layer--over {
+  background: transparent;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * O1 更多工具弹窗（宽 420、内边距 22、冰蓝四项 + 白底两项）
+ * ──────────────────────────────────────────────────────────────── */
+.rc-tools {
+  width: 420px;
+  padding: 22px;
+  border: 1px solid var(--stroke-popover);
+  border-radius: var(--r-modal);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-popover), var(--shadow-inset-highlight);
+  outline: none;
+  animation: rc-pop-in var(--dur-fast) var(--ease-out);
+}
+
+.rc-tools__title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: var(--size-h1);
+  font-weight: var(--font-weight-semibold);
+  line-height: 24px;
+}
+
+.rc-tools__list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.rc-tools__item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 54px;
+  padding: 0 16px;
+  border: 1px solid transparent;
+  border-radius: var(--r-row);
+  font-family: var(--font-sans);
+  text-align: left;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.rc-tools__item:focus {
+  outline: none;
+}
+
+.rc-tools__item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.rc-tools__item--tile {
+  background: var(--bg-tool-tile);
+  border-color: var(--bg-tool-tile-stroke);
+}
+
+.rc-tools__item--tile:hover {
+  background: var(--bg-tool-tile-hover);
+  box-shadow: var(--shadow-row);
+}
+
+.rc-tools__item--tile .rc-tools__icon {
+  color: var(--accent);
+}
+
+.rc-tools__item--plain {
+  background: var(--bg-window);
+  border-color: var(--stroke);
+}
+
+.rc-tools__item--tile + .rc-tools__item--plain {
+  margin-top: 6px;
+}
+
+.rc-tools__item--plain:hover {
+  background: var(--bg-card);
+  border-color: var(--stroke-hover);
+  box-shadow: var(--shadow-row);
+}
+
+.rc-tools__item--plain .rc-tools__icon {
+  color: var(--text-secondary);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+.rc-tools__item--plain:hover .rc-tools__icon {
+  color: var(--danger);
+}
+
+.rc-tools__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.rc-tools__label {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: var(--size-title);
+  font-weight: var(--font-weight-medium);
+  line-height: 20px;
+}
+
+.rc-tools__chevron {
+  display: flex;
+  color: var(--text-secondary);
+}
+
+.rc-tools__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 44px;
+  margin-top: 16px;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * ConfirmDialog
+ * ──────────────────────────────────────────────────────────────── */
+.rc-confirm {
+  width: 320px;
+  padding: 22px;
+  border: 1px solid var(--stroke-popover);
+  border-radius: var(--r-modal);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-popover), var(--shadow-inset-highlight);
+  animation: rc-pop-in var(--dur-fast) var(--ease-out);
+}
+
+.rc-confirm__title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: var(--size-h2);
+  font-weight: var(--font-weight-semibold);
+  line-height: 22px;
+}
+
+.rc-confirm__body {
+  margin: 8px 0 0;
+  color: var(--text-secondary);
+  font-size: var(--size-secondary);
+  line-height: 20px;
+}
+
+.rc-confirm__footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 开发预览台（仅 ?preview=o1|o2|o3 / #o1|#o2|#o3 时注入）
+ * ──────────────────────────────────────────────────────────────── */
+.rc-preview {
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  inset: 0;
+  z-index: 8000;
+  background: var(--bg-window);
+}
+
+.rc-preview__bar {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: var(--titlebar-h);
+  padding: 0 16px 0 12px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.rc-preview__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.rc-preview__body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+.rc-preview__sidebar {
+  flex: none;
+  width: var(--sidebar-w);
+  padding: 12px;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--divider);
+}
+
+.rc-preview__content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: 16px;
+  padding: var(--sp-page);
+  overflow: hidden;
+}
+
+.rc-preview__skeleton {
+  height: 36px;
+  margin-bottom: 8px;
+  border-radius: var(--r-row);
+  background: var(--bg-hover);
+}
+
+.rc-preview__skeleton--wide {
+  height: 220px;
+  border-radius: var(--r-card);
+  background: var(--bg-card);
+}
+
+.rc-preview__toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: none;
+  height: var(--toolbar-h);
+  padding: 0 16px 0 var(--sp-page);
+  border-top: 1px solid var(--divider);
+}
+
+.rc-preview__toolhint {
+  color: var(--text-secondary);
+  font-size: var(--size-caption);
+}
+
+body.rc-preview-mode {
+  margin: 0;
+  background: var(--bg-window);
+}
+
+body.rc-preview-mode > #app {
+  visibility: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rc-popover,
+  .rc-tools,
+  .rc-confirm {
+    animation: none;
+  }
+
+  .rc-menu__item,
+  .rc-menu__icon,
+  .rc-tools__item,
+  .rc-tools__item--plain .rc-tools__icon {
+    transition: none;
+  }
+}

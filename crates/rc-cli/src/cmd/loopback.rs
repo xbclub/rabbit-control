@@ -14,6 +14,17 @@ use super::{CliResult, LoopbackArgs};
 
 /// 执行 `loopback` 子命令。Gate 通过返回 SUCCESS，未通过返回 FAILURE。
 pub fn run(args: &LoopbackArgs) -> CliResult<ExitCode> {
+    #[cfg(target_os = "macos")]
+    let _activity = if matches!(args.backend, super::BackendMode::Real) {
+        rc_capture_macos::promote_current_thread_qos();
+        Some(rc_capture_macos::LatencyCriticalActivity::begin(
+            "RabbitControl loopback",
+            true,
+        ))
+    } else {
+        None
+    };
+
     let cfg = LoopbackConfig {
         resolution: args.resolution,
         fps: args.fps,

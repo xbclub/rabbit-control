@@ -1,0 +1,508 @@
+/* terminal.css —— W3 终端窗口
+ *
+ * 唯一依据：docs/reference/design/08-ui-design.md §2 / §6 W3
+ * 约束：色值一律引用 tokens.css 的 var(--*)，禁止裸写 #xxx / rgb / rgba。
+ * 共用组件（交通灯 / 标题栏基础 / 滚动条）唯一实现在 base.css。
+ */
+
+:root {
+  color-scheme: dark;
+}
+
+body[data-page="terminal"] {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  background: var(--bg-canvas);
+}
+
+.tm-window {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100vh;
+  min-width: 720px;
+  min-height: 480px;
+  max-width: 1200px;
+  max-height: 760px;
+  overflow: hidden;
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
+}
+
+@media (min-width: 1201px), (min-height: 761px) {
+  .tm-window {
+    border: 1px solid var(--terminal-border);
+    border-radius: var(--r-card);
+    box-shadow: var(--shadow-popover);
+  }
+}
+
+/* Tauri 真窗口铺满视口 */
+body.is-tauri {
+  display: block;
+  min-height: 0;
+  background: var(--terminal-bg);
+}
+
+body.is-tauri .tm-window {
+  min-width: 0;
+  min-height: 0;
+  max-width: none;
+  max-height: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.tm-titlebar {
+  padding: 0 16px 0 var(--pad-titlebar-x);
+  background: var(--terminal-bar);
+  border-bottom: 1px solid var(--terminal-border);
+}
+
+.tm-title {
+  color: var(--terminal-muted);
+}
+
+.tm-body {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  padding: var(--sp-page);
+  font-family: var(--font-mono);
+}
+
+.tm-body.is-live {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.tm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.tm-row[hidden],
+.tm-status-bar[hidden],
+.tm-screen[hidden],
+.tm-notice[hidden],
+.tm-tag[hidden],
+.tm-btn[hidden] {
+  display: none;
+}
+
+.tm-prompt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tm-tag {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--terminal-tag-border);
+  border-radius: 5px;
+  background: var(--terminal-tag-bg);
+  color: var(--terminal-muted);
+  font-family: var(--font-mono);
+  font-size: var(--size-caption);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.tm-tilde {
+  color: var(--accent);
+  font-size: var(--size-terminal);
+  line-height: 18px;
+}
+
+.tm-chevron {
+  color: var(--online);
+  font-size: var(--size-terminal);
+  line-height: 18px;
+}
+
+.tm-cursor {
+  width: 8px;
+  height: 16px;
+  flex: none;
+  border-radius: 1.5px;
+  background: var(--accent);
+  animation: tm-blink 800ms steps(1, end) infinite;
+}
+
+@keyframes tm-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.tm-timer {
+  flex: none;
+  color: var(--terminal-muted);
+  font-family: var(--font-mono);
+  font-size: var(--size-body);
+  line-height: 20px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ── Tauri 实时交互终端头栏 / 输出区 / 重连态 ──────────────── */
+
+.tm-status-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 36px;
+  padding: 0 16px;
+  background: var(--terminal-bar);
+  border-bottom: 1px solid var(--terminal-border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.tm-status-bar__left,
+.tm-status-bar__right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tm-status-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: var(--r-pill);
+  background: var(--terminal-muted);
+}
+
+.tm-status-dot.is-online {
+  background: var(--online);
+  box-shadow: var(--online-glow);
+}
+
+.tm-status-dot.is-error {
+  background: var(--danger);
+}
+
+.tm-status-text {
+  color: var(--terminal-muted);
+  font-family: var(--font-sans);
+  font-size: var(--size-caption);
+  white-space: nowrap;
+}
+
+.tm-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--terminal-tag-border);
+  border-radius: var(--r-control);
+  background: var(--terminal-tag-bg);
+  color: var(--terminal-fg);
+  font-family: var(--font-sans);
+  font-size: var(--size-caption);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+
+.tm-btn:hover {
+  background: var(--stage-glass-hover);
+  border-color: var(--stage-glass-stroke);
+}
+
+.tm-btn--primary {
+  height: 32px;
+  padding: 0 16px;
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--size-secondary);
+}
+
+.tm-btn--primary:hover {
+  border-color: var(--accent-hover);
+  background: var(--accent-hover);
+}
+
+.tm-screen {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 14px 16px 20px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--terminal-bg);
+  color: var(--terminal-fg);
+  font-family: var(--font-mono);
+  font-size: var(--size-terminal);
+  line-height: 19px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  outline: none;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.tm-line {
+  min-height: 19px;
+}
+
+.tm-line--system {
+  margin-top: 6px;
+  color: var(--terminal-muted);
+}
+
+.tm-live-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  vertical-align: text-bottom;
+  border-radius: 1.5px;
+  background: var(--accent);
+  animation: tm-blink 800ms steps(1, end) infinite;
+}
+
+.tm-ime-input {
+  position: fixed;
+  left: -9999px;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+  resize: none;
+}
+
+.tm-notice {
+  position: absolute;
+  inset: 36px 0 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 24px;
+  background: var(--terminal-bg);
+  text-align: center;
+}
+
+.tm-notice__text {
+  margin: 0;
+  color: var(--terminal-muted);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  line-height: 22px;
+}
+
+/* ── ANSI SGR 样式类（严格仅使用 tokens.css 变量） ──────────── */
+
+.tm-ansi-bold {
+  font-weight: var(--font-weight-semibold);
+}
+
+.tm-ansi-dim {
+  opacity: 0.65;
+}
+
+.tm-ansi-italic {
+  font-style: italic;
+}
+
+.tm-ansi-underline {
+  text-decoration: underline;
+}
+
+.tm-ansi-inverse {
+  background: var(--terminal-fg);
+  color: var(--terminal-bg);
+}
+
+.tm-ansi-fg-muted {
+  color: var(--terminal-muted);
+}
+
+.tm-ansi-fg-red {
+  color: var(--danger);
+}
+
+.tm-ansi-fg-green {
+  color: var(--online);
+}
+
+.tm-ansi-fg-yellow {
+  color: var(--warning);
+}
+
+.tm-ansi-fg-blue {
+  color: var(--accent);
+}
+
+.tm-ansi-fg-magenta {
+  color: var(--accent-hover);
+}
+
+.tm-ansi-fg-cyan {
+  color: var(--local-pill-fg);
+}
+
+.tm-ansi-fg-white {
+  color: var(--terminal-fg);
+}
+
+.tm-ansi-bg-red {
+  background: var(--danger-soft);
+}
+
+.tm-ansi-bg-green {
+  background: var(--success-bg);
+  color: var(--success-fg);
+}
+
+.tm-ansi-bg-yellow {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.tm-ansi-bg-blue {
+  background: var(--accent-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tm-cursor,
+  .tm-live-cursor {
+    animation: none;
+  }
+
+.tm-btn {
+  transition: none;
+}
+}
+
+/* ── 多标签栏（最多 4 个标签，严守 tokens.css 变量） ────────── */
+
+.tm-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px 0;
+  background: var(--terminal-bar);
+  border-bottom: 1px solid var(--terminal-border);
+  overflow-x: auto;
+}
+
+.tm-tabs[hidden] {
+  display: none;
+}
+
+.tm-tabs__list {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.tm-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  max-width: 180px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 6px 6px 0 0;
+  background: transparent;
+  color: var(--terminal-muted);
+  font-family: var(--font-sans);
+  font-size: var(--size-caption);
+  cursor: pointer;
+}
+
+.tm-tab:hover {
+  background: var(--terminal-tag-bg);
+  color: var(--terminal-fg);
+}
+
+.tm-tab.is-active {
+  background: var(--terminal-bg);
+  border-color: var(--terminal-border);
+  color: var(--terminal-fg);
+}
+
+.tm-tab__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tm-tab__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0;
+  background: transparent;
+  color: var(--terminal-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tm-tab__close:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.tm-tabs__add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--terminal-tag-border);
+  border-radius: 5px;
+  background: var(--terminal-tag-bg);
+  color: var(--terminal-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tm-tabs__add:hover:not(:disabled) {
+  color: var(--terminal-fg);
+  border-color: var(--accent);
+}
+
+.tm-tabs__add:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

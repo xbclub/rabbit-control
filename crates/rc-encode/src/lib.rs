@@ -24,6 +24,8 @@ pub mod fake;
 pub use fake::FakeEncoder;
 pub use rc_types::{Error, Result};
 
+use std::time::Duration;
+
 use rc_capture::CapturedFrame;
 use rc_types::{FrameKind, Resolution, Timestamp};
 
@@ -64,6 +66,38 @@ pub trait Encoder: Send {
     /// 零输出延迟（E3）的实现没有任何内部缓冲，恒返回空 `Vec`；
     /// 保留本方法是为了契约稳定（个别硬件编码器在复位时需要冲刷）。
     fn flush(&mut self) -> Result<Vec<EncodedFrame>>;
+
+    /// 是否支持 2-deep 异步流水线编码（[`Encoder::submit_encode`] /
+    /// [`Encoder::recv_encoded`]）。默认返回 `false`。
+    fn supports_pipelined_encode(&self) -> bool {
+        false
+    }
+
+    /// 异步提交一帧进行编码（仅当 [`Encoder::supports_pipelined_encode`]
+    /// 为 `true` 时可用）。调用方以 `token` 关联输入与输出，并需保证
+    /// 在途帧数不超过实现上限。
+    fn submit_encode(
+        &mut self,
+        _token: u64,
+        _frame: &CapturedFrame,
+        _force_idr: bool,
+        _deadline_ts: Timestamp,
+    ) -> Result<()> {
+        Err(Error::InvalidConfig(
+            "pipelined encode not supported".into(),
+        ))
+    }
+
+    /// 接收下一帧已完成的异步编码输出（按 FIFO 提交顺序返回）。
+    /// 超时无就绪输出时返回 `Ok(None)`。
+    fn recv_encoded(&mut self, _timeout: Duration) -> Result<Option<(u64, EncodedFrame)>> {
+        Ok(None)
+    }
+
+    /// 当前已提交但尚未被 [`Encoder::recv_encoded`] 取走的在途帧数。
+    fn in_flight_count(&self) -> usize {
+        0
+    }
 }
 
 /// 编码输出的一帧。
@@ -241,6 +275,7 @@ impl BitstreamFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rc_capture::FrameTexture;
 
     /// 合法配置必须通过校验。
     #[test]
@@ -306,5 +341,36 @@ mod tests {
         assert_eq!(Codec::Av1.as_str(), "av1");
         assert_eq!(BitstreamFormat::AnnexB.as_str(), "annexb");
         assert_eq!(BitstreamFormat::Avcc.as_str(), "avcc");
+    }
+
+    /// 默认流水线编码方法对非流水线编码器保持安全退化语义。
+    #[test]
+    fn default_pipelined_encoder_methods_reject_submit_and_return_none() {
+        let mut enc = FakeEncoder::new(EncoderConfig::default()).expect("假编码器配置合法");
+        assert!(!enc.supports_pipelined_encode());
+        assert_eq!(enc.in_flight_count(), 0);
+        assert!(enc
+            .recv_encoded(Duration::from_millis(1))
+            .expect("recv_encoded 默认应返回 Ok(None)")
+            .is_none());
+
+        let frame = CapturedFrame {
+            texture: FrameTexture::Cpu(rc_types::CpuFrame {
+                width: 4,
+                height: 4,
+                format: rc_types::PixelFormat::Bgra8,
+                stride: 16,
+                data: vec![0; 64],
+            }),
+            timestamp: Timestamp(0),
+            dirty: None,
+            seq: rc_types::CaptureSeq(0),
+            is_repeat: false,
+            resource_guard: None,
+        };
+        let err = enc
+            .submit_encode(1, &frame, false, Timestamp(50_000))
+            .expect_err("不支持流水线的编码器调用 submit_encode 应返回 Err");
+        assert!(matches!(err, Error::InvalidConfig(_)));
     }
 }

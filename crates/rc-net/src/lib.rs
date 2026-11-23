@@ -28,10 +28,13 @@
 #![deny(unsafe_code)]
 
 pub mod fec_adapter;
+pub mod mtls;
 pub mod pacer;
 pub mod quic;
 pub mod reassemble;
 pub mod stats;
+
+pub use mtls::{cert_sha256_hex, parse_rc_san_uri, MtlsConfig, PeerMtlsIdentity};
 
 use std::net::SocketAddr;
 use std::time::Duration;

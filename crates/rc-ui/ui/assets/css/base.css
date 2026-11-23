@@ -1,0 +1,682 @@
+/* base.css —— 全站唯一的基础层
+ *   reset / 排版 / 图标 / StatusDot / Pill / Button / Switch / Select /
+ *   Toast / 交通灯 / 标题栏基础 / 滚动条
+ *
+ * 加载顺序（每个页面必须遵守）：tokens.css → base.css → 页面 CSS。
+ * 约束：本文件禁止裸写任何色值，一律引用 var(--*)。
+ */
+
+/* ────────────────────────────────────────────────────────────────
+ * 0. Reset
+ * ──────────────────────────────────────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 1. 排版基线
+ * ──────────────────────────────────────────────────────────────── */
+body {
+  background: var(--bg-window);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  font-weight: var(--font-weight-regular);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 2. 图标（Lucide sprite + .ic 基础）
+ * ──────────────────────────────────────────────────────────────── */
+.sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.ic {
+  display: block;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: var(--icon-stroke);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.ic--14 { width: 14px; height: 14px; }
+.ic--16 { width: 16px; height: 16px; }
+.ic--18 { width: 18px; height: 18px; }
+.ic--20 { width: 20px; height: 20px; }
+.ic--24 { width: 24px; height: 24px; }
+.ic--40 { width: 40px; height: 40px; }
+
+/* ────────────────────────────────────────────────────────────────
+ * 3. StatusDot（6px 圆点：在线 / 离线 / 占位）
+ * ──────────────────────────────────────────────────────────────── */
+.dot,
+.status-dot {
+  display: inline-block;
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+}
+
+.dot--online,
+.status-dot--online {
+  background: var(--online);
+  box-shadow: var(--online-glow);
+}
+
+.dot--offline {
+  background: var(--text-disabled);
+}
+
+.dot--none {
+  background: transparent;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 4. Pill（高 22、R_PILL、12px medium；五款语义）
+ * ──────────────────────────────────────────────────────────────── */
+.pill,
+.sn-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: var(--r-pill);
+  font-size: var(--size-caption);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.pill .dot,
+.sn-pill .dot {
+  width: 6px;
+  height: 6px;
+}
+
+.pill--online .dot--online {
+  box-shadow: none;
+}
+
+.sn-pill {
+  gap: 4px;
+}
+
+.pill--online {
+  background: var(--pill-online-bg);
+  color: var(--pill-online-fg);
+}
+
+.pill--local {
+  background: var(--local-pill-bg);
+  color: var(--local-pill-fg);
+}
+
+.pill--remote {
+  background: var(--success-bg);
+  color: var(--success-fg);
+}
+
+.pill--warning,
+.sn-pill--warning {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.pill--watch,
+.sn-pill--watch {
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.pill[hidden],
+.sn-pill[hidden] {
+  display: none;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 5. Button（Primary / Secondary / Danger / Ghost 及其禁用态）
+ * ──────────────────────────────────────────────────────────────── */
+.btn,
+.rc-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: var(--control-h);
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: var(--r-control);
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--size-body);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.btn:focus,
+.rc-btn:focus {
+  outline: none;
+}
+
+.btn:focus-visible,
+.rc-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.btn--primary,
+.rc-btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  box-shadow: var(--accent-shadow);
+  color: var(--on-accent);
+}
+
+.btn--primary:hover,
+.rc-btn--primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn--primary:active,
+.rc-btn--primary:active {
+  background: var(--accent-pressed);
+  border-color: var(--accent-pressed);
+}
+
+.btn--secondary,
+.rc-btn--secondary {
+  background: var(--bg-window);
+  border-color: var(--stroke);
+  box-shadow: var(--shadow-row);
+  color: var(--text-primary);
+}
+
+.btn--secondary:hover,
+.rc-btn--secondary:hover {
+  background: var(--bg-card);
+  border-color: var(--stroke-hover);
+}
+
+.btn--secondary:active,
+.rc-btn--secondary:active {
+  background: var(--bg-active);
+}
+
+.btn--danger,
+.rc-btn--danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--on-accent);
+}
+
+.btn--danger:hover,
+.rc-btn--danger:hover {
+  background: var(--danger-hover);
+  border-color: var(--danger-hover);
+}
+
+.btn--danger:active,
+.rc-btn--danger:active {
+  background: var(--danger-hover);
+}
+
+.btn--ghost,
+.rc-btn--ghost {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: var(--r-control);
+}
+
+.btn--ghost:hover,
+.rc-btn--ghost:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.btn--ghost:active,
+.rc-btn--ghost:active {
+  background: var(--bg-active);
+}
+
+/* 禁用态：清爽浅灰底 + 极淡描边 + 禁用文字 */
+.btn:disabled,
+.btn.is-disabled,
+.btn--primary:disabled,
+.btn--primary.is-disabled,
+.rc-btn:disabled,
+.rc-btn.is-disabled,
+.rc-btn--primary:disabled,
+.rc-btn--primary.is-disabled {
+  background: var(--fill-disabled);
+  border-color: var(--stroke-soft);
+  box-shadow: none;
+  color: var(--text-disabled);
+  cursor: default;
+}
+
+.btn--ghost:disabled,
+.rc-btn--ghost:disabled {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--text-disabled);
+}
+
+.btn .ico,
+.rc-btn .rc-icon,
+.btn .rc-icon,
+.rc-btn .ico {
+  display: block;
+  flex: none;
+}
+
+.rc-btn[aria-expanded="true"] {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 6. Switch（全站统一 macOS 精致 40×24 开关）
+ *    覆盖三种写法：.rc-switch / .sn-switch（label+knob）与 input.switch（W4）
+ * ──────────────────────────────────────────────────────────────── */
+.rc-switch,
+.sn-switch {
+  position: relative;
+  display: inline-flex;
+  width: var(--switch-w);
+  height: var(--switch-h);
+  flex: none;
+}
+
+.rc-switch input,
+.sn-switch input {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: var(--fill-off);
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.rc-switch input:checked,
+.sn-switch input:checked {
+  background: var(--accent);
+}
+
+.rc-switch input:focus,
+.sn-switch input:focus {
+  outline: none;
+}
+
+.rc-switch input:focus-visible,
+.sn-switch input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.rc-switch__knob,
+.sn-switch__knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: var(--switch-knob);
+  height: var(--switch-knob);
+  border-radius: var(--r-pill);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-row);
+  pointer-events: none;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.rc-switch input:checked ~ .rc-switch__knob,
+.sn-switch input:checked ~ .sn-switch__knob {
+  transform: translateX(calc(var(--switch-w) - var(--switch-h)));
+}
+
+.rc-switch input:disabled,
+.sn-switch input:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.rc-switch input:disabled ~ .rc-switch__knob,
+.sn-switch input:disabled ~ .sn-switch__knob {
+  opacity: 0.5;
+}
+
+/* 独立 <input type="checkbox" class="switch">（W4 端口映射） */
+.switch {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: var(--switch-w);
+  height: var(--switch-h);
+  margin: 0;
+  border: 0;
+  border-radius: var(--r-pill);
+  background: var(--fill-off);
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: var(--switch-knob);
+  height: var(--switch-knob);
+  border-radius: var(--r-pill);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-row);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.switch:checked {
+  background: var(--accent);
+}
+
+.switch:checked::after {
+  transform: translateX(calc(var(--switch-w) - var(--switch-h)));
+}
+
+.switch:focus {
+  outline: none;
+}
+
+.switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 7. Select（全站统一下拉框：34px 高、圆角 7px、柔和边框与聚焦光晕）
+ * ──────────────────────────────────────────────────────────────── */
+.rc-select,
+.sn-select {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+}
+
+.rc-select {
+  width: 140px;
+}
+
+.rc-select select,
+.sn-select select {
+  width: 100%;
+  height: var(--control-h);
+  padding: 0 30px 0 11px;
+  border: 1px solid var(--stroke);
+  border-radius: var(--r-control);
+  background: var(--bg-window);
+  box-shadow: var(--shadow-row);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--size-body);
+  line-height: 1;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  transition: border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out);
+}
+
+.sn-select select {
+  min-width: 116px;
+}
+
+.rc-select select:hover,
+.sn-select select:hover {
+  border-color: var(--stroke-hover);
+}
+
+.rc-select select:focus,
+.sn-select select:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.rc-select select:disabled,
+.sn-select select:disabled {
+  color: var(--text-disabled);
+  cursor: default;
+}
+
+.rc-select .rc-icon,
+.sn-select .sn-ico {
+  position: absolute;
+  top: 50%;
+  right: 9px;
+  color: var(--text-secondary);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 8. Toast（暗色毛玻璃胶囊，距底 24 水平居中）
+ * ──────────────────────────────────────────────────────────────── */
+.toast,
+.rc-toast,
+.sn-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 9500;
+  display: inline-flex;
+  align-items: center;
+  height: 36px;
+  max-width: 70vw;
+  padding: 0 16px;
+  border: 1px solid var(--hud-border);
+  border-radius: var(--r-pill);
+  background: var(--hud-bg);
+  -webkit-backdrop-filter: blur(16px) saturate(160%);
+  backdrop-filter: blur(16px) saturate(160%);
+  box-shadow: var(--shadow-popover);
+  color: var(--on-accent);
+  font-family: var(--font-sans);
+  font-size: var(--size-secondary);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate(-50%, 8px);
+  transition: opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+
+.toast.is-visible,
+.rc-toast.is-visible,
+.sn-toast.is-visible {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.rc-toast--hosted,
+.sn-toast {
+  position: absolute;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 9. 交通灯与 Tauri 真窗隐藏规则
+ * ──────────────────────────────────────────────────────────────── */
+.traffic,
+.rc-traffic,
+.tm-traffic,
+.sn-bar__traffic {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: var(--traffic-gap);
+}
+
+.traffic__light,
+.rc-traffic__dot,
+.tm-traffic__dot,
+.sn-bar__dot {
+  flex: none;
+  width: var(--traffic-size);
+  height: var(--traffic-size);
+  border-radius: var(--r-pill);
+}
+
+.traffic__light--close,
+.rc-traffic__dot--close,
+.tm-traffic__dot--close,
+.sn-bar__dot--close {
+  background: var(--traffic-close);
+}
+
+.traffic__light--min,
+.rc-traffic__dot--min,
+.tm-traffic__dot--min,
+.sn-bar__dot--min {
+  background: var(--traffic-min);
+}
+
+.traffic__light--zoom,
+.rc-traffic__dot--zoom,
+.tm-traffic__dot--zoom,
+.sn-bar__dot--zoom {
+  background: var(--traffic-zoom);
+}
+
+/* Tauri 真窗口由 macOS 原生提供交通灯，隐藏全站所有自绘灯 */
+.is-tauri .rc-traffic,
+.is-tauri .traffic,
+.is-tauri .tm-traffic,
+.is-tauri .sn-bar__traffic {
+  display: none;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 10. 标题栏基础
+ * ──────────────────────────────────────────────────────────────── */
+.titlebar,
+.tm-titlebar,
+.rc-window__titlebar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: var(--titlebar-h);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.titlebar {
+  background: var(--bg-window);
+}
+
+.titlebar__title,
+.rc-window__title,
+.tm-title {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  margin: 0;
+  color: var(--text-primary);
+  font-size: var(--size-title);
+  font-weight: var(--font-weight-semibold);
+  line-height: 20px;
+  white-space: nowrap;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 11. 滚动条美化（6px 极简圆角滑块）
+ * ──────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: var(--r-pill);
+  background: var(--scroll-thumb);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ────────────────────────────────────────────────────────────────
+ * 12. 动效降级
+ * ──────────────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .btn,
+  .rc-btn,
+  .rc-switch input,
+  .sn-switch input,
+  .rc-switch__knob,
+  .sn-switch__knob,
+  .switch,
+  .switch::after,
+  .rc-select select,
+  .sn-select select,
+  .toast,
+  .rc-toast,
+  .sn-toast {
+    transition: none;
+  }
+}

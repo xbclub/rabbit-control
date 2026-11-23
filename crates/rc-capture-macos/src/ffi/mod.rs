@@ -15,15 +15,19 @@
 // 见模块文档：本模块是 crate 内唯一允许 unsafe 的地方。
 #![allow(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
+use objc2::rc::{autoreleasepool, Retained};
+use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
-use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFType};
+use objc2_core_foundation::{
+    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks, CFArray, CFBoolean,
+    CFDictionary, CFNumber, CFRetained, CFString, CFType,
+};
 use objc2_core_media::{CMClock, CMSampleBuffer, CMTime, CMTimeFlags};
 use objc2_core_video::{
     kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, CVPixelBuffer, CVPixelBufferGetBytesPerRow,
@@ -42,13 +46,88 @@ use rc_types::Resolution;
 // ─────────────────────────────────────────────────────────────────────────────
 
 mod raw {
-    // CGWindow.h：`bool CGPreflightScreenCaptureAccess(void)`（10.15+）。
+    use super::c_void;
+    use objc2_core_foundation::{CFArray, CFDictionary, CFString};
+
+    // CGWindow.h / CGDirectDisplay.h / CGDisplayConfiguration.h
     // 与 core-graphics crate 链接同一个 CoreGraphics 框架。
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
+        pub static kCGDisplayShowDuplicateLowResolutionModes: Option<&'static CFString>;
+
         pub fn CGPreflightScreenCaptureAccess() -> bool;
         pub fn CGRequestScreenCaptureAccess() -> bool;
+
+        pub fn CGDisplayCopyAllDisplayModes(
+            display: u32,
+            options: *const CFDictionary,
+        ) -> *mut CFArray;
+        pub fn CGDisplayCopyDisplayMode(display: u32) -> *mut c_void;
+        pub fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
+        pub fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
+        pub fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
+        pub fn CGDisplayModeGetPixelHeight(mode: *const c_void) -> usize;
+        pub fn CGDisplayModeGetRefreshRate(mode: *const c_void) -> f64;
+        pub fn CGDisplayModeIsUsableForDesktopGUI(mode: *const c_void) -> bool;
+
+        pub fn CGBeginDisplayConfiguration(config: *mut *mut c_void) -> i32;
+        pub fn CGConfigureDisplayWithDisplayMode(
+            config: *mut c_void,
+            display: u32,
+            mode: *const c_void,
+            options: *const c_void,
+        ) -> i32;
+        pub fn CGCompleteDisplayConfiguration(config: *mut c_void, option: u32) -> i32;
+        pub fn CGCancelDisplayConfiguration(config: *mut c_void) -> i32;
     }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        pub fn CFRelease(cf: *const c_void);
+        pub fn CFDataCreateMutable(allocator: *const c_void, capacity: isize) -> *mut c_void;
+        pub fn CFDataGetLength(the_data: *const c_void) -> isize;
+        pub fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
+    }
+
+    extern "C" {
+        pub fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        pub fn dlopen(path: *const std::ffi::c_char, mode: std::ffi::c_int) -> *mut c_void;
+        pub fn dlsym(handle: *mut c_void, symbol: *const std::ffi::c_char) -> *mut c_void;
+        pub fn dlclose(handle: *mut c_void) -> std::ffi::c_int;
+    }
+
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        pub static kCGImageSourceCreateThumbnailFromImageAlways: Option<&'static CFString>;
+        pub static kCGImageSourceThumbnailMaxPixelSize: Option<&'static CFString>;
+        pub static kCGImageSourceCreateThumbnailWithTransform: Option<&'static CFString>;
+        pub static kCGImageDestinationLossyCompressionQuality: Option<&'static CFString>;
+
+        pub fn CGImageSourceCreateWithURL(
+            url: *const c_void,
+            options: *const c_void,
+        ) -> *mut c_void;
+        pub fn CGImageSourceCreateThumbnailAtIndex(
+            isrc: *const c_void,
+            index: usize,
+            options: *const c_void,
+        ) -> *mut c_void;
+        pub fn CGImageDestinationCreateWithData(
+            data: *mut c_void,
+            image_type: *const CFString,
+            count: usize,
+            options: *const c_void,
+        ) -> *mut c_void;
+        pub fn CGImageDestinationAddImage(
+            idst: *mut c_void,
+            image: *const c_void,
+            properties: *const c_void,
+        );
+        pub fn CGImageDestinationFinalize(idst: *mut c_void) -> bool;
+    }
+
+    #[link(name = "AppKit", kind = "framework")]
+    extern "C" {}
 
     // AXUIElement.h：`Boolean AXIsProcessTrusted(void)`（10.4+）。
     // Boolean == unsigned char == u8。注意这个变体**没有 options 参数、绝不弹窗**。
@@ -100,6 +179,626 @@ pub(crate) fn iohid_check_input_monitoring() -> bool {
 pub(crate) fn main_display_id() -> u32 {
     // SAFETY: 纯查询，无前置条件。
     unsafe { core_graphics::display::CGMainDisplayID() }
+}
+
+/// 查询主显示器逻辑分辨率（单位：点，向下取偶以匹配 YUV 4:2:0 / 编码器要求）。
+///
+/// 使用 CoreGraphics `CGDisplay::main().bounds()` 同步查询，不触发任何 TCC 权限弹窗，
+/// 返回值与 ScreenCaptureKit `display = 0`（主显示器）的逻辑坐标系完全一致。
+pub(crate) fn main_display_logical_resolution() -> Option<Resolution> {
+    let bounds = core_graphics::display::CGDisplay::main().bounds();
+    let w = bounds.size.width;
+    let h = bounds.size.height;
+    if !w.is_finite() || !h.is_finite() || w < 2.0 || h < 2.0 {
+        return None;
+    }
+    let res = Resolution::new(w.round() as u32, h.round() as u32).to_even();
+    (res.width >= 2 && res.height >= 2).then_some(res)
+}
+
+/// 查询主显示器物理像素分辨率（backing pixels，向下取偶以匹配 YUV 4:2:0 / 编码器要求）。
+///
+/// 优先使用 `CGDisplay::main().display_mode()` 的 `pixel_width/pixel_height` 获取真实 Retina
+/// 物理像素（例如 14" MBP `3024×1964`），不可用时回退至 `pixels_wide/pixels_high`；
+/// 全程同步查询 CoreGraphics，绝不触发任何 TCC 权限弹窗。
+pub(crate) fn main_display_backing_resolution() -> Option<Resolution> {
+    let display = core_graphics::display::CGDisplay::main();
+    let (w, h) = match display.display_mode() {
+        Some(mode) if mode.pixel_width() >= 2 && mode.pixel_height() >= 2 => {
+            (mode.pixel_width(), mode.pixel_height())
+        }
+        _ => (display.pixels_wide(), display.pixels_high()),
+    };
+    let w = u32::try_from(w).ok()?;
+    let h = u32::try_from(h).ok()?;
+    if w < 2 || h < 2 {
+        return None;
+    }
+    let res = Resolution::new(w, h).to_even();
+    (res.width >= 2 && res.height >= 2).then_some(res)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 显示模式枚举与动态切换（Item #4）+ 桌面壁纸缩略图（Item #6）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `kCGConfigureForSession`（CGDisplayConfiguration.h = 1）：仅当前登录会话生效。
+const K_CG_CONFIGURE_FOR_SESSION: u32 = 1;
+
+/// 通用 +1 所有权 CF 对象 RAII 包装，确保任何分支退出都释放 CFRelease。
+struct CfOwned(NonNull<c_void>);
+
+impl CfOwned {
+    fn from_raw(ptr: *mut c_void) -> Option<Self> {
+        NonNull::new(ptr).map(Self)
+    }
+
+    fn as_ptr(&self) -> *mut c_void {
+        self.0.as_ptr()
+    }
+}
+
+impl Drop for CfOwned {
+    fn drop(&mut self) {
+        // SAFETY: self.0 由 Create/Copy 规则拥有 +1 引用，此处配对 CFRelease。
+        unsafe { raw::CFRelease(self.0.as_ptr().cast_const()) };
+    }
+}
+
+/// 构造 `{ kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue }` 选项字典。
+fn duplicate_low_res_modes_options() -> Option<CFRetained<CFDictionary>> {
+    // SAFETY: 读取框架导出的只读 extern static CFString 常量指针。
+    let key = unsafe { raw::kCGDisplayShowDuplicateLowResolutionModes }?;
+    let val = CFBoolean::new(true);
+    let keys = [key as *const CFString as *const c_void];
+    let values = [val as *const CFBoolean as *const c_void];
+    // SAFETY: keys/values 为 1 个元素长的有效指针数组，key/val 均为 CF 对象。
+    unsafe {
+        CFDictionary::new(
+            None,
+            keys.as_ptr() as *mut *const c_void,
+            values.as_ptr() as *mut *const c_void,
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        )
+    }
+}
+
+fn copy_all_display_modes(
+    display_id: u32,
+    opts: Option<&CFDictionary>,
+) -> Option<CFRetained<CFArray>> {
+    let opts_ptr = opts
+        .map(|d| d as *const CFDictionary)
+        .unwrap_or_else(std::ptr::null);
+    // SAFETY: opts_ptr 为 null 或有效 CFDictionary；返回值为 +1 retained CFArray（可为 null）。
+    let ptr = unsafe { raw::CGDisplayCopyAllDisplayModes(display_id, opts_ptr) };
+    // SAFETY: CGDisplayCopyAllDisplayModes 遵循 Copy Rule，非空时返回 +1 所有权引用。
+    NonNull::new(ptr).map(|nn| unsafe { CFRetained::from_raw(nn) })
+}
+
+fn mode_metrics(mode: *const c_void) -> Option<(u32, u32, u32, u32, u32, bool)> {
+    // SAFETY: mode 为有效 CGDisplayModeRef，以下均为纯只读属性查询。
+    let usable = unsafe { raw::CGDisplayModeIsUsableForDesktopGUI(mode) };
+    if !usable {
+        return None;
+    }
+    // SAFETY: 同上，mode 有效。
+    let (w, h, pw, ph, hz_raw) = unsafe {
+        (
+            raw::CGDisplayModeGetWidth(mode),
+            raw::CGDisplayModeGetHeight(mode),
+            raw::CGDisplayModeGetPixelWidth(mode),
+            raw::CGDisplayModeGetPixelHeight(mode),
+            raw::CGDisplayModeGetRefreshRate(mode),
+        )
+    };
+    let w = u32::try_from(w).ok()?;
+    let h = u32::try_from(h).ok()?;
+    let pw = u32::try_from(pw).ok()?;
+    let ph = u32::try_from(ph).ok()?;
+    let refresh_hz = if hz_raw.is_finite() && hz_raw > 0.0 {
+        hz_raw.round() as u32
+    } else {
+        0
+    };
+    let is_hidpi = pw > w;
+    Some((w, h, pw, ph, refresh_hz, is_hidpi))
+}
+
+/// 枚举主显示器可用桌面显示模式（960..=3840 × 600..=2160，去重偏好 HiDPI 与高刷）。
+pub(crate) fn list_main_display_modes() -> Vec<crate::DisplayModePreset> {
+    let display_id = main_display_id();
+    let opts = duplicate_low_res_modes_options();
+    let Some(modes) = copy_all_display_modes(display_id, opts.as_deref()) else {
+        return Vec::new();
+    };
+
+    // SAFETY: 纯查询当前显示模式，返回值遵循 Copy Rule（+1 或 null）。
+    let cur_mode = CfOwned::from_raw(unsafe { raw::CGDisplayCopyDisplayMode(display_id) });
+    let cur_dims = cur_mode.as_ref().and_then(|m| {
+        // SAFETY: m.as_ptr() 为有效 CGDisplayModeRef。
+        let (w, h) = unsafe {
+            (
+                raw::CGDisplayModeGetWidth(m.as_ptr()),
+                raw::CGDisplayModeGetHeight(m.as_ptr()),
+            )
+        };
+        Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?))
+    });
+
+    let mut dedup: BTreeMap<(u32, u32), crate::DisplayModePreset> = BTreeMap::new();
+    let count = modes.count();
+    for i in 0..count {
+        // SAFETY: i < count 在合法范围内；modes 在整个循环内保活。
+        let raw_mode = unsafe { modes.value_at_index(i) };
+        if raw_mode.is_null() {
+            continue;
+        }
+        let Some((w, h, pw, ph, refresh_hz, is_hidpi)) = mode_metrics(raw_mode) else {
+            continue;
+        };
+        if !(960..=3840).contains(&w) || !(600..=2160).contains(&h) {
+            continue;
+        }
+        let candidate = crate::DisplayModePreset {
+            width: w,
+            height: h,
+            pixel_width: pw,
+            pixel_height: ph,
+            refresh_hz,
+            is_hidpi,
+            is_current: cur_dims == Some((w, h)),
+        };
+        match dedup.get(&(w, h)) {
+            Some(existing)
+                if (existing.is_hidpi, existing.refresh_hz)
+                    >= (candidate.is_hidpi, candidate.refresh_hz) => {}
+            _ => {
+                dedup.insert((w, h), candidate);
+            }
+        }
+    }
+
+    let mut result: Vec<crate::DisplayModePreset> = dedup.into_values().collect();
+    result.sort_by(|a, b| b.width.cmp(&a.width).then_with(|| b.height.cmp(&a.height)));
+    result
+}
+
+/// 主显示器显示模式 RAII 守卫：切换分辨率并在退出/Drop 时自动恢复原始模式。
+pub(crate) struct DisplayModeGuard {
+    display_id: u32,
+    original_mode: NonNull<c_void>,
+    original_res: Resolution,
+    modified: bool,
+}
+
+// SAFETY: CGDisplayModeRef 是 CoreGraphics 不可变 CF 对象（CFRetain/CFRelease 线程安全），
+// DisplayModeGuard 独占其 +1 所有权，且所有可变操作仅经 `&mut self` 进行。
+unsafe impl Send for DisplayModeGuard {}
+
+impl DisplayModeGuard {
+    /// 捕获主显示器当前显示模式（失败返回 `None`）。
+    pub(crate) fn capture_current() -> Option<Self> {
+        let display_id = main_display_id();
+        // SAFETY: CGDisplayCopyDisplayMode 返回 +1 所有权引用或 null。
+        let mode_ptr = NonNull::new(unsafe { raw::CGDisplayCopyDisplayMode(display_id) })?;
+        // SAFETY: mode_ptr 为有效 CGDisplayModeRef。
+        let (w, h) = unsafe {
+            (
+                raw::CGDisplayModeGetWidth(mode_ptr.as_ptr()),
+                raw::CGDisplayModeGetHeight(mode_ptr.as_ptr()),
+            )
+        };
+        let original_res = main_display_logical_resolution().or_else(|| {
+            let w = u32::try_from(w).ok()?;
+            let h = u32::try_from(h).ok()?;
+            let r = Resolution::new(w, h).to_even();
+            (r.width >= 2 && r.height >= 2).then_some(r)
+        });
+        let Some(original_res) = original_res else {
+            // SAFETY: mode_ptr 拥有 +1 引用，失败分支立即释放。
+            unsafe { raw::CFRelease(mode_ptr.as_ptr().cast_const()) };
+            return None;
+        };
+        Some(Self {
+            display_id,
+            original_mode: mode_ptr,
+            original_res,
+            modified: false,
+        })
+    }
+
+    /// 捕获时记录的主显示器原始逻辑分辨率。
+    pub(crate) fn original_resolution(&self) -> Resolution {
+        self.original_res
+    }
+
+    /// 切换主显示器到匹配 `(target_w, target_h)` 的最佳可用模式（偏好 HiDPI 与高刷）。
+    pub(crate) fn switch_to(&mut self, target_w: u32, target_h: u32) -> Result<Resolution, String> {
+        let opts = duplicate_low_res_modes_options();
+        let modes = copy_all_display_modes(self.display_id, opts.as_deref())
+            .ok_or_else(|| "CGDisplayCopyAllDisplayModes 返回空".to_string())?;
+
+        let mut best: Option<(*const c_void, bool, u32)> = None;
+        let count = modes.count();
+        for i in 0..count {
+            // SAFETY: i < count，modes 在整个函数期间保活。
+            let raw_mode = unsafe { modes.value_at_index(i) };
+            if raw_mode.is_null() {
+                continue;
+            }
+            let Some((w, h, _pw, _ph, refresh_hz, is_hidpi)) = mode_metrics(raw_mode) else {
+                continue;
+            };
+            if w != target_w || h != target_h {
+                continue;
+            }
+            match best {
+                Some((_, best_hidpi, best_hz))
+                    if (best_hidpi, best_hz) >= (is_hidpi, refresh_hz) => {}
+                _ => best = Some((raw_mode, is_hidpi, refresh_hz)),
+            }
+        }
+        let (target_mode, _, _) =
+            best.ok_or_else(|| format!("未找到可用的显示模式 {target_w}x{target_h}"))?;
+
+        let mut config: *mut c_void = std::ptr::null_mut();
+        // SAFETY: config 是合法出参。
+        let begin_status = unsafe { raw::CGBeginDisplayConfiguration(&mut config) };
+        if begin_status != 0 || config.is_null() {
+            return Err(format!(
+                "CGBeginDisplayConfiguration 失败: CGError {begin_status}"
+            ));
+        }
+
+        // SAFETY: config 为有效事务句柄；target_mode 在 modes CFArray 存活期内有效。
+        let cfg_status = unsafe {
+            raw::CGConfigureDisplayWithDisplayMode(
+                config,
+                self.display_id,
+                target_mode,
+                std::ptr::null(),
+            )
+        };
+        if cfg_status != 0 {
+            // SAFETY: 配置失败必须取消事务释放 CGDisplayConfigRef。
+            let _ = unsafe { raw::CGCancelDisplayConfiguration(config) };
+            return Err(format!(
+                "CGConfigureDisplayWithDisplayMode({target_w}x{target_h}) 失败: CGError {cfg_status}"
+            ));
+        }
+
+        // SAFETY: 事务已配置，1 = kCGConfigureForSession（仅本会话生效）。
+        let complete_status =
+            unsafe { raw::CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_FOR_SESSION) };
+        if complete_status != 0 {
+            return Err(format!(
+                "CGCompleteDisplayConfiguration 失败: CGError {complete_status}"
+            ));
+        }
+        self.modified = true;
+
+        // 给 WindowServer 短暂过渡时间刷新显示边界。
+        std::thread::sleep(Duration::from_millis(120));
+        main_display_logical_resolution()
+            .ok_or_else(|| "切换显示模式后无法读取主显示器逻辑分辨率".to_string())
+    }
+
+    /// 恢复为捕获时的原始显示模式（幂等）。
+    pub(crate) fn restore(&mut self) {
+        if !self.modified {
+            return;
+        }
+        let mut config: *mut c_void = std::ptr::null_mut();
+        // SAFETY: config 是合法出参。
+        let begin_status = unsafe { raw::CGBeginDisplayConfiguration(&mut config) };
+        if begin_status == 0 && !config.is_null() {
+            // SAFETY: config 与 self.original_mode 均有效。
+            let cfg_status = unsafe {
+                raw::CGConfigureDisplayWithDisplayMode(
+                    config,
+                    self.display_id,
+                    self.original_mode.as_ptr(),
+                    std::ptr::null(),
+                )
+            };
+            if cfg_status == 0 {
+                // SAFETY: 事务已配置，1 = kCGConfigureForSession。
+                let _ = unsafe {
+                    raw::CGCompleteDisplayConfiguration(config, K_CG_CONFIGURE_FOR_SESSION)
+                };
+            } else {
+                // SAFETY: 配置失败取消事务释放句柄。
+                let _ = unsafe { raw::CGCancelDisplayConfiguration(config) };
+            }
+        }
+        self.modified = false;
+    }
+}
+
+impl Drop for DisplayModeGuard {
+    fn drop(&mut self) {
+        self.restore();
+        // SAFETY: original_mode 由 CGDisplayCopyDisplayMode 返回 +1 所有权，此处配对释放。
+        unsafe { raw::CFRelease(self.original_mode.as_ptr().cast_const()) };
+    }
+}
+
+/// 编码一张 CGImageSource 缩略图到 JPEG 字节流。
+fn encode_thumbnail_jpeg(
+    image_source: *const c_void,
+    max_px: u32,
+    quality: f64,
+) -> Option<Vec<u8>> {
+    // SAFETY: 读取 ImageIO 只读 extern static CFString 键常量。
+    let (always_key, max_px_key, transform_key, quality_key) = unsafe {
+        (
+            raw::kCGImageSourceCreateThumbnailFromImageAlways?,
+            raw::kCGImageSourceThumbnailMaxPixelSize?,
+            raw::kCGImageSourceCreateThumbnailWithTransform?,
+            raw::kCGImageDestinationLossyCompressionQuality?,
+        )
+    };
+    let bool_true = CFBoolean::new(true);
+    let max_px_num = CFNumber::new_i32(i32::try_from(max_px.max(1)).unwrap_or(i32::MAX));
+    let thumb_keys = [
+        always_key as *const CFString as *const c_void,
+        max_px_key as *const CFString as *const c_void,
+        transform_key as *const CFString as *const c_void,
+    ];
+    let thumb_vals = [
+        bool_true as *const CFBoolean as *const c_void,
+        &*max_px_num as *const CFNumber as *const c_void,
+        bool_true as *const CFBoolean as *const c_void,
+    ];
+    // SAFETY: thumb_keys/thumb_vals 为 3 个合法 CF 对象指针。
+    let thumb_opts = unsafe {
+        CFDictionary::new(
+            None,
+            thumb_keys.as_ptr() as *mut *const c_void,
+            thumb_vals.as_ptr() as *mut *const c_void,
+            3,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        )
+    }?;
+    // SAFETY: image_source 与 thumb_opts 均合法，返回 +1 CGImageRef 或 null。
+    let thumb_img = CfOwned::from_raw(unsafe {
+        raw::CGImageSourceCreateThumbnailAtIndex(
+            image_source,
+            0,
+            &*thumb_opts as *const CFDictionary as *const c_void,
+        )
+    })?;
+
+    // SAFETY: 创建可变 CFData（容量 0 = 按需增长，返回 +1 所有权）。
+    let cf_data = CfOwned::from_raw(unsafe { raw::CFDataCreateMutable(std::ptr::null(), 0) })?;
+    let jpeg_uti = CFString::from_str("public.jpeg");
+    // SAFETY: cf_data 与 jpeg_uti 均有效，count = 1。
+    let dest = CfOwned::from_raw(unsafe {
+        raw::CGImageDestinationCreateWithData(cf_data.as_ptr(), &*jpeg_uti, 1, std::ptr::null())
+    })?;
+
+    let quality_num = CFNumber::new_f64(quality);
+    let dest_keys = [quality_key as *const CFString as *const c_void];
+    let dest_vals = [&*quality_num as *const CFNumber as *const c_void];
+    // SAFETY: dest_keys/dest_vals 为 1 个合法 CF 对象指针。
+    let dest_props = unsafe {
+        CFDictionary::new(
+            None,
+            dest_keys.as_ptr() as *mut *const c_void,
+            dest_vals.as_ptr() as *mut *const c_void,
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        )
+    }?;
+
+    // SAFETY: dest、thumb_img、dest_props 均有效。
+    unsafe {
+        raw::CGImageDestinationAddImage(
+            dest.as_ptr(),
+            thumb_img.as_ptr().cast_const(),
+            &*dest_props as *const CFDictionary as *const c_void,
+        );
+        if !raw::CGImageDestinationFinalize(dest.as_ptr()) {
+            return None;
+        }
+    }
+
+    // SAFETY: finalize 成功后从 cf_data 读取字节切片（存活期覆盖本次拷贝）。
+    let len = unsafe { raw::CFDataGetLength(cf_data.as_ptr().cast_const()) };
+    if len <= 0 {
+        return None;
+    }
+    // SAFETY: len > 0 时 CFDataGetBytePtr 返回至少 len 字节的可读连续内存。
+    let ptr = unsafe { raw::CFDataGetBytePtr(cf_data.as_ptr().cast_const()) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: ptr 非空且长度为 len。
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    Some(slice.to_vec())
+}
+
+/// 读取当前主显示器桌面壁纸并生成低体积 JPEG 缩略图（零 TCC 弹窗）。
+pub(crate) fn main_display_wallpaper_jpeg(max_width: u32, max_height: u32) -> Option<Vec<u8>> {
+    if max_width == 0 || max_height == 0 {
+        return None;
+    }
+    let image_source = autoreleasepool(|_| -> Option<CfOwned> {
+        let ws_cls = AnyClass::get(c"NSWorkspace")?;
+        let screen_cls = AnyClass::get(c"NSScreen")?;
+        // SAFETY: NSWorkspace.sharedWorkspace 是标准类方法，返回共享实例。
+        let ws: Option<Retained<AnyObject>> = unsafe { msg_send![ws_cls, sharedWorkspace] };
+        let ws = ws?;
+
+        // SAFETY: NSScreen.mainScreen 是标准类方法，无参可返回 nil。
+        let main_screen: Option<Retained<AnyObject>> = unsafe { msg_send![screen_cls, mainScreen] };
+        let screen = match main_screen {
+            Some(s) => s,
+            None => {
+                // SAFETY: NSScreen.screens 是标准类方法，返回 NSArray<NSScreen *>。
+                let screens: Option<Retained<AnyObject>> =
+                    unsafe { msg_send![screen_cls, screens] };
+                let screens = screens?;
+                // SAFETY: NSArray.firstObject 返回首个元素或 nil。
+                let first: Option<Retained<AnyObject>> =
+                    unsafe { msg_send![&*screens, firstObject] };
+                first?
+            }
+        };
+
+        // SAFETY: desktopImageURLForScreen: 接收有效 NSScreen*，返回 NSURL*（toll-free CFURLRef）或 nil。
+        let url: Option<Retained<AnyObject>> =
+            unsafe { msg_send![&*ws, desktopImageURLForScreen: &*screen] };
+        let url = url?;
+
+        // SAFETY: url 为 toll-free bridged CFURLRef，返回 +1 CGImageSourceRef 或 null。
+        CfOwned::from_raw(unsafe {
+            raw::CGImageSourceCreateWithURL(
+                (&*url as *const AnyObject).cast::<c_void>(),
+                std::ptr::null(),
+            )
+        })
+    })?;
+
+    let initial_max_px = max_width.max(max_height).max(1);
+    let mut jpeg = encode_thumbnail_jpeg(image_source.as_ptr().cast_const(), initial_max_px, 0.72)?;
+    if jpeg.len() > 48 * 1024 {
+        let retry_max_px = initial_max_px.min(480);
+        jpeg = encode_thumbnail_jpeg(image_source.as_ptr().cast_const(), retry_max_px, 0.50)?;
+    }
+    if jpeg.len() > 60 * 1024 || jpeg.is_empty() {
+        return None;
+    }
+    Some(jpeg)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// App Nap 抑制与实时线程 QoS 提升（维持 120fps 不被后台节流）
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NS_ACTIVITY_IDLE_DISPLAY_SLEEP_DISABLED: u64 = 1 << 40;
+const NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED: u64 = 1 << 20;
+const NS_ACTIVITY_USER_INITIATED: u64 = 0x00FF_FFFF | NS_ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED;
+const NS_ACTIVITY_LATENCY_CRITICAL: u64 = 0x00FF_0000_0000;
+const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+/// RAII 声明高优先级实时会话活动，防止 macOS App Nap 在长时 120fps 运行期间
+/// 降低定时器与采集/编解码线程调度优先级。
+pub(crate) struct LatencyCriticalActivity {
+    retained: Option<(Retained<AnyObject>, Retained<AnyObject>)>,
+}
+
+// SAFETY: `NSProcessInfo` 是线程安全的，`beginActivityWithOptions:reason:` 返回的
+// activity token 仅用于最终配对调用 `endActivity:`，可在创建或工作线程安全持有并 Drop。
+unsafe impl Send for LatencyCriticalActivity {}
+// SAFETY: 仅持有不可变 Foundation 对象句柄且无内部可变共享状态，Drop 需要独占 `&mut self`。
+unsafe impl Sync for LatencyCriticalActivity {}
+
+impl LatencyCriticalActivity {
+    pub(crate) fn begin(reason: &str, keep_display_awake: bool) -> Self {
+        let mut options = NS_ACTIVITY_USER_INITIATED | NS_ACTIVITY_LATENCY_CRITICAL;
+        if keep_display_awake {
+            options |= NS_ACTIVITY_IDLE_DISPLAY_SLEEP_DISABLED;
+        }
+        let sanitized = reason.replace('\0', " ");
+        let Ok(c_reason) = std::ffi::CString::new(sanitized) else {
+            return Self { retained: None };
+        };
+        let retained = autoreleasepool(|_| -> Option<(Retained<AnyObject>, Retained<AnyObject>)> {
+            let pi_cls = AnyClass::get(c"NSProcessInfo")?;
+            let ns_cls = AnyClass::get(c"NSString")?;
+            // SAFETY: `NSProcessInfo.processInfo` 返回进程级单例。
+            let info: Option<Retained<AnyObject>> = unsafe { msg_send![pi_cls, processInfo] };
+            let info = info?;
+            // SAFETY: `c_reason` 为合法 NUL 结尾 UTF-8 字符串，返回自动释放 NSString。
+            let ns_reason: Option<Retained<AnyObject>> =
+                unsafe { msg_send![ns_cls, stringWithUTF8String: c_reason.as_ptr()] };
+            let ns_reason = ns_reason?;
+            // SAFETY: `options` 为 `NSActivityOptions` (u64)，`ns_reason` 为非空 NSString*。
+            let token: Option<Retained<AnyObject>> = unsafe {
+                msg_send![&*info, beginActivityWithOptions: options, reason: &*ns_reason]
+            };
+            let token = token?;
+            Some((info, token))
+        });
+        Self { retained }
+    }
+}
+
+impl Drop for LatencyCriticalActivity {
+    fn drop(&mut self) {
+        if let Some((info, token)) = self.retained.take() {
+            autoreleasepool(|_| {
+                // SAFETY: `info` 与 `token` 来自成对的 `beginActivityWithOptions:reason:`。
+                unsafe {
+                    let _: () = msg_send![&*info, endActivity: &*token];
+                }
+            });
+        }
+    }
+}
+
+/// 将当前操作系统线程提升至 `QOS_CLASS_USER_INTERACTIVE`（`0x21`）。
+pub(crate) fn promote_current_thread_qos() {
+    // SAFETY: `pthread_set_qos_class_self_np` 对任意用户态 pthread 均为安全系统调用，
+    // 传入合法 `QOS_CLASS_USER_INTERACTIVE`（0x21）与相对优先级 0。
+    let _ = unsafe { raw::pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+}
+
+const RTLD_LAZY: std::ffi::c_int = 0x1;
+const LOGIN_FRAMEWORK_PATH: &std::ffi::CStr =
+    c"/System/Library/PrivateFrameworks/login.framework/Versions/Current/login";
+
+/// 检查系统 `login.framework` 是否导出 `SACLockScreenImmediate`（仅解析符号，不锁屏）。
+#[cfg(test)]
+pub(crate) fn has_lock_screen_symbol() -> bool {
+    // SAFETY: `LOGIN_FRAMEWORK_PATH` 与 `c"SACLockScreenImmediate"` 为静态 NUL 结尾 C 字符串；
+    // 若 `dlopen` 返回非空句柄则配对调用 `dlclose`，绝不解引用或调用目标函数指针。
+    unsafe {
+        let handle = raw::dlopen(LOGIN_FRAMEWORK_PATH.as_ptr(), RTLD_LAZY);
+        if handle.is_null() {
+            return false;
+        }
+        let sym = raw::dlsym(handle, c"SACLockScreenImmediate".as_ptr());
+        let ok = !sym.is_null();
+        let _ = raw::dlclose(handle);
+        ok
+    }
+}
+
+/// 立即锁定当前 macOS 登录会话屏幕（优先调用 `SACLockScreenImmediate`，失败回退 `pmset displaysleepnow`）。
+pub(crate) fn lock_screen_now() -> bool {
+    // SAFETY: `dlopen`/`dlsym` 解析 Apple `login.framework` 的零参无返回值函数
+    // `SACLockScreenImmediate`（`extern "C" fn()`），调用后配对 `dlclose` 释放句柄。
+    let locked = unsafe {
+        let handle = raw::dlopen(LOGIN_FRAMEWORK_PATH.as_ptr(), RTLD_LAZY);
+        if handle.is_null() {
+            false
+        } else {
+            let sym = raw::dlsym(handle, c"SACLockScreenImmediate".as_ptr());
+            let invoked = if !sym.is_null() {
+                let lock_fn: extern "C" fn() = std::mem::transmute(sym);
+                lock_fn();
+                true
+            } else {
+                false
+            };
+            let _ = raw::dlclose(handle);
+            invoked
+        }
+    };
+    if locked {
+        return true;
+    }
+    std::process::Command::new("/usr/bin/pmset")
+        .arg("displaysleepnow")
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -631,11 +1330,13 @@ fn make_configuration(target: Resolution, fps: u32) -> Retained<SCStreamConfigur
     // SAFETY: 纯属性 setter。
     unsafe { config.setCapturesAudio(false) };
     // M9：输出逻辑分辨率 —— Retina 2x 屏上等价于把 2x 帧下采样到 1x，
-    // 不把 2x 分辨率喂给编码器（带宽翻倍）。
+    // 不把 2x 分辨率喂给编码器（带宽翻倍）；显式启用 scalesToFit 确保
+    // 目标分辨率小于物理分辨率时由 GPU 等比缩放填满画幅而非左上角 1:1 裁切。
     // SAFETY: 纯属性 setter。
     unsafe {
         config.setWidth(target.width as usize);
         config.setHeight(target.height as usize);
+        config.setScalesToFit(true);
     }
     // minimumFrameInterval 带 10% vsync 抖动容差（见 minimum_frame_interval_us），
     // 消除 ProMotion 120Hz 节拍拍频掉帧；静止画面下回调仍不触发（契约 C1）。
@@ -836,6 +1537,21 @@ mod tests {
         let t1 = host_time_us();
         let t2 = host_time_us();
         assert!(t1 > 0 && t2 >= t1);
+    }
+
+    #[test]
+    fn main_display_backing_resolution_is_even_and_at_least_logical() {
+        if let (Some(logical), Some(backing)) = (
+            main_display_logical_resolution(),
+            main_display_backing_resolution(),
+        ) {
+            assert_eq!(backing.width % 2, 0);
+            assert_eq!(backing.height % 2, 0);
+            assert!(
+                backing.width >= logical.width && backing.height >= logical.height,
+                "backing {backing:?} 应不小于逻辑分辨率 {logical:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RabbitControl</title>
+  <link rel="stylesheet" href="assets/css/tokens.css" />
+  <link rel="stylesheet" href="assets/css/base.css" />
+  <link rel="stylesheet" href="assets/css/pages/overlay.css" />
+  <link rel="stylesheet" href="assets/css/pages/main.css" />
+</head>
+<body>
+  <!-- ────────────────────────────────────────────────────────────────
+       Lucide 图标 sprite（lucide-static v1.77.0，ISC；内联路径，离线可跑）
+       用 CSS 定位隐藏而非 display:none，保证 <use> 引用在 WKWebView 有效。
+       ──────────────────────────────────────────────────────────────── -->
+  <svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+    <symbol id="i-app-window" viewBox="0 0 24 24">
+      <rect x="2" y="4" width="20" height="16" rx="2" />
+      <path d="M10 4v4" />
+      <path d="M2 8h20" />
+      <path d="M6 4v4" />
+    </symbol>
+    <symbol id="i-laptop" viewBox="0 0 24 24">
+      <path d="M18 5a2 2 0 0 1 2 2v8.526a2 2 0 0 0 .212.897l1.068 2.127a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45l1.068-2.127A2 2 0 0 0 4 15.526V7a2 2 0 0 1 2-2z" />
+      <path d="M20.054 15.987H3.946" />
+    </symbol>
+    <symbol id="i-smartphone" viewBox="0 0 24 24">
+      <rect width="14" height="20" x="5" y="2" rx="2" ry="2" />
+      <path d="M12 18h.01" />
+    </symbol>
+    <symbol id="i-tablet" viewBox="0 0 24 24">
+      <rect width="16" height="20" x="4" y="2" rx="2" ry="2" />
+      <line x1="12" x2="12.01" y1="18" y2="18" />
+    </symbol>
+    <symbol id="i-monitor-smartphone" viewBox="0 0 24 24">
+      <path d="M18 8V6a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h8" />
+      <path d="M10 19v-3.96 3.15" />
+      <path d="M7 19h5" />
+      <rect width="6" height="10" x="16" y="12" rx="2" />
+    </symbol>
+    <symbol id="i-layout-grid" viewBox="0 0 24 24">
+      <rect width="7" height="7" x="3" y="3" rx="1" />
+      <rect width="7" height="7" x="14" y="3" rx="1" />
+      <rect width="7" height="7" x="14" y="14" rx="1" />
+      <rect width="7" height="7" x="3" y="14" rx="1" />
+    </symbol>
+    <symbol id="i-users" viewBox="0 0 24 24">
+      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+      <path d="M16 3.128a4 4 0 0 1 0 7.744" />
+      <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+      <circle cx="9" cy="7" r="4" />
+    </symbol>
+    <symbol id="i-handshake" viewBox="0 0 24 24">
+      <path d="m11 17 2 2a1 1 0 1 0 3-3" />
+      <path d="m14 14 2.5 2.5a1 1 0 1 0 3-3l-3.88-3.88a3 3 0 0 0-4.24 0l-.88.88a1 1 0 1 1-3-3l2.81-2.81a5.79 5.79 0 0 1 7.06-.87l.47.28a2 2 0 0 0 1.42.25L21 4" />
+      <path d="m21 3 1 11h-2" />
+      <path d="M3 3 2 14l6.5 6.5a1 1 0 1 0 3-3" />
+      <path d="M3 4h8" />
+    </symbol>
+    <symbol id="i-bookmark" viewBox="0 0 24 24">
+      <path d="M17 3a2 2 0 0 1 2 2v15a1 1 0 0 1-1.496.868l-4.512-2.578a2 2 0 0 0-1.984 0l-4.512 2.578A1 1 0 0 1 5 20V5a2 2 0 0 1 2-2z" />
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24">
+      <rect width="14" height="14" x="8" y="8" rx="2" ry="2" />
+      <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2" />
+    </symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24">
+      <path d="M10.268 21a2 2 0 0 0 3.464 0" />
+      <path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326" />
+    </symbol>
+    <symbol id="i-circle-user" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="10" />
+      <circle cx="12" cy="10" r="3" />
+      <path d="M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662" />
+    </symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24">
+      <path d="M4 5h16" />
+      <path d="M4 12h16" />
+      <path d="M4 19h16" />
+    </symbol>
+    <symbol id="i-ellipsis" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="1" />
+      <circle cx="19" cy="12" r="1" />
+      <circle cx="5" cy="12" r="1" />
+    </symbol>
+    <symbol id="i-chevron-up" viewBox="0 0 24 24">
+      <path d="m18 15-6-6-6 6" />
+    </symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24">
+      <path d="m6 9 6 6 6-6" />
+    </symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 24 24">
+      <path d="m9 18 6-6-6-6" />
+    </symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24">
+      <path d="M5 12h14" />
+      <path d="m12 5 7 7-7 7" />
+    </symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24">
+      <path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0" />
+      <circle cx="12" cy="12" r="3" />
+    </symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24">
+      <path d="M10.733 5.076a10.744 10.744 0 0 1 11.205 6.575 1 1 0 0 1 0 .696 10.747 10.747 0 0 1-1.444 2.49" />
+      <path d="M14.084 14.158a3 3 0 0 1-4.242-4.242" />
+      <path d="M17.479 17.499a10.75 10.75 0 0 1-15.417-5.151 1 1 0 0 1 0-.696 10.75 10.75 0 0 1 4.446-5.143" />
+      <path d="m2 2 20 20" />
+    </symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24">
+      <path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915" />
+      <circle cx="12" cy="12" r="3" />
+    </symbol>
+    <symbol id="i-info" viewBox="0 0 24 24">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 16v-4" />
+      <path d="M12 8h.01" />
+    </symbol>
+    <symbol id="i-folder-symlink" viewBox="0 0 24 24">
+      <path d="M2 9.35V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h7" />
+      <path d="m8 16 3-3-3-3" />
+    </symbol>
+    <symbol id="i-square-play" viewBox="0 0 24 24">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <path d="M9 9.003a1 1 0 0 1 1.517-.859l4.997 2.997a1 1 0 0 1 0 1.718l-4.997 2.997A1 1 0 0 1 9 14.996z" />
+    </symbol>
+    <symbol id="i-square-terminal" viewBox="0 0 24 24">
+      <path d="m7 11 2-2-2-2" />
+      <path d="M11 13h4" />
+      <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
+    </symbol>
+    <symbol id="i-unplug" viewBox="0 0 24 24">
+      <path d="m19 5 3-3" />
+      <path d="m2 22 3-3" />
+      <path d="M6.3 20.3a2.4 2.4 0 0 0 3.4 0L12 18l-6-6-2.3 2.3a2.4 2.4 0 0 0 0 3.4Z" />
+      <path d="M7.5 13.5 10 11" />
+      <path d="M10.5 16.5 13 14" />
+      <path d="m12 6 6 6 2.3-2.3a2.4 2.4 0 0 0 0-3.4l-2.6-2.6a2.4 2.4 0 0 0-3.4 0Z" />
+    </symbol>
+    <symbol id="i-refresh-cw" viewBox="0 0 24 24">
+      <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8" />
+      <path d="M21 3v5h-5" />
+      <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16" />
+      <path d="M8 16H3v5" />
+    </symbol>
+    <symbol id="i-cast" viewBox="0 0 24 24">
+      <path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6" />
+      <path d="M2 12a9 9 0 0 1 8 8" />
+      <path d="M2 16a5 5 0 0 1 4 4" />
+      <line x1="2" x2="2.01" y1="20" y2="20" />
+    </symbol>
+    <symbol id="i-shield-check" viewBox="0 0 24 24">
+      <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
+      <path d="m9 12 2 2 4-4" />
+    </symbol>
+    <symbol id="i-pencil" viewBox="0 0 24 24">
+      <path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
+      <path d="m15 5 4 4" />
+    </symbol>
+    <symbol id="i-trash-2" viewBox="0 0 24 24">
+      <path d="M3 6h18" />
+      <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+      <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+      <line x1="10" x2="10" y1="11" y2="17" />
+      <line x1="14" x2="14" y1="11" y2="17" />
+    </symbol>
+    <symbol id="i-triangle-alert" viewBox="0 0 24 24">
+      <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3" />
+      <path d="M12 9v4" />
+      <path d="M12 17h.01" />
+    </symbol>
+    <symbol id="i-x" viewBox="0 0 24 24">
+      <path d="M18 6 6 18" />
+      <path d="m6 6 12 12" />
+    </symbol>
+  </svg>
+
+  <!-- ────────────────────────────────────────────────────────────────
+       主窗口骨架（08 §5.1）：52px 标题栏 + 216px 侧栏 + 内容区
+       ──────────────────────────────────────────────────────────────── -->
+  <div class="app" id="app">
+    <!-- 骨架（§5.1 重构）：侧栏 216px 通顶，顶部 52px 为交通灯带（sidebar__chrome）；
+         右侧 app__body = 顶栏 + 内容区 纵向排列。所有既有 class/id 原样保留。 -->
+    <aside class="sidebar" id="sidebar" aria-label="导航">
+      <div class="sidebar__chrome" data-tauri-drag-region>
+        <div class="titlebar__lead" data-tauri-drag-region>
+          <div class="rc-traffic" aria-hidden="true" data-tauri-drag-region>
+            <span class="rc-traffic__dot rc-traffic__dot--close" data-tauri-drag-region></span>
+            <span class="rc-traffic__dot rc-traffic__dot--min" data-tauri-drag-region></span>
+            <span class="rc-traffic__dot rc-traffic__dot--zoom" data-tauri-drag-region></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 侧栏滚动区（§3.6：左右内边距 12；分组头 40；行 36） -->
+      <div class="sidebar__groups">
+        <div class="sidebar__group" data-group="devices">
+          <button type="button" class="sidebar__head" aria-expanded="true" aria-controls="sidebarDevices">
+            <span class="sidebar__head-icon">
+              <svg class="ic ic--20" aria-hidden="true" focusable="false"><use href="#i-monitor-smartphone"></use></svg>
+            </span>
+            <span class="sidebar__head-title">我的设备</span>
+            <span class="sidebar__head-chevron">
+              <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-chevron-up"></use></svg>
+            </span>
+          </button>
+          <div class="sidebar__rows" id="sidebarDevices"></div>
+        </div>
+
+        <div class="sidebar__group" data-group="assist">
+          <button type="button" class="sidebar__head" aria-expanded="true" aria-controls="sidebarAssist">
+            <span class="sidebar__head-icon">
+              <svg class="ic ic--20" aria-hidden="true" focusable="false"><use href="#i-users"></use></svg>
+            </span>
+            <span class="sidebar__head-title">远程协助</span>
+            <span class="sidebar__head-chevron">
+              <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-chevron-up"></use></svg>
+            </span>
+          </button>
+          <div class="sidebar__rows" id="sidebarAssist"></div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="app__body">
+      <header class="titlebar" data-tauri-drag-region>
+        <!-- 当前页上下文：P1 = 在线 Pill + 设备名 + ellipsis｜P2/P3 = 页面标题 -->
+        <div class="titlebar__context" id="titlebarContext" data-tauri-drag-region></div>
+
+        <div class="titlebar__actions" data-tauri-drag-region>
+          <div class="titlebar__actions-inner" data-tauri-drag-region>
+            <button type="button" class="rc-btn rc-btn--ghost" id="btnCopyWindow" aria-label="复制窗口">
+              <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-copy"></use></svg>
+            </button>
+            <button type="button" class="rc-btn rc-btn--ghost titlebar__bell" id="btnBell" aria-label="通知，1 条未读">
+              <span class="titlebar__bell-icon">
+                <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-bell"></use></svg>
+                <span class="badge" aria-hidden="true">1</span>
+              </span>
+            </button>
+            <button type="button" class="rc-btn rc-btn--ghost" data-rc-anchor="account" aria-label="账户">
+              <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-circle-user"></use></svg>
+            </button>
+            <button type="button" class="rc-btn rc-btn--ghost" data-rc-anchor="menu" aria-label="菜单" aria-haspopup="menu">
+              <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-menu"></use></svg>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <!-- macOS 权限引导横幅（登录后若缺失屏幕录制/辅助功能权限则顶部非阻断提醒） -->
+      <div class="perm-banner" id="permBanner" role="region" aria-label="系统权限提示" hidden>
+        <div class="perm-banner__main">
+          <svg class="ic ic--16 perm-banner__icon" aria-hidden="true" focusable="false"><use href="#i-triangle-alert"></use></svg>
+          <span class="perm-banner__text" id="permBannerText">macOS 尚未授予必需系统权限，远程自控与协助将受限</span>
+        </div>
+        <div class="perm-banner__actions">
+          <button type="button" class="rc-btn rc-btn--primary perm-banner__btn" id="btnGrantPerms">一键去授权</button>
+          <button type="button" class="rc-btn rc-btn--secondary perm-banner__btn" id="btnRecheckPerms">重新检测</button>
+          <button type="button" class="rc-btn rc-btn--ghost perm-banner__close" id="btnDismissPerms" aria-label="暂不提醒">
+            <svg class="ic ic--14" aria-hidden="true" focusable="false"><use href="#i-x"></use></svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- 内容区：三页互斥（侧栏路由） -->
+      <main class="content" id="content">
+        <!-- ══════════════ P1 设备主页 ══════════════ -->
+        <section class="page page--p1" id="page-p1" aria-label="设备主页">
+          <div class="p1__banner" id="p1SessionBanner" hidden>
+            <span class="p1__banner-info">
+              <svg class="ic ic--16 p1__banner-icon" aria-hidden="true" focusable="false"><use href="#i-cast"></use></svg>
+              <span class="p1__banner-tag">控制中</span>
+              <span class="p1__banner-sep" aria-hidden="true"></span>
+              <span class="p1__banner-text">本机正在控制此电脑</span>
+            </span>
+            <button type="button" class="rc-btn rc-btn--secondary p1__banner-btn" id="p1BannerDisconnect">断开远控</button>
+          </div>
+          <div class="p1__stack">
+            <!-- 预览卡：内容区−2×48、高 480、距标题栏 48、水平居中 -->
+            <div class="p1__card" id="p1Card" role="button" tabindex="0" aria-label="进入桌面">
+              <!-- 预览卡三态（设计文档 §6 P1）：A 有缓存快照 / B 无快照 / C 离线。
+                   本期 mock 一律 B 态：如实表达「从未连接」，不造假图。 -->
+              <div class="p1__preview p1__preview--empty" id="p1Preview" aria-hidden="true">
+                <img class="p1__wallpaper" id="p1Wallpaper" alt="" hidden />
+                <svg class="p1__preview-icon" aria-hidden="true" focusable="false"><use href="#i-laptop"></use></svg>
+                <span class="p1__preview-name" id="p1PreviewName">yii's MacBook Pro</span>
+                <span class="p1__preview-hint" id="p1PreviewHint">尚未连接过该设备</span>
+              </div>
+              <span class="p1__watermark" id="p1Watermark">yii's MacBook Pro</span>
+              <span class="p1__enter">
+                <span class="p1__enter-label">进入桌面</span>
+                <svg class="ic ic--16 p1__enter-arrow" aria-hidden="true" focusable="false"><use href="#i-arrow-right"></use></svg>
+              </span>
+              <div class="p1__active-overlay" id="p1ActiveOverlay" hidden>
+                <span class="p1__active-icon">
+                  <svg class="ic ic--24" aria-hidden="true" focusable="false"><use href="#i-cast"></use></svg>
+                </span>
+                <span class="p1__active-text">已建立远程连接</span>
+                <button type="button" class="rc-btn rc-btn--primary p1__active-btn" id="p1FocusSession">显示远控窗口</button>
+              </div>
+            </div>
+
+            <!-- 底部工具条：紧贴预览卡、高 56、五组等宽均分 -->
+            <div class="p1__toolbar" role="toolbar" aria-label="设备工具">
+              <div class="p1__toolcell">
+                <button type="button" class="p1__tool" data-tool="transfer">
+                  <svg class="ic ic--20" aria-hidden="true" focusable="false"><use href="#i-folder-symlink"></use></svg>
+                  <span class="p1__tool-label">文件传输</span>
+                </button>
+              </div>
+              <div class="p1__toolcell">
+                <button type="button" class="p1__tool" data-tool="watch">
+                  <svg class="ic ic--20" aria-hidden="true" focusable="false"><use href="#i-square-play"></use></svg>
+                  <span class="p1__tool-label">观看模式</span>
+                </button>
+              </div>
+              <div class="p1__toolcell">
+                <button type="button" class="p1__tool" data-tool="terminal">
+                  <svg class="ic ic--20" aria-hidden="true" focusable="false"><use href="#i-square-terminal"></use></svg>
+                  <span class="p1__tool-label">终端</span>
+                </button>
+              </div>
+              <div class="p1__toolcell">
+                <button type="button" class="p1__tool" data-tool="portmap">
+                  <svg class="ic ic--20" aria-hidden="true" focusable="false"><use href="#i-unplug"></use></svg>
+                  <span class="p1__tool-label">端口映射</span>
+                </button>
+              </div>
+              <div class="p1__toolcell">
+                <button type="button" class="p1__tool p1__tool--icon" data-rc-anchor="more" aria-label="更多工具">
+                  <svg class="ic ic--20" aria-hidden="true" focusable="false"><use href="#i-ellipsis"></use></svg>
+                </button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ══════════════ P2 远程协助 ══════════════ -->
+        <section class="page page--p2" id="page-p2" aria-label="远程协助">
+          <div class="p2">
+            <div class="p2__session-bar" id="p2SessionBar" hidden>
+              <span class="p2__session-info">
+                <svg class="ic ic--16 p2__session-icon" aria-hidden="true" focusable="false"><use href="#i-cast"></use></svg>
+                <span class="p2__session-text" id="p2SessionText">正在远控</span>
+              </span>
+              <div class="p2__session-actions">
+                <button type="button" class="rc-btn rc-btn--secondary p2__session-btn" id="p2OpenTransfer" hidden>文件传输</button>
+                <button type="button" class="rc-btn rc-btn--secondary p2__session-btn" id="p2OpenTerminal" hidden>终端</button>
+                <button type="button" class="rc-btn rc-btn--secondary p2__session-btn" id="p2OpenPortmap" hidden>端口映射</button>
+                <button type="button" class="rc-btn rc-btn--primary p2__session-btn" id="p2FocusSession">显示远控窗口</button>
+                <button type="button" class="rc-btn rc-btn--secondary p2__session-btn" id="p2DisconnectSession">断开远控</button>
+              </div>
+            </div>
+            <!-- 卡 1 本设备 -->
+            <div class="p2__card">
+              <div class="p2__card-head">
+                <h2 class="p2__title">本设备</h2>
+                <div class="p2__allow">
+                  <span class="p2__allow-label" id="p2AllowLabel">允许他人远程协助</span>
+                  <label class="rc-switch">
+                    <input type="checkbox" id="p2Allow" checked aria-labelledby="p2AllowLabel" />
+                    <span class="rc-switch__knob"></span>
+                  </label>
+                </div>
+              </div>
+              <div class="p2__rule"></div>
+
+              <div class="p2__body" id="p2Body">
+                <div class="p2__id-col">
+                  <span class="p2__label">本设备 ID</span>
+                  <div class="p2__id-row">
+                    <div class="p2__bigid" id="p2DeviceId">183 435 140</div>
+                    <button type="button" class="rc-btn rc-btn--ghost p2__id-refresh" id="p2RefreshId" aria-label="刷新设备 ID" title="更换新的设备 ID">
+                      <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-refresh-cw"></use></svg>
+                    </button>
+                  </div>
+                  <div class="p2__id-sub" id="p2DeviceSub" hidden></div>
+                </div>
+
+                <div class="p2__verify-col">
+                  <div class="p2__verify-row">
+                    <span class="p2__label p2__label--inline">验证方式：</span>
+                    <span class="rc-select p2__select">
+                      <select id="p2VerifyMode" aria-label="验证方式">
+                        <option>仅使用临时验证码</option>
+                        <option>自定义验证码</option>
+                      </select>
+                      <svg class="ic ic--16 rc-icon" aria-hidden="true" focusable="false"><use href="#i-chevron-down"></use></svg>
+                    </span>
+                  </div>
+
+                  <div class="p2__code-row">
+                    <span class="p2__code" id="p2Code">9ZGQ30ES</span>
+                    <button type="button" class="rc-btn rc-btn--ghost" id="p2Eye" aria-pressed="false" aria-label="显示验证码" title="显示验证码">
+                      <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-eye"></use></svg>
+                    </button>
+                    <button type="button" class="rc-btn rc-btn--ghost" id="p2CodeSettings" aria-label="验证码设置">
+                      <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-settings"></use></svg>
+                    </button>
+                    <button type="button" class="rc-btn rc-btn--secondary" id="p2Copy">复制并分享</button>
+                  </div>
+
+                  <div class="p2__refresh">每次远控结束刷新</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- 卡 2 远控伙伴设备 -->
+            <div class="p2__card">
+              <h2 class="p2__title">远控伙伴设备</h2>
+              <p class="p2__hint">通过其他设备的【设备 ID】及【设备验证码】启动远程控制</p>
+              <div class="p2__rule p2__rule--form"></div>
+
+              <div class="p2__form">
+                <span class="p2__form-label">伙伴的设备 ID</span>
+                <div class="p2__form-row">
+                  <div class="p2__input-wrap">
+                    <input type="text" class="p2__input" id="p2PeerInput" placeholder="请输入设备 ID" autocomplete="off" aria-label="伙伴的设备 ID" />
+                    <button type="button" class="p2__input-chevron" id="p2HistoryBtn" aria-label="历史记录" aria-haspopup="listbox" aria-expanded="false">
+                      <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-chevron-down"></use></svg>
+                    </button>
+                  </div>
+                  <button type="button" class="rc-btn rc-btn--primary p2__connect" id="p2Connect" disabled>连接</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ══════════════ P3 全部设备 ══════════════ -->
+        <section class="page page--p3" id="page-p3" aria-label="全部设备">
+          <div class="p3" id="p3Groups"></div>
+
+          <!-- §7.2 P3 无设备空态 -->
+          <div class="p3__empty" id="p3Empty" hidden>
+            <svg class="ic ic--40" aria-hidden="true" focusable="false"><use href="#i-monitor-smartphone"></use></svg>
+            <p class="p3__empty-text">暂无设备</p>
+            <button type="button" class="rc-btn rc-btn--primary" id="p3EmptyAssist">开始协助</button>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- ────────────────────────────────────────────────────────────────
+       首次启动双阶强门禁遮罩（仅真桌面客户端 IS_TAURI == true 激活；浏览器静态预览保持隐藏）
+       ──────────────────────────────────────────────────────────────── -->
+  <div class="gate-overlay" id="gateOverlay" role="dialog" aria-modal="true" aria-label="初始化与登录" hidden>
+    <div class="gate-drag" data-tauri-drag-region></div>
+    <div class="gate-card">
+      <div class="gate-brand">
+        <div class="gate-brand__mark" aria-hidden="true">
+          <svg class="ic ic--24" aria-hidden="true" focusable="false"><use href="#i-shield-check"></use></svg>
+        </div>
+        <div class="gate-brand__text">
+          <h1 class="gate-brand__title" id="gateTitle">连接 RabbitControl 服务器</h1>
+          <p class="gate-brand__sub" id="gateSubtitle">首次启动请先锚定服务器地址并完成账号认证</p>
+        </div>
+      </div>
+
+      <!-- 阶段 0：启动加载态 -->
+      <div class="gate-step" id="gateStepLoading" hidden>
+        <p class="gate-loading-text">正在检查服务器配置与登录状态…</p>
+      </div>
+
+      <!-- 门禁 1：未配置服务器 -->
+      <div class="gate-step" id="gateStepServer" hidden>
+        <div class="gate-field">
+          <label class="gate-label" for="gateServerHost">服务器地址</label>
+          <input type="text" class="gate-input" id="gateServerHost"
+                 placeholder="例如 192.168.1.10 或 rc.example.com" autocomplete="off" spellcheck="false" />
+        </div>
+
+        <div class="gate-adv-toggle-row">
+          <button type="button" class="gate-link-btn" id="gateAdvToggle" aria-expanded="false">
+            高级端口与 HTTPS 设置
+          </button>
+          <label class="gate-https-check">
+            <input type="checkbox" id="gateUseHttps" checked />
+            <span>启用 HTTPS (TLS)</span>
+          </label>
+        </div>
+
+        <div class="gate-ports" id="gateAdvPanel" hidden>
+          <label class="gate-port-item">
+            <span>API 端口</span>
+            <input type="text" inputmode="numeric" class="gate-input gate-input--mono" id="gateApiPort" value="21118" />
+          </label>
+          <label class="gate-port-item">
+            <span>信令端口</span>
+            <input type="text" inputmode="numeric" class="gate-input gate-input--mono" id="gateSignalPort" value="21116" />
+          </label>
+          <label class="gate-port-item">
+            <span>中继端口</span>
+            <input type="text" inputmode="numeric" class="gate-input gate-input--mono" id="gateRelayPort" value="21117" />
+          </label>
+        </div>
+
+        <div class="gate-probe" id="gateProbeResult" hidden>
+          <div class="gate-probe__head">
+            <span class="gate-probe__badge" id="gateProbeBadge">连接正常</span>
+            <span class="gate-probe__meta" id="gateProbeMeta"></span>
+          </div>
+          <div class="gate-probe__fp-label">Root CA 证书 SHA-256 指纹</div>
+          <code class="gate-probe__fp" id="gateCaFingerprint">--</code>
+          <div class="gate-probe__reg" id="gateProbeReg"></div>
+        </div>
+
+        <div class="gate-error" id="gateServerError" role="alert" hidden></div>
+
+        <div class="gate-actions">
+          <button type="button" class="rc-btn rc-btn--secondary" id="gateBackToLoginBtn" hidden>返回登录</button>
+          <button type="button" class="rc-btn rc-btn--secondary" id="gateProbeBtn">检测连接</button>
+          <button type="button" class="rc-btn rc-btn--primary" id="gateConfirmServerBtn" disabled>确认并进入登录</button>
+        </div>
+      </div>
+
+      <!-- 门禁 2：登录 / 注册 -->
+      <div class="gate-step" id="gateStepAuth" hidden>
+        <div class="gate-server-bar">
+          <span class="gate-server-bar__info" id="gateServerSummary">服务器：--</span>
+          <button type="button" class="gate-link-btn" id="gateChangeServerBtn">修改服务器</button>
+        </div>
+
+        <div class="gate-tabs" id="gateAuthTabs" role="tablist">
+          <button type="button" class="gate-tab is-active" id="gateTabLogin" role="tab" aria-selected="true">账号登录</button>
+          <button type="button" class="gate-tab" id="gateTabRegister" role="tab" aria-selected="false">注册新账号</button>
+        </div>
+
+        <div class="gate-notice" id="gateRegDisabledNotice" hidden>
+          管理员已关闭自助注册，请联系管理员开通
+        </div>
+
+        <form class="gate-form" id="gateLoginForm" novalidate>
+          <div class="gate-field">
+            <label class="gate-label" for="gateLoginEmail">邮箱</label>
+            <input type="email" class="gate-input" id="gateLoginEmail" placeholder="name@company.com" autocomplete="username" />
+          </div>
+          <div class="gate-field">
+            <label class="gate-label" for="gateLoginPassword">密码</label>
+            <div class="gate-pw-wrap">
+              <input type="password" class="gate-input gate-input--pw" id="gateLoginPassword" placeholder="请输入登录密码" autocomplete="current-password" />
+              <button type="button" class="gate-pw-eye" data-pw-toggle="gateLoginPassword" aria-label="显示密码">
+                <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-eye-off"></use></svg>
+              </button>
+            </div>
+          </div>
+          <div class="gate-error" id="gateLoginError" role="alert" hidden></div>
+          <button type="submit" class="rc-btn rc-btn--primary gate-submit" id="gateLoginBtn">登录</button>
+        </form>
+
+        <form class="gate-form" id="gateRegForm" hidden novalidate>
+          <div class="gate-field">
+            <label class="gate-label" for="gateRegEmail">邮箱</label>
+            <input type="email" class="gate-input" id="gateRegEmail" placeholder="name@company.com" autocomplete="email" />
+          </div>
+          <div class="gate-field">
+            <label class="gate-label" for="gateRegName">显示名称（可选）</label>
+            <input type="text" class="gate-input" id="gateRegName" placeholder="例如 张三的 Mac" autocomplete="name" />
+          </div>
+          <div class="gate-field">
+            <label class="gate-label" for="gateRegPassword">密码</label>
+            <div class="gate-pw-wrap">
+              <input type="password" class="gate-input gate-input--pw" id="gateRegPassword" placeholder="至少 8 位密码" autocomplete="new-password" />
+              <button type="button" class="gate-pw-eye" data-pw-toggle="gateRegPassword" aria-label="显示密码">
+                <svg class="ic ic--16" aria-hidden="true" focusable="false"><use href="#i-eye-off"></use></svg>
+              </button>
+            </div>
+          </div>
+          <div class="gate-field">
+            <label class="gate-label" for="gateRegConfirm">确认密码</label>
+            <input type="password" class="gate-input" id="gateRegConfirm" placeholder="再次输入密码" autocomplete="new-password" />
+          </div>
+          <div class="gate-error" id="gateRegError" role="alert" hidden></div>
+          <button type="submit" class="rc-btn rc-btn--primary gate-submit" id="gateRegBtn">注册并登录</button>
+        </form>
+      </div>
+
+      <!-- 门禁 2b：首次登录强制修改密码 -->
+      <div class="gate-step" id="gateStepPasswordChange" hidden>
+        <div class="gate-notice gate-notice--warn">
+          检测到当前账号为初始密码，必须修改密码后才能签发设备证书并进入客户端。
+        </div>
+        <form class="gate-form" id="gateCpForm" novalidate>
+          <div class="gate-field">
+            <label class="gate-label" for="gateCpCurrent">当前密码</label>
+            <input type="password" class="gate-input" id="gateCpCurrent" autocomplete="current-password" />
+          </div>
+          <div class="gate-field">
+            <label class="gate-label" for="gateCpNew">新密码</label>
+            <input type="password" class="gate-input" id="gateCpNew" placeholder="至少 8 位字符" autocomplete="new-password" />
+          </div>
+          <div class="gate-field">
+            <label class="gate-label" for="gateCpConfirm">确认新密码</label>
+            <input type="password" class="gate-input" id="gateCpConfirm" autocomplete="new-password" />
+          </div>
+          <div class="gate-error" id="gateCpError" role="alert" hidden></div>
+          <div class="gate-actions">
+            <button type="button" class="rc-btn rc-btn--secondary" id="gateCpLogoutBtn">退出登录</button>
+            <button type="submit" class="rc-btn rc-btn--primary" id="gateCpSubmitBtn">确认修改并进入</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script src="assets/js/mock.js"></script>
+  <script src="assets/js/bridge.js"></script>
+  <script src="assets/js/overlay.js"></script>
+  <script src="assets/js/app.js"></script>
+</body>
+</html>

@@ -13,6 +13,7 @@
 #
 # 用法：
 #   ./scripts/macos-dev-run.sh check-cert
+#   ./scripts/macos-dev-run.sh ui [--release]
 #   ./scripts/macos-dev-run.sh cli [--release] -- <rc-cli 参数...>
 #   ./scripts/macos-dev-run.sh test <crate> [--release] -- <test 二进制参数...>
 #   ./scripts/macos-dev-run.sh open-settings
@@ -175,6 +176,15 @@ cmd_test() {
                 cargo_args+=(--release)
                 shift
                 ;;
+            --lib)
+                cargo_args+=(--lib)
+                shift
+                ;;
+            --test)
+                [[ $# -ge 2 ]] || die "--test 需要提供集成测试名"
+                cargo_args+=(--test "$2")
+                shift 2
+                ;;
             --)
                 shift
                 break
@@ -213,16 +223,41 @@ print(bins[-1] if bins else "")
     run_packaged_app "$mode" "$@"
 }
 
+cmd_ui() {
+    local pkg_args=(--no-dmg --out "$REPO_ROOT/target/dev-app")
+    local profile="debug"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --release)
+                profile="release"
+                shift
+                ;;
+            --debug)
+                profile="debug"
+                shift
+                ;;
+            *)
+                die "未知 ui 参数: $1（支持 --debug | --release）"
+                ;;
+        esac
+    done
+    pkg_args+=("--$profile")
+    "$REPO_ROOT/scripts/package-macos.sh" "${pkg_args[@]}"
+    echo "==> 通过 LaunchServices 启动 RabbitControl.app"
+    open -n "$REPO_ROOT/target/dev-app/RabbitControl.app"
+}
+
 cmd_open_settings() {
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
 }
 
 main() {
-    [[ $# -ge 1 ]] || die "用法: $0 {check-cert|cli|test|open-settings}"
+    [[ $# -ge 1 ]] || die "用法: $0 {check-cert|ui|cli|test|open-settings}"
     local sub="$1"
     shift
     case "$sub" in
         check-cert) cmd_check_cert "$@" ;;
+        ui) cmd_ui "$@" ;;
         cli) cmd_cli "$@" ;;
         test) cmd_test "$@" ;;
         open-settings) cmd_open_settings "$@" ;;

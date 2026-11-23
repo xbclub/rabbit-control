@@ -72,10 +72,10 @@ T11 需要 Linux，T12 需要 macOS。
 | [T16](T16-idr-reliable-channel.md) | M2-3 IDR 可靠通道完善 | T13, T14 | 全 | M2 | ✅ 已完成（2026-11-21，15 测试；丢包演练 17ms 恢复） |
 | [T17](T17-session-reconnect.md) | 断线重连与会话恢复（M2-9） | T15, T16 | 全 | M2 | ✅ 已完成（2026-11-21，19 测试；rebind 迁移 + 70min 刷新守卫） |
 | [T18](T18-cli-host-client-localhost.md) | rc-cli host/client 双进程直连 + localhost 实测 | T13–T17 | 全（real 仅 macOS） | M2 | ✅ 已完成（2026-11-21，22 测试；localhost 真后端 Run B Gate 全过（首帧 630ms/p50 10.8/p99 18.5/68.3fps），MTU+时钟两根因修复见 TASK.md §13） |
-| [T19](T19-auth-password-approval.md) | M2-5 鉴权：密码挑战 + 接受弹窗联动 | T13, T14 | 全 | M2 | ⬜ 待领取 |
-| [T20](T20-clipboard-text-sync.md) | 剪贴板文本同步（M2-8） | T13, T14 | 全（real 仅 macOS） | M2 | ⬜ 待领取 |
-| [T21](T21-controller-ui.md) | M2-6 控制端 UI（rc-ui） | T13–T18 | **macOS** | M2 | ⬜ 待领取 |
-| [T22](T22-host-tray-approval.md) | 被控端托盘 + 接受弹窗（M2-7） | T18, T19 | **macOS**（会话侧全平台） | M2 | ⬜ 待领取 |
+| [T19](T19-auth-password-approval.md) | M2-5 鉴权：密码挑战 + 接受弹窗联动 | T13, T14 | 全 | M2 | ✅ 已完成（2026-11-22，workflow 6 阶段 + 独立审计捉虫修复；手写 SHA-256/HMAC/PBKDF2 + 唯一非阻塞 `ConnectionApprover` + `--password` 冒烟通过，workspace 577 全绿） |
+| [T20](T20-clipboard-text-sync.md) | 剪贴板文本同步（M2-8） | T13, T14 | 全（real 仅 macOS） | M2 | ✅ 已完成（2026-11-22，workflow 5 阶段 + 独立只读 Review 0 缺陷；0x0F + 同步引擎 + CarbonCore Pasteboard C API + `--clipboard` 真 QUIC E2E，workspace 598 全绿 / 17 ignore） |
+| [T21](T21-controller-ui.md) | M2-6 控制端 UI（rc-ui） | T13–T18 | **macOS** | M2 | ✅ 已完成（2026-11-22，workflow 5 阶段 + 独立 Review 捉 3 处 `CAMetalLayer*` 生命周期/竞态缺陷并以 `LayerLease`+代次状态机闭环；`rc-ui` 并入 workspace `members`，26+6=32 项测试全绿，workspace 652 全绿 / 20 ignore） |
+| [T22](T22-host-tray-approval.md) | 被控端托盘 + 接受弹窗（M2-7） | T18, T19 | **macOS**（会话侧全平台） | M2 | ✅ 已完成（2026-11-22，workflow 4 阶段 + 独立 Review 捉出 3 处并发/时钟/停机缺陷并补 5 回归测试；`rc-host-macos` + `tray_bench --run` 真机通过 + `--tray/--approval/--approval-timeout`，workspace 620 全绿） |
 
 > **2026-11-20 重排**：P0 改为 macOS，主线为 **T02 → T07 → T12 → T05 → T08**。
 > Windows 任务降为 P1（阶段 D），Linux 降为 P2（阶段 E，归档）。

@@ -47,9 +47,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::thread::JoinHandle;
@@ -60,6 +60,8 @@ use rc_proto::{MediaHeader, HEADER_LEN};
 use rc_trace::{Mark, Outcome, TraceCollector, TraceSummary};
 use rc_types::{Error, FrameSeq, Result, Timestamp};
 
+use crate::mtls::{build_mtls_client_tls, build_mtls_server_tls, resolve_mtls_server_name};
+pub use crate::mtls::{cert_sha256_hex, parse_rc_san_uri, MtlsConfig, PeerMtlsIdentity};
 use crate::pacer::Pacer;
 use crate::reassemble::FRAME_STALE_US;
 use crate::stats::LossEstimator;
@@ -119,6 +121,18 @@ const TRACK_STALE_US: u32 = FRAME_STALE_US;
 /// 64 条对键鼠事件是数秒的缓冲余量，连这也填满即视为消费侧已卡死，
 /// 上层应当降频或合并移动类事件后重试。
 const URGENT_QUEUE_CAPACITY: usize = 64;
+
+/// 控制流（Stream A）可靠接收的有界通道容量。
+///
+/// 接收侧消费速度跟不上高速 LAN 发送方时，控制流读线程阻塞在
+/// `sync_channel::send`，让 QUIC 原生流控反压对端而不丢弃任何可靠帧。
+const RELIABLE_RECV_CAPACITY: usize = 256;
+
+/// 单次 [`Transport::poll`] 最多排空的控制流可靠帧数量。
+///
+/// 避免单次 `rc-session::tick()` 瞬间涌入超量 `ToolChannel` 帧触发上层溢出丢包，
+/// 剩余帧留在有界通道内于下一次 `poll` 立即零等待取出。
+const MAX_RELIABLE_PER_POLL: usize = 64;
 
 /// 在 `mtu` 预算下，单个媒体分片可承载的最大负载（字节）。
 ///
@@ -180,63 +194,137 @@ impl Identity {
     pub fn cert_chain(&self) -> &[rustls::pki_types::CertificateDer<'static>] {
         &self.cert_chain
     }
+
+    pub(crate) fn clone_key(&self) -> rustls::pki_types::PrivateKeyDer<'static> {
+        self.key.clone_key()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
 // 端点
 // ─────────────────────────────────────────────────────────────────
 
+/// 共享的端点关闭守卫：最后一个持有者（[`QuicEndpoint`] 或由其创建的
+/// [`QuicTransport`]）释放时立刻调用 `quinn::Endpoint::close`，避免已关闭端点
+/// 继续占着 UDP 套接字进入 3s draining，同时确保测试/调用方提前丢弃临时端点句柄
+/// 不会误杀仍在存活的连接。
+struct EndpointCloser(quinn::Endpoint);
+
+impl Drop for EndpointCloser {
+    fn drop(&mut self) {
+        self.0.close(0u32.into(), b"endpoint closed");
+    }
+}
+
 /// QUIC 端点：绑定本地端口，可发起（Controller）或接受（Host）连接。
 ///
 /// 一个端点可以同时做两件事（QUIC 天然支持）；本卡的用法是
 /// Host `accept`、Controller `connect`。
 pub struct QuicEndpoint {
-    endpoint: quinn::Endpoint,
+    closer: Arc<EndpointCloser>,
     mtu: usize,
     role: Role,
 }
 
+impl Drop for QuicEndpoint {
+    fn drop(&mut self) {
+        // 没有由本端点派生的活跃 `QuicTransport` 时立即关闭底层 `quinn::Endpoint`，
+        // 避免空闲/失败端点或已结束会话继续占用 UDP 套接字；若仍有活跃传输，则由
+        // 最后一个 `EndpointCloser` 持有者释放时执行关闭。
+        if Arc::strong_count(&self.closer) == 1 {
+            self.closer.0.close(0u32.into(), b"endpoint closed");
+        }
+    }
+}
+
 impl QuicEndpoint {
+    fn endpoint(&self) -> &quinn::Endpoint {
+        &self.closer.0
+    }
+
     /// 绑定并监听。`identity` 是本端作为服务端时的证书与私钥。
     pub fn new(cfg: &NetConfig, identity: &Identity) -> Result<Self> {
+        let server_config = build_server_config(identity)?;
+        Self::bind_with_server_config(cfg, Some(server_config))
+    }
+
+    /// 绑定并监听（强制双向 mTLS 校验对端设备证书）。
+    pub fn new_mtls(cfg: &NetConfig, mtls: &MtlsConfig) -> Result<Self> {
+        let server_config = build_mtls_server_config(mtls)?;
+        Self::bind_with_server_config(cfg, Some(server_config))
+    }
+
+    fn bind_with_server_config(
+        cfg: &NetConfig,
+        server_config: Option<quinn::ServerConfig>,
+    ) -> Result<Self> {
         validate_mtu(cfg.mtu)?;
         let socket = UdpSocket::bind(cfg.local_addr)
             .map_err(|e| Error::Network(format!("bind {}: {e}", cfg.local_addr)))?;
+        Self::endpoint_from_socket(socket, cfg.mtu, cfg.role, server_config)
+    }
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|e| Error::InvalidConfig(format!("tls versions: {e}")))?
-            .with_no_client_auth()
-            .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())
-            .map_err(|e| Error::InvalidConfig(format!("server cert: {e}")))?;
-        tls.alpn_protocols = vec![ALPN.to_vec()];
+    /// 基于已绑定（如完成 UDP 打洞）的 [`UdpSocket`] 构造 QUIC 端点。
+    ///
+    /// 当 `identity` 为 `Some` 时配置服务端 TLS 身份以支持 [`Self::accept`]；
+    /// 为 `None` 时仅作为客户端发起 [`Self::connect`]（无需服务端证书）。
+    pub fn from_socket(
+        socket: UdpSocket,
+        config: NetConfig,
+        identity: Option<Identity>,
+    ) -> Result<Self> {
+        let server_config = match identity.as_ref() {
+            Some(id) => Some(build_server_config(id)?),
+            None => None,
+        };
+        Self::endpoint_from_socket(socket, config.mtu, config.role, server_config)
+    }
 
-        let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
-            .map_err(|e| Error::InvalidConfig(format!("quic server crypto: {e}")))?;
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
-        server_config
-            .migration(true) // N9：允许连接迁移
-            .transport_config(transport_config());
+    /// 基于已绑定 [`UdpSocket`] 构造支持双向 mTLS 的 QUIC 端点。
+    ///
+    /// 当 `server_mtls` 为 `Some` 时配置服务端 mTLS 验证器以支持 [`Self::accept`]；
+    /// 为 `None` 时仅作为客户端发起 [`Self::connect_mtls`]。
+    pub fn from_socket_mtls(
+        socket: UdpSocket,
+        config: NetConfig,
+        server_mtls: Option<&MtlsConfig>,
+    ) -> Result<Self> {
+        let server_config = match server_mtls {
+            Some(mtls) => Some(build_mtls_server_config(mtls)?),
+            None => None,
+        };
+        Self::endpoint_from_socket(socket, config.mtu, config.role, server_config)
+    }
+
+    fn endpoint_from_socket(
+        socket: UdpSocket,
+        mtu: usize,
+        role: Role,
+        server_config: Option<quinn::ServerConfig>,
+    ) -> Result<Self> {
+        validate_mtu(mtu)?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| Error::Network(format!("set_nonblocking: {e}")))?;
 
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
-            Some(server_config),
+            server_config,
             socket,
             Arc::new(quinn::SmolRuntime),
         )
         .map_err(|e| Error::Network(format!("endpoint: {e}")))?;
 
         Ok(Self {
-            endpoint,
-            mtu: cfg.mtu,
-            role: cfg.role,
+            closer: Arc::new(EndpointCloser(endpoint)),
+            mtu,
+            role,
         })
     }
 
     /// 实际绑定的本地地址（端口填 0 时由此得知）。
     pub fn local_addr(&self) -> Result<SocketAddr> {
-        self.endpoint
+        self.endpoint()
             .local_addr()
             .map_err(|e| Error::Network(format!("local_addr: {e}")))
     }
@@ -257,10 +345,74 @@ impl QuicEndpoint {
         server_name: &str,
         timeout: Duration,
     ) -> Result<QuicTransport> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| Error::InvalidConfig("connect timeout overflow".into()))?;
+        self.connect_inner(peer, server_certs, server_name, timeout, None)
+    }
 
+    /// 可被外部取消标志打断的 [`Self::connect`] 变体（供 P2P 建连与快速回退使用）。
+    ///
+    /// 握手进行中不会因为分片超时而丢弃在途 `Connecting` future；每 50ms
+    /// 轮询一次 `cancel`，置位时立即中止并返回网络错误。
+    pub fn connect_cancelable(
+        &self,
+        peer: SocketAddr,
+        server_certs: &[rustls::pki_types::CertificateDer<'static>],
+        server_name: &str,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<QuicTransport> {
+        self.connect_inner(peer, server_certs, server_name, timeout, Some(cancel))
+    }
+
+    /// 作为 Controller 以双向 mTLS 连接对端（阻塞至握手完成或超时）。
+    ///
+    /// 会向服务端出示 `mtls.identity` 客户端证书，并校验证书链（`mtls.ca_certs`）、
+    /// `urn:rabbitcontrol:user:{uid}:device:{did}` SAN URI 以及可选的
+    /// `expected_peer_device_id` / `expected_peer_user_id`。
+    /// `server_name` 为空且设置了 `expected_peer_device_id` 时，自动使用
+    /// `device-{did}.rc.internal`。
+    pub fn connect_mtls(
+        &self,
+        peer: SocketAddr,
+        mtls: &MtlsConfig,
+        server_name: &str,
+        timeout: Duration,
+    ) -> Result<QuicTransport> {
+        self.connect_mtls_inner(peer, mtls, server_name, timeout, None)
+    }
+
+    /// 可被外部取消标志打断的 [`Self::connect_mtls`] 变体。
+    pub fn connect_mtls_cancelable(
+        &self,
+        peer: SocketAddr,
+        mtls: &MtlsConfig,
+        server_name: &str,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<QuicTransport> {
+        self.connect_mtls_inner(peer, mtls, server_name, timeout, Some(cancel))
+    }
+
+    fn connect_mtls_inner(
+        &self,
+        peer: SocketAddr,
+        mtls: &MtlsConfig,
+        server_name: &str,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<QuicTransport> {
+        let effective_name = resolve_mtls_server_name(mtls, server_name)?;
+        let tls = build_mtls_client_tls(mtls, ALPN)?;
+        self.connect_with_tls(tls, peer, &effective_name, timeout, cancel)
+    }
+
+    fn connect_inner(
+        &self,
+        peer: SocketAddr,
+        server_certs: &[rustls::pki_types::CertificateDer<'static>],
+        server_name: &str,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<QuicTransport> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut roots = rustls::RootCertStore::empty();
         for c in server_certs {
@@ -274,6 +426,20 @@ impl QuicEndpoint {
             .with_root_certificates(roots)
             .with_no_client_auth();
         tls.alpn_protocols = vec![ALPN.to_vec()];
+        self.connect_with_tls(tls, peer, server_name, timeout, cancel)
+    }
+
+    fn connect_with_tls(
+        &self,
+        tls: rustls::ClientConfig,
+        peer: SocketAddr,
+        server_name: &str,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<QuicTransport> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::InvalidConfig("connect timeout overflow".into()))?;
 
         let quic_client = quinn::crypto::rustls::QuicClientConfig::try_from(Arc::new(tls))
             .map_err(|e| Error::InvalidConfig(format!("quic client crypto: {e}")))?;
@@ -281,49 +447,144 @@ impl QuicEndpoint {
         client_config.transport_config(transport_config());
 
         let connecting = self
-            .endpoint
+            .endpoint()
             .connect_with(client_config, peer, server_name)
             .map_err(|e| Error::Network(format!("connect: {e}")))?;
 
-        let conn = block_on_deadline(connecting, deadline, || Error::Timeout(timeout))
-            .and_then(|r| r.map_err(|e| Error::Network(format!("handshake: {e}"))))?;
+        let conn =
+            block_on_deadline_cancelable(connecting, deadline, cancel, || Error::Timeout(timeout))
+                .and_then(|r| r.map_err(|e| Error::Network(format!("handshake: {e}"))))?;
         // 连接发起方打开两条 reliable 双向流（先控制、后 urgent），各自写入
         // 一条长度为 0 的引导消息：QUIC 的流是「隐式打开」的——不写数据，
         // 对端的 accept_bi 永远看不到这个流（open_bi 只是本地动作）。
         // 打开顺序即角色（open_bi 的流 ID 单调递增），与到达顺序无关。
-        let control = open_bootstrap_stream(&conn, deadline, timeout)?;
-        let urgent = open_bootstrap_stream(&conn, deadline, timeout)?;
+        let control = open_bootstrap_stream(&conn, deadline, timeout, cancel)?;
+        let urgent = open_bootstrap_stream(&conn, deadline, timeout, cancel)?;
         // 输入流优先级高于控制流（叠加优化，见 URGENT_STREAM_PRIORITY）。
         // 流此刻必然存活，失败也无害：真正的发送错误由后续写操作上报。
         let _ = urgent.send.set_priority(URGENT_STREAM_PRIORITY);
-        QuicTransport::new(conn, control, urgent, self.mtu)
+        QuicTransport::new(conn, control, urgent, self.mtu, Arc::clone(&self.closer))
     }
 
     /// 作为 Host 等待并接受一个连接（阻塞至握手完成或超时）。
     pub fn accept(&self, timeout: Duration) -> Result<QuicTransport> {
+        self.accept_inner(None, timeout, None)
+    }
+
+    /// 可被外部取消标志打断的 [`Self::accept`] 变体（供 P2P Host 建连与快速回退使用）。
+    ///
+    /// 在 `timeout` 内持续等待入站连接并完成完整握手，每 50ms 检查 `cancel`；
+    /// 不会因为短分片轮询而误丢已经开始握手的连接。
+    pub fn accept_cancelable(
+        &self,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<QuicTransport> {
+        self.accept_from_cancelable(None, timeout, cancel)
+    }
+
+    /// 可限定预期对端地址且可取消的 [`Self::accept`] 变体（供 P2P Host 定向接受打洞对端）。
+    ///
+    /// - 当 `expected_peer` 为 `Some(addr)` 时，对任何规范化 `(IP, port)` 不匹配的入站
+    ///   `Incoming` 调用 `refuse()` 并继续等待，且单个入站握手或引导流失败时（只要尚未超时
+    ///   且未被取消）继续等待合法对端接入，防止公网扫描器或陈旧对端抢占 P2P 握手；
+    /// - 当 `expected_peer` 为 `None` 时，单个入站握手失败立即返回 `Err(Error::Network)`，
+    ///   以便上层会话统计 `accept_errors`。
+    pub fn accept_from_cancelable(
+        &self,
+        expected_peer: Option<SocketAddr>,
+        timeout: Duration,
+        cancel: &AtomicBool,
+    ) -> Result<QuicTransport> {
+        self.accept_inner(expected_peer, timeout, Some(cancel))
+    }
+
+    fn accept_inner(
+        &self,
+        expected_peer: Option<SocketAddr>,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<QuicTransport> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::InvalidConfig("accept timeout overflow".into()))?;
+        let expected_canon = expected_peer.map(canonical_ip_port);
 
-        let incoming =
-            block_on_deadline(self.endpoint.accept(), deadline, || Error::Timeout(timeout))?
+        loop {
+            if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+                return Err(Error::Network("cancelled".into()));
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout(timeout));
+            }
+
+            let incoming =
+                block_on_deadline_cancelable(self.endpoint().accept(), deadline, cancel, || {
+                    Error::Timeout(timeout)
+                })?
                 .ok_or_else(|| Error::Network("endpoint stopped before accept".into()))?;
-        // Incoming → Connecting：0.11.12 里 Incoming 本身不是 Future。
-        let connecting = incoming
-            .accept()
-            .map_err(|e| Error::Network(format!("accept: {e}")))?;
-        let conn = block_on_deadline(connecting, deadline, || Error::Timeout(timeout))
-            .and_then(|r| r.map_err(|e| Error::Network(format!("handshake: {e}"))))?;
-        // 接受对端打开的两条 reliable 双向流。**角色按流 ID 序号判定**
-        // （先打开的 = control、后打开的 = urgent，见 [`control_is_first`]）：
-        // 弱网丢包重传会让 accept_bi 的交付顺序与打开顺序颠倒，按到达
-        // 顺序分配角色会让两条流静默互换（输入进了控制流、控制进了
-        // 输入流）——流 ID 是打开顺序的权威记录，不受乱序影响。
-        let first = accept_stream(&conn, deadline, timeout)?;
-        let second = accept_stream(&conn, deadline, timeout)?;
-        let (control, urgent) = order_by_stream_index(first, second)?;
-        let _ = urgent.send.set_priority(URGENT_STREAM_PRIORITY);
-        QuicTransport::new(conn, control, urgent, self.mtu)
+
+            if let Some(exp) = expected_canon {
+                if canonical_ip_port(incoming.remote_address()) != exp {
+                    incoming.refuse();
+                    continue;
+                }
+            }
+
+            // Incoming → Connecting：0.11.12 里 Incoming 本身不是 Future。
+            let connecting = match incoming.accept() {
+                Ok(c) => c,
+                Err(_) if expected_canon.is_some() => continue,
+                Err(e) => return Err(Error::Network(format!("accept: {e}"))),
+            };
+            let conn = match block_on_deadline_cancelable(connecting, deadline, cancel, || {
+                Error::Timeout(timeout)
+            }) {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(_)) if expected_canon.is_some() => continue,
+                Ok(Err(e)) => return Err(Error::Network(format!("handshake: {e}"))),
+                Err(err) => return Err(err),
+            };
+            // 接受对端打开的两条 reliable 双向流。**角色按流 ID 序号判定**
+            // （先打开的 = control、后打开的 = urgent，见 [`control_is_first`]）：
+            // 弱网丢包重传会让 accept_bi 的交付顺序与打开顺序颠倒，按到达
+            // 顺序分配角色会让两条流静默互换（输入进了控制流、控制进了
+            // 输入流）——流 ID 是打开顺序的权威记录，不受乱序影响。
+            let first = match accept_stream(&conn, deadline, timeout, cancel) {
+                Ok(s) => s,
+                Err(Error::Timeout(t)) => return Err(Error::Timeout(t)),
+                Err(_) if cancel.is_some_and(|c| c.load(Ordering::Acquire)) => {
+                    return Err(Error::Network("cancelled".into()));
+                }
+                Err(_) if expected_canon.is_some() => {
+                    conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let second = match accept_stream(&conn, deadline, timeout, cancel) {
+                Ok(s) => s,
+                Err(Error::Timeout(t)) => return Err(Error::Timeout(t)),
+                Err(_) if cancel.is_some_and(|c| c.load(Ordering::Acquire)) => {
+                    return Err(Error::Network("cancelled".into()));
+                }
+                Err(_) if expected_canon.is_some() => {
+                    conn.close(quinn::VarInt::from(0u32), b"bootstrap failed");
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let (control, urgent) = match order_by_stream_index(first, second) {
+                Ok(pair) => pair,
+                Err(_) if expected_canon.is_some() => {
+                    conn.close(quinn::VarInt::from(0u32), b"invalid streams");
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let _ = urgent.send.set_priority(URGENT_STREAM_PRIORITY);
+            return QuicTransport::new(conn, control, urgent, self.mtu, Arc::clone(&self.closer));
+        }
     }
 
     /// 迁移到新的 UDP socket（N9：模拟 NAT rebinding 的路径迁移）。
@@ -332,10 +593,23 @@ impl QuicEndpoint {
     /// 新地址（服务端需允许迁移，[`QuicEndpoint::new`] 已开启）。对端
     /// 观察到地址变化后会上报 [`NetEvent::PathChanged`]。
     pub fn rebind(&self, socket: UdpSocket) -> Result<()> {
-        self.endpoint
+        self.endpoint()
             .rebind(socket)
             .map_err(|e| Error::Network(format!("rebind: {e}")))
     }
+}
+
+/// 规范化 `(IP, port)`，将 IPv4-mapped IPv6（`::ffff:a.b.c.d`）统一还原为 IPv4，
+/// 确保双栈套接字与纯 IPv4 套接字间对端地址比对一致。
+fn canonical_ip_port(addr: SocketAddr) -> (IpAddr, u16) {
+    let ip = match addr.ip() {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    };
+    (ip, addr.port())
 }
 
 /// 一条 reliable 双向流（发送 + 接收两半）。
@@ -383,16 +657,52 @@ fn order_by_stream_index(
     }
 }
 
+/// 构造 QUIC 服务端 TLS 与传输配置（`QuicEndpoint::new` 与 `from_socket` 共用）。
+fn build_server_config(identity: &Identity) -> Result<quinn::ServerConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| Error::InvalidConfig(format!("tls versions: {e}")))?
+        .with_no_client_auth()
+        .with_single_cert(identity.cert_chain.clone(), identity.key.clone_key())
+        .map_err(|e| Error::InvalidConfig(format!("server cert: {e}")))?;
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    finish_server_config(tls)
+}
+
+/// 构造强制双向 mTLS 的 QUIC 服务端配置（`QuicEndpoint::new_mtls` 与 `from_socket_mtls` 共用）。
+fn build_mtls_server_config(mtls: &MtlsConfig) -> Result<quinn::ServerConfig> {
+    let tls = build_mtls_server_tls(mtls, ALPN)?;
+    finish_server_config(tls)
+}
+
+fn finish_server_config(tls: rustls::ServerConfig) -> Result<quinn::ServerConfig> {
+    let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(tls))
+        .map_err(|e| Error::InvalidConfig(format!("quic server crypto: {e}")))?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server));
+    server_config
+        .migration(true) // N9：允许连接迁移
+        .transport_config(transport_config());
+    Ok(server_config)
+}
+
 /// 打开一条 reliable 双向流并写入 0 长度引导消息（让对端 accept_bi 可见）。
 fn open_bootstrap_stream(
     conn: &quinn::Connection,
     deadline: Instant,
     timeout: Duration,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ReliableStream> {
-    let (mut send, recv) = block_on_deadline(conn.open_bi(), deadline, || Error::Timeout(timeout))
-        .and_then(|r| r.map_err(|e| Error::Network(format!("open stream: {e}"))))?;
-    block_on(send.write_all(&0u32.to_le_bytes()))
-        .map_err(|e| Error::Network(format!("stream bootstrap: {e}")))?;
+    let (mut send, recv) =
+        block_on_deadline_cancelable(conn.open_bi(), deadline, cancel, || Error::Timeout(timeout))
+            .and_then(|r| r.map_err(|e| Error::Network(format!("open stream: {e}"))))?;
+    block_on_deadline_cancelable(
+        send.write_all(&0u32.to_le_bytes()),
+        deadline,
+        cancel,
+        || Error::Timeout(timeout),
+    )
+    .and_then(|r| r.map_err(|e| Error::Network(format!("stream bootstrap: {e}"))))?;
     Ok(ReliableStream { send, recv })
 }
 
@@ -401,9 +711,12 @@ fn accept_stream(
     conn: &quinn::Connection,
     deadline: Instant,
     timeout: Duration,
+    cancel: Option<&AtomicBool>,
 ) -> Result<ReliableStream> {
-    let (send, recv) = block_on_deadline(conn.accept_bi(), deadline, || Error::Timeout(timeout))
-        .and_then(|r| r.map_err(|e| Error::Network(format!("open stream: {e}"))))?;
+    let (send, recv) = block_on_deadline_cancelable(conn.accept_bi(), deadline, cancel, || {
+        Error::Timeout(timeout)
+    })
+    .and_then(|r| r.map_err(|e| Error::Network(format!("open stream: {e}"))))?;
     Ok(ReliableStream { send, recv })
 }
 
@@ -445,6 +758,10 @@ struct Shared {
     /// pacing 队列（N3）。锁只被发送路径短持有。
     pacer: Mutex<Pacer>,
     pacer_cv: Condvar,
+    /// 双接收通道（`events_rx` + 有界 `reliable_rx`）的统一唤醒信号，
+    /// 让 [`Transport::poll`] 在任意通道到达事件或关闭时 < 1ms 唤醒。
+    event_wake_seq: Mutex<u64>,
+    event_wake_cv: Condvar,
     trace: Mutex<TraceCollector>,
     session_start: Instant,
     sent_bytes: AtomicU64,
@@ -452,14 +769,39 @@ struct Shared {
     datagram_send_errors: AtomicU64,
 }
 
+impl Shared {
+    fn notify_event(&self) {
+        let mut seq = self
+            .event_wake_seq
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *seq = seq.wrapping_add(1);
+        self.event_wake_cv.notify_all();
+    }
+}
+
+/// 后台读线程退出时自动触发事件唤醒的 RAII 守卫，防止所有发送端退出后 `poll` 空等到超时。
+struct WakeOnDrop<'a>(&'a Shared);
+
+impl Drop for WakeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.notify_event();
+    }
+}
+
 /// `Transport` 的 QUIC 实现。
 ///
 /// 构造途径只有 [`QuicEndpoint::connect`] / [`QuicEndpoint::accept`]。
-/// Drop 时关闭连接并回收三条后台线程。
+/// Drop 时关闭连接并回收后台线程。
 pub struct QuicTransport {
     conn: quinn::Connection,
     shared: Arc<Shared>,
     events_rx: Receiver<NetEvent>,
+    /// Stream A（控制流）有界可靠接收通道（容量 [`RELIABLE_RECV_CAPACITY`]）。
+    ///
+    /// `Option` 用于在 [`Drop`] 阶段先释放接收端，立即解除可能阻塞在
+    /// `sync_channel::send` 的控制流读线程，避免 `join` 死锁。
+    reliable_rx: Option<Receiver<Vec<u8>>>,
     /// 控制流的发送半边（单流，天然保序）
     send_stream: quinn::SendStream,
     /// urgent（输入）流的发送入队口：专职写线程持有流本体。
@@ -484,6 +826,8 @@ pub struct QuicTransport {
     /// 接收侧的帧到达跟踪（按 packet_idx 去重 + 过期主动结算），喂 `loss`
     recv_track: ArrivalTracker,
     threads: Vec<JoinHandle<()>>,
+    /// 持有端点引用，确保最后释放时关闭底层 `quinn::Endpoint`。
+    _endpoint_closer: Arc<EndpointCloser>,
 }
 
 impl QuicTransport {
@@ -492,6 +836,7 @@ impl QuicTransport {
         control: ReliableStream,
         urgent: ReliableStream,
         mtu: usize,
+        endpoint_closer: Arc<EndpointCloser>,
     ) -> Result<Self> {
         let ReliableStream {
             send: send_stream,
@@ -503,11 +848,15 @@ impl QuicTransport {
         } = urgent;
 
         let (tx, events_rx) = std::sync::mpsc::channel::<NetEvent>();
+        let (reliable_tx, reliable_rx) =
+            std::sync::mpsc::sync_channel::<Vec<u8>>(RELIABLE_RECV_CAPACITY);
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             conn: conn.clone(),
             pacer: Mutex::new(Pacer::new(DEFAULT_INITIAL_PACING_BPS)),
             pacer_cv: Condvar::new(),
+            event_wake_seq: Mutex::new(0),
+            event_wake_cv: Condvar::new(),
             trace: Mutex::new(TraceCollector::new(4096)),
             session_start: Instant::now(),
             sent_bytes: AtomicU64::new(0),
@@ -535,12 +884,12 @@ impl QuicTransport {
             spawn_named("rc-net-stream", {
                 let tx = tx.clone();
                 let shared = shared.clone();
-                move || stream_reader(control_recv, tx, shared, false)
+                move || control_stream_reader(control_recv, reliable_tx, tx, shared)
             }),
             spawn_named("rc-net-stream-urgent", {
                 let tx = tx.clone();
                 let shared = shared.clone();
-                move || stream_reader(urgent_recv, tx, shared, true)
+                move || urgent_stream_reader(urgent_recv, tx, shared)
             }),
             spawn_named("rc-net-urgent-writer", {
                 let shared = shared.clone();
@@ -556,6 +905,7 @@ impl QuicTransport {
             conn,
             shared,
             events_rx,
+            reliable_rx: Some(reliable_rx),
             send_stream,
             urgent_tx: Some(urgent_tx),
             last_remote,
@@ -563,6 +913,7 @@ impl QuicTransport {
             loss: Mutex::new(LossEstimator::new()),
             recv_track: ArrivalTracker::new(),
             threads,
+            _endpoint_closer: endpoint_closer,
         })
     }
 
@@ -573,6 +924,31 @@ impl QuicTransport {
             Some(peer) => budget.min(peer),
             None => budget,
         }
+    }
+
+    /// 对端传输层地址（QUIC 连接实际远端地址，供会话层审批展示等使用，T19）。
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+
+    /// 提取对端通过 TLS 握手出示的叶子证书身份（需包含 RabbitControl SAN URI）。
+    ///
+    /// 非 mTLS 服务端连接（未要求客户端证书）或对端证书不含合法
+    /// `urn:rabbitcontrol:user:{user_id}:device:{device_id}` SAN URI 时返回 `None`。
+    pub fn peer_mtls_identity(&self) -> Option<PeerMtlsIdentity> {
+        let certs = self
+            .conn
+            .peer_identity()?
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .ok()?;
+        let leaf = certs.first()?;
+        let (user_id, device_id) = parse_rc_san_uri(leaf.as_ref())?;
+        let cert_fingerprint_sha256 = cert_sha256_hex(leaf.as_ref());
+        Some(PeerMtlsIdentity {
+            user_id,
+            device_id,
+            cert_fingerprint_sha256,
+        })
     }
 
     /// 更新 pacing 速率（M3 的拥塞控制从这里接入）。
@@ -840,20 +1216,107 @@ impl Transport for QuicTransport {
             .checked_add(timeout)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
         let mut out = Vec::new();
+        let mut deferred_disconnected = Vec::new();
+        let mut reliable_drained = 0usize;
 
-        // N4：最多阻塞到 deadline。先等第一个事件……
-        if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            match self.events_rx.recv_timeout(remaining) {
-                Ok(ev) => out.push(ev),
-                Err(RecvTimeoutError::Timeout) => {}
-                // 所有发送端（后台线程）都退出：不再有事件源。
-                Err(RecvTimeoutError::Disconnected) => {}
+        let drain_ready = |events_rx: &Receiver<NetEvent>,
+                           reliable_rx: Option<&Receiver<Vec<u8>>>,
+                           out: &mut Vec<NetEvent>,
+                           deferred_disconnected: &mut Vec<NetEvent>,
+                           reliable_drained: &mut usize|
+         -> (bool, bool) {
+            let mut events_disc = false;
+            loop {
+                match events_rx.try_recv() {
+                    Ok(ev @ NetEvent::Disconnected { .. }) => deferred_disconnected.push(ev),
+                    Ok(ev) => out.push(ev),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        events_disc = true;
+                        break;
+                    }
+                }
             }
+            let mut reliable_disc = reliable_rx.is_none();
+            if let Some(rx) = reliable_rx {
+                while *reliable_drained < MAX_RELIABLE_PER_POLL {
+                    match rx.try_recv() {
+                        Ok(payload) => {
+                            out.push(NetEvent::Reliable(payload));
+                            *reliable_drained += 1;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            reliable_disc = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            (events_disc, reliable_disc)
+        };
+
+        // N4 + H1：最多阻塞到 deadline；任一通道（events_rx 或有界 reliable_rx）
+        // 已有就绪事件时立即返回，不空等 timeout；均为空时通过 condvar 在 < 1ms
+        // 内响应任意通道的新事件或退出信号。
+        loop {
+            let observed_seq = *self
+                .shared
+                .event_wake_seq
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let (events_disc, reliable_disc) = drain_ready(
+                &self.events_rx,
+                self.reliable_rx.as_ref(),
+                &mut out,
+                &mut deferred_disconnected,
+                &mut reliable_drained,
+            );
+
+            if !out.is_empty()
+                || !deferred_disconnected.is_empty()
+                || (events_disc && reliable_disc)
+            {
+                break;
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+
+            let mut seq_guard = self
+                .shared
+                .event_wake_seq
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *seq_guard == observed_seq {
+                let (next_guard, wait_res) = self
+                    .shared
+                    .event_wake_cv
+                    .wait_timeout(seq_guard, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+                seq_guard = next_guard;
+                if wait_res.timed_out() {
+                    drop(seq_guard);
+                    let _ = drain_ready(
+                        &self.events_rx,
+                        self.reliable_rx.as_ref(),
+                        &mut out,
+                        &mut deferred_disconnected,
+                        &mut reliable_drained,
+                    );
+                    break;
+                }
+            }
+            drop(seq_guard);
         }
-        // ……再把已就绪的全部取走（非阻塞）。
-        while let Ok(ev) = self.events_rx.try_recv() {
-            out.push(ev);
-        }
+
+        // 本批次内把 Disconnected 排在已就绪 Reliable 帧之后，确保收尾消息不被提前截断。
+        out.extend(deferred_disconnected);
 
         // N9：地址变化 = 路径迁移。QUIC 连接 ID 不变，媒体流天然不断，
         // 这里只负责把变化暴露成事件让上层知情。
@@ -898,9 +1361,13 @@ impl Drop for QuicTransport {
         // 先关闭 urgent 入队口：写线程的 recv_timeout 立即以 Disconnected
         // 返回，不必再多空等一轮 50ms 的 WORKER_IDLE_WAIT。
         self.urgent_tx = None;
+        // 先丢弃有界 reliable 接收端：若控制流读线程正因队列满阻塞在
+        // sync_channel::send，此处立即以 SendError 解除阻塞再 join。
+        self.reliable_rx = None;
         // 关闭连接让阻塞中的读 future 立即出错返回，线程随之退出。
         self.conn
             .close(quinn::VarInt::from(0u32), b"transport dropped");
+        self.shared.notify_event();
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -920,6 +1387,7 @@ fn spawn_named(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> 
 
 /// datagram 接收线程：独自等待 `read_datagram`，结果入事件队列。
 fn datagram_reader(conn: quinn::Connection, tx: Sender<NetEvent>, shared: Arc<Shared>) {
+    let _wake = WakeOnDrop(&shared);
     loop {
         match block_on(conn.read_datagram()) {
             Ok(bytes) => {
@@ -929,28 +1397,32 @@ fn datagram_reader(conn: quinn::Connection, tx: Sender<NetEvent>, shared: Arc<Sh
                 if tx.send(NetEvent::Datagram(bytes.to_vec())).is_err() {
                     return; // 接收端已销毁
                 }
+                shared.notify_event();
             }
             Err(e) => {
                 // 连接断开（正常关闭 / 超时 / 出错）是最后一个事件。
                 let _ = tx.send(NetEvent::Disconnected {
                     reason: e.to_string(),
                 });
+                shared.notify_event();
                 return;
             }
         }
     }
 }
 
-/// reliable 流接收线程：解长度前缀帧，保序交付。
+/// Stream A（控制流）接收线程：解长度前缀帧并通过有界 `sync_channel` 交付。
 ///
-/// `urgent` 区分流归属：控制流交付 [`NetEvent::Reliable`]，
-/// 输入流交付 [`NetEvent::ReliableUrgent`]（成帧完全一致）。
-fn stream_reader(
+/// 当上层消费速度慢于对端发送速度时，此处阻塞在 `reliable_tx.send(payload)`，
+/// 停止继续从 QUIC `RecvStream` 拉取字节，从而触发 QUIC 原生流控反压对端，
+/// 保证零丢帧且不在内存无界堆积。
+fn control_stream_reader(
     mut stream: quinn::RecvStream,
-    tx: Sender<NetEvent>,
+    reliable_tx: SyncSender<Vec<u8>>,
+    events_tx: Sender<NetEvent>,
     shared: Arc<Shared>,
-    urgent: bool,
 ) {
+    let _wake = WakeOnDrop(&shared);
     loop {
         let mut len_buf = [0u8; 4];
         if block_on(stream.read_exact(&mut len_buf)).is_err() {
@@ -958,9 +1430,10 @@ fn stream_reader(
         }
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > MAX_RELIABLE_MSG {
-            let _ = tx.send(NetEvent::Disconnected {
+            let _ = events_tx.send(NetEvent::Disconnected {
                 reason: format!("oversized reliable message: {len} bytes"),
             });
+            shared.notify_event();
             return;
         }
         // 长度 0 是连接引导占位（让对端看见这条流），不作为事件交付。
@@ -972,14 +1445,42 @@ fn stream_reader(
             return;
         }
         shared.recv_bytes.fetch_add(len as u64, Ordering::Relaxed);
-        let ev = if urgent {
-            NetEvent::ReliableUrgent(payload)
-        } else {
-            NetEvent::Reliable(payload)
-        };
-        if tx.send(ev).is_err() {
+        if reliable_tx.send(payload).is_err() {
             return;
         }
+        shared.notify_event();
+    }
+}
+
+/// Stream B（urgent 输入流）接收线程：解长度前缀帧，低延迟交付 [`NetEvent::ReliableUrgent`]。
+fn urgent_stream_reader(mut stream: quinn::RecvStream, tx: Sender<NetEvent>, shared: Arc<Shared>) {
+    let _wake = WakeOnDrop(&shared);
+    loop {
+        let mut len_buf = [0u8; 4];
+        if block_on(stream.read_exact(&mut len_buf)).is_err() {
+            return; // 对端关闭或连接断开
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len > MAX_RELIABLE_MSG {
+            let _ = tx.send(NetEvent::Disconnected {
+                reason: format!("oversized reliable message: {len} bytes"),
+            });
+            shared.notify_event();
+            return;
+        }
+        // 长度 0 是连接引导占位（让对端看见这条流），不作为事件交付。
+        if len == 0 {
+            continue;
+        }
+        let mut payload = vec![0u8; len];
+        if block_on(stream.read_exact(&mut payload)).is_err() {
+            return;
+        }
+        shared.recv_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        if tx.send(NetEvent::ReliableUrgent(payload)).is_err() {
+            return;
+        }
+        shared.notify_event();
     }
 }
 
@@ -1121,10 +1622,14 @@ fn block_on<F: Future>(fut: F) -> F::Output {
     }
 }
 
-/// 带截止时间的 `block_on`；超时返回 `Err(on_timeout())` 并丢弃 future。
-fn block_on_deadline<F: Future>(
+/// 带截止时间与可选外部取消信号的 `block_on`。
+///
+/// 当 `cancel` 存在时，以 50ms 粒度唤醒检查取消标志，而不丢弃在途 future；
+/// 置位时立即返回取消错误，超时返回 `Err(on_timeout())`。
+fn block_on_deadline_cancelable<F: Future>(
     fut: F,
     deadline: Instant,
+    cancel: Option<&AtomicBool>,
     on_timeout: impl FnOnce() -> Error,
 ) -> Result<F::Output> {
     struct ThreadWaker(std::thread::Thread);
@@ -1133,17 +1638,29 @@ fn block_on_deadline<F: Future>(
             self.0.unpark();
         }
     }
+    const CANCEL_POLL_STEP: Duration = Duration::from_millis(50);
     let mut fut = Box::pin(fut);
     let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
     let mut cx = Context::from_waker(&waker);
     loop {
+        if cancel.is_some_and(|c| c.load(Ordering::Acquire)) {
+            return Err(Error::Network("cancelled".into()));
+        }
         let now = Instant::now();
         if now >= deadline {
             return Err(on_timeout());
         }
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(v) => return Ok(v),
-            Poll::Pending => std::thread::park_timeout(deadline - now),
+            Poll::Pending => {
+                let remaining = deadline - now;
+                let wait = if cancel.is_some() {
+                    remaining.min(CANCEL_POLL_STEP)
+                } else {
+                    remaining
+                };
+                std::thread::park_timeout(wait);
+            }
         }
     }
 }
@@ -1378,5 +1895,279 @@ mod tests {
             Error::Network(msg) => assert!(msg.contains("full"), "满队错误必须说明原因：{msg}"),
             other => panic!("满队必须映射为网络错误，got {other:?}"),
         }
+    }
+
+    #[test]
+    fn from_socket_roundtrip_datagram_reliable_and_urgent() {
+        const CERT_PEM: &str = include_str!("../tests/certs/server-cert.pem");
+        const KEY_PEM: &str = include_str!("../tests/certs/server-key.pem");
+
+        let host_sock = UdpSocket::bind("127.0.0.1:0").expect("bind host udp");
+        let host_addr = host_sock.local_addr().expect("host addr");
+        let client_sock = UdpSocket::bind("127.0.0.1:0").expect("bind client udp");
+        let client_addr = client_sock.local_addr().expect("client addr");
+
+        let ident = Identity::from_pem(CERT_PEM, KEY_PEM).expect("identity");
+        let certs = Identity::certs_from_pem(CERT_PEM).expect("certs");
+
+        let host_ep = QuicEndpoint::from_socket(
+            host_sock,
+            NetConfig::new(Role::Host, host_addr),
+            Some(ident),
+        )
+        .expect("host from_socket");
+        let client_ep = QuicEndpoint::from_socket(
+            client_sock,
+            NetConfig::new(Role::Controller, client_addr),
+            None,
+        )
+        .expect("client from_socket");
+
+        assert_eq!(host_ep.local_addr().expect("host local_addr"), host_addr);
+        assert_eq!(
+            client_ep.local_addr().expect("client local_addr"),
+            client_addr
+        );
+
+        let timeout = Duration::from_secs(10);
+        let accepter = std::thread::spawn(move || host_ep.accept(timeout).expect("host accept"));
+        let mut client = client_ep
+            .connect(host_addr, &certs, "rabbitcontrol", timeout)
+            .expect("client connect");
+        let mut host = accepter.join().expect("accepter join");
+
+        // 双向验证 datagram / reliable / urgent 三条通道
+        let dgram_h2c = b"p2p-dgram-from-host".to_vec();
+        let rel_h2c = b"p2p-reliable-from-host".to_vec();
+        let urg_c2h = b"p2p-urgent-from-client".to_vec();
+        let rel_c2h = b"p2p-reliable-from-client".to_vec();
+
+        host.send_datagram(&dgram_h2c).expect("host send_datagram");
+        host.send_reliable(&rel_h2c).expect("host send_reliable");
+        client
+            .send_reliable(&rel_c2h)
+            .expect("client send_reliable");
+        client
+            .send_reliable_urgent(&urg_c2h)
+            .expect("client send_reliable_urgent");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got_dgram = false;
+        let mut got_rel_h2c = false;
+        let mut got_rel_c2h = false;
+        let mut got_urg_c2h = false;
+
+        while Instant::now() < deadline && !(got_dgram && got_rel_h2c && got_rel_c2h && got_urg_c2h)
+        {
+            for ev in client.poll(Duration::from_millis(20)).expect("client poll") {
+                match ev {
+                    NetEvent::Datagram(b) if b == dgram_h2c => got_dgram = true,
+                    NetEvent::Reliable(b) if b == rel_h2c => got_rel_h2c = true,
+                    _ => {}
+                }
+            }
+            for ev in host.poll(Duration::from_millis(20)).expect("host poll") {
+                match ev {
+                    NetEvent::Reliable(b) if b == rel_c2h => got_rel_c2h = true,
+                    NetEvent::ReliableUrgent(b) if b == urg_c2h => got_urg_c2h = true,
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(got_dgram, "client must receive datagram over from_socket");
+        assert!(got_rel_h2c, "client must receive reliable over from_socket");
+        assert!(got_rel_c2h, "host must receive reliable over from_socket");
+        assert!(
+            got_urg_c2h,
+            "host must receive reliable_urgent over from_socket"
+        );
+    }
+
+    #[test]
+    fn accept_from_cancelable_refuses_wrong_peer_and_accepts_expected_peer() {
+        const CERT_PEM: &str = include_str!("../tests/certs/server-cert.pem");
+        const KEY_PEM: &str = include_str!("../tests/certs/server-key.pem");
+
+        let ident = Identity::from_pem(CERT_PEM, KEY_PEM).expect("identity");
+        let certs = Identity::certs_from_pem(CERT_PEM).expect("certs");
+
+        let host_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("host ep");
+        let host_addr = host_ep.local_addr().expect("host addr");
+
+        let wrong_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("wrong ep");
+        let good_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("good ep");
+        let good_addr = good_ep.local_addr().expect("good addr");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_host = Arc::clone(&cancel);
+        let accepter = std::thread::spawn(move || {
+            host_ep.accept_from_cancelable(Some(good_addr), Duration::from_secs(5), &cancel_host)
+        });
+
+        // 先由非预期对端发起连接：Host 必须 refuse 且继续等待合法对端。
+        let wrong_res = wrong_ep.connect(
+            host_addr,
+            &certs,
+            "rabbitcontrol",
+            Duration::from_millis(600),
+        );
+        assert!(
+            wrong_res.is_err(),
+            "unexpected peer must be refused by accept_from_cancelable"
+        );
+
+        // 再由预期对端连接：必须握手成功且远端地址精确匹配。
+        let mut client = good_ep
+            .connect(host_addr, &certs, "rabbitcontrol", Duration::from_secs(5))
+            .expect("expected peer must connect");
+        let mut host = accepter
+            .join()
+            .expect("accepter join")
+            .expect("host must accept expected peer");
+        assert_eq!(
+            canonical_ip_port(host.remote_addr()),
+            canonical_ip_port(good_addr)
+        );
+
+        client.send_reliable(b"hello-expected").expect("send");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = false;
+        while Instant::now() < deadline && !got {
+            for ev in host.poll(Duration::from_millis(20)).expect("poll") {
+                if matches!(ev, NetEvent::Reliable(ref b) if b == b"hello-expected") {
+                    got = true;
+                }
+            }
+        }
+        assert!(got, "expected peer reliable payload must arrive");
+    }
+
+    #[test]
+    fn bounded_reliable_backpressure_delivers_over_512_messages_without_drops() {
+        const CERT_PEM: &str = include_str!("../tests/certs/server-cert.pem");
+        const KEY_PEM: &str = include_str!("../tests/certs/server-key.pem");
+        const TOTAL: u32 = 700;
+
+        let ident = Identity::from_pem(CERT_PEM, KEY_PEM).expect("identity");
+        let certs = Identity::certs_from_pem(CERT_PEM).expect("certs");
+
+        let host_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Host, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("host ep");
+        let host_addr = host_ep.local_addr().expect("host addr");
+        let client_ep = QuicEndpoint::new(
+            &NetConfig::new(Role::Controller, "127.0.0.1:0".parse().unwrap()),
+            &ident,
+        )
+        .expect("client ep");
+
+        let accepter =
+            std::thread::spawn(move || host_ep.accept(Duration::from_secs(10)).expect("accept"));
+        let mut client = client_ep
+            .connect(host_addr, &certs, "rabbitcontrol", Duration::from_secs(10))
+            .expect("connect");
+        let mut host = accepter.join().expect("join");
+
+        // 先排掉初始 Connected，并验证空闲 poll(timeout) 在单条 Reliable 到达时低延迟唤醒。
+        let init_events = host.poll(Duration::from_millis(50)).expect("init poll");
+        assert!(init_events.iter().any(|e| matches!(e, NetEvent::Connected)));
+
+        let wake_sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            client.send_reliable(b"wake-probe").expect("send wake");
+            client
+        });
+        let t_wake = Instant::now();
+        let wake_events = host.poll(Duration::from_secs(2)).expect("wake poll");
+        let wake_elapsed = t_wake.elapsed();
+        assert!(
+            wake_events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Reliable(b) if b == b"wake-probe")),
+            "poll must wake on reliable_rx arrival"
+        );
+        assert!(
+            wake_elapsed < Duration::from_millis(300),
+            "poll wake latency too high: {wake_elapsed:?}"
+        );
+        let mut client = wake_sender.join().expect("wake sender join");
+
+        // 连续灌入 700 条（> 512 且 > RELIABLE_RECV_CAPACITY=256）4 KiB 可靠帧，
+        // 接收侧故意延迟消费以触发有界通道与 QUIC 流控反压，验证零丢帧且每次 poll <= 64 帧。
+        let sender = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            for seq in 0..TOTAL {
+                buf[..4].copy_from_slice(&seq.to_le_bytes());
+                client.send_reliable(&buf).expect("send reliable frame");
+            }
+            client
+        });
+
+        // 刻意停顿让有界接收队列填满并反压对端。
+        std::thread::sleep(Duration::from_millis(60));
+
+        let mut received = Vec::with_capacity(TOTAL as usize);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while received.len() < TOTAL as usize && Instant::now() < deadline {
+            let events = host.poll(Duration::from_millis(50)).expect("host poll");
+            let mut reliable_in_batch = 0usize;
+            for ev in events {
+                if let NetEvent::Reliable(payload) = ev {
+                    reliable_in_batch += 1;
+                    assert_eq!(payload.len(), 4096);
+                    let seq = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                    received.push(seq);
+                }
+            }
+            assert!(
+                reliable_in_batch <= MAX_RELIABLE_PER_POLL,
+                "single poll returned {reliable_in_batch} > MAX_RELIABLE_PER_POLL ({MAX_RELIABLE_PER_POLL})"
+            );
+        }
+
+        let mut client = sender.join().expect("sender join");
+        assert_eq!(
+            received.len(),
+            TOTAL as usize,
+            "must not drop any reliable frame"
+        );
+        let expected: Vec<u32> = (0..TOTAL).collect();
+        assert_eq!(
+            received, expected,
+            "reliable frames must remain strictly ordered"
+        );
+
+        // 验证当有界队列满载阻塞读线程时，Drop 仍能迅速释放而不死锁。
+        let flooder = std::thread::spawn(move || {
+            let payload = vec![0xABu8; 1024];
+            for _ in 0..(RELIABLE_RECV_CAPACITY + 64) {
+                if client.send_reliable(&payload).is_err() {
+                    break;
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(40));
+        let drop_start = Instant::now();
+        drop(host);
+        assert!(
+            drop_start.elapsed() < Duration::from_secs(2),
+            "QuicTransport::drop must unblock full reliable_rx without deadlock"
+        );
+        let _ = flooder.join();
     }
 }

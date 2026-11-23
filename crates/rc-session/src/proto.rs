@@ -27,7 +27,7 @@ use rc_types::{Error, Result};
 /// 消费错误：`Error::Protocol` 本就是 `is_fatal() == true`）。
 pub const PROTOCOL_VERSION: u8 = 1;
 
-// ── 类型号（0x01..=0x0C 本卡实现；0x0D..=0x0F 冻结占号，T19/T20 增量添加）──
+// ── 类型号（0x01..=0x12 全部实装）──
 
 /// 线格式类型字节：`Hello`（client→host 握手请求）。
 pub const TYPE_HELLO: u8 = 0x01;
@@ -53,16 +53,67 @@ pub const TYPE_INPUT_ACK: u8 = 0x0A;
 pub const TYPE_RECONNECT_REQUEST: u8 = 0x0B;
 /// 线格式类型字节：`Bye`（双向优雅关闭 / 饱和刷新）。
 pub const TYPE_BYE: u8 = 0x0C;
-/// 预留：鉴权挑战（M2-5 / T19）。占号公开，载荷语义 T19 定义。
+/// 线格式类型字节：`AuthChallenge`（host→client 密码挑战，M2-5 / T19）。
 pub const TYPE_AUTH_CHALLENGE: u8 = 0x0D;
-/// 预留：鉴权应答（M2-5 / T19）。
+/// 线格式类型字节：`AuthResponse`（client→host 挑战应答，M2-5 / T19）。
 pub const TYPE_AUTH_RESPONSE: u8 = 0x0E;
-/// 预留：剪贴板文本通知（M2-8 / T20）。
+/// 线格式类型字节：`ClipboardNotify`（双向，剪贴板文本通知，M2-8 / T20）。
 pub const TYPE_CLIPBOARD_NOTIFY: u8 = 0x0F;
+/// 线格式类型字节：`ToolChannel`（双向，工具复用通道：文件/终端/端口映射/音频控制）。
+pub const TYPE_TOOL_CHANNEL: u8 = 0x10;
+/// 线格式类型字节：`AudioFrame`（双向，音频帧传输通道）。
+pub const TYPE_AUDIO_FRAME: u8 = 0x11;
+/// 线格式类型字节：`OwnerAuthResponse`（client→host 自控免密挑战签名应答）。
+pub const TYPE_OWNER_AUTH_RESPONSE: u8 = 0x12;
+
+/// 工具复用子通道号：文件传输（W2）。
+pub const TOOL_CHANNEL_FILE: u8 = 1;
+/// 工具复用子通道号：PTY 终端（W3）。
+pub const TOOL_CHANNEL_TERMINAL: u8 = 2;
+/// 工具复用子通道号：端口转发（W4）。
+pub const TOOL_CHANNEL_PORTMAP: u8 = 3;
+/// 工具复用子通道号：音频控制。
+pub const TOOL_CHANNEL_AUDIO_CTRL: u8 = 4;
+/// 工具复用子通道号：显示控制（分辨率与帧率热切换）。
+pub const TOOL_CHANNEL_DISPLAY_CTRL: u8 = 5;
+
+/// 工具复用单条载荷最大字节数（256 KiB）。
+pub const MAX_TOOL_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// 音频编解码标识：16 位有符号小端 PCM。
+pub const AUDIO_CODEC_PCM16: u8 = 0;
+/// 音频编解码标识：IMA-ADPCM。
+pub const AUDIO_CODEC_IMA_ADPCM: u8 = 1;
+
+/// 单帧音频数据最大字节数（32 KiB）。
+pub const MAX_AUDIO_FRAME_BYTES: usize = 32 * 1024;
+
+/// 音频采样率下界（Hz，8 kHz）。
+pub const MIN_AUDIO_SAMPLE_RATE: u32 = 8_000;
+/// 音频采样率上界（Hz，192 kHz）。
+pub const MAX_AUDIO_SAMPLE_RATE: u32 = 192_000;
+
+/// 剪贴板文本的最大**字节数**（不是字符数）。与变长段 u16 长度前缀同宽，
+/// 线格式上限与引擎上限共用这一个常量（单一事实源）。
+/// 要提升上限必须走 `PROTOCOL_VERSION` 版本协商，不得私自改 u32 前缀。
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = u16::MAX as usize;
 
 /// [`ControlMessage::BwProbeRequest`] 的 `total_bytes` 线格式上限
 /// （设计师裁定 256KB）：恶意 client 不得借探测流量打满带宽。
 pub const MAX_BW_PROBE_BYTES: u32 = 256 * 1024;
+
+/// AuthChallenge 盐长度（字节）。固定长度，线格式无长度前缀。
+pub const AUTH_SALT_LEN: usize = 16;
+/// AuthResponse 证明长度（字节）= PBKDF2-HMAC-SHA256 输出长度。
+pub const AUTH_PROOF_LEN: usize = 32;
+/// AuthChallenge.iterations 的线格式上限。decode 拒收 0 与超限值
+/// （对齐 BwProbeRequest.total_bytes 的防灌边界纪律：恶意 host
+/// 不得借荒谬迭代数烧 client CPU）。
+pub const MAX_AUTH_ITERATIONS: u32 = 1_000_000;
+/// OwnerAuthResponse 签名载荷最大字节数（1..=128）。
+pub const MAX_OWNER_SIGNATURE_LEN: usize = 128;
+/// Hello.auth_payload 携带自控票据载荷的合理长度上限（4 KiB）。
+pub const MAX_OWNER_TICKET_PAYLOAD_LEN: usize = 4096;
 
 /// Hello 请求 / Welcome 裁定共用的流参数（client 请求值，host 夹紧后
 /// 的真值）。**线格式不做语义校验**：0 或离谱值照收，夹紧归 T14。
@@ -78,14 +129,28 @@ pub struct SessionParams {
     pub bitrate_bps: u32,
 }
 
-/// Hello 的鉴权方式。0=无（本轮唯一实装），1=密码（M2-5 / T19 预留）。
+/// Hello 的鉴权方式：0=无、1=密码（M2-5 / T19）、2=自控免密签名票据（OwnerTicket PoP）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AuthMethod {
-    /// 无鉴权（本阶段唯一实装值）。
+    /// 无鉴权。
     None = 0,
     /// 密码鉴权（M2-5 / T19 实装）。
     Password = 1,
+    /// 自控免密签名票据鉴权（OwnerTicket PoP）。
+    OwnerTicket = 2,
+}
+
+impl AuthMethod {
+    /// 从线上字节解析鉴权方式；仅接受 `0`（None）、`1`（Password）、`2`（OwnerTicket）。
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::None),
+            1 => Some(Self::Password),
+            2 => Some(Self::OwnerTicket),
+            _ => None,
+        }
+    }
 }
 
 /// Welcome 的鉴权状态。2=拒绝并断开。
@@ -170,9 +235,9 @@ pub struct Hello {
     pub session_id: u64,
     /// 请求参数（host 侧按显示器与编码器能力夹紧，见 Welcome）。
     pub requested: SessionParams,
-    /// 鉴权方式。本轮会话层只接受 None（T19 实装 Password）。
+    /// 鉴权方式（None / Password / OwnerTicket）。
     pub auth_method: AuthMethod,
-    /// 鉴权载荷（线上带 auth_len u16 前缀；T19 前恒空）。
+    /// 鉴权载荷（线上带 auth_len u16 前缀；`OwnerTicket` 时携带序列化的 `owner_grant`，上限 [`MAX_OWNER_TICKET_PAYLOAD_LEN`]）。
     pub auth_payload: Vec<u8>,
 }
 
@@ -188,6 +253,39 @@ pub struct Welcome {
     pub auth_status: AuthStatus,
     /// host 能力位。
     pub host_flags: HostFlags,
+}
+
+/// 0x0D AuthChallenge（host→client，M2-5 / T19）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthChallenge {
+    /// PBKDF2 盐：host 每次握手随机生成、一次性使用——重放旧 proof 必失败。
+    pub salt: [u8; AUTH_SALT_LEN],
+    /// PBKDF2 迭代次数（decode 校验 1..=MAX_AUTH_ITERATIONS）。
+    pub iterations: u32,
+}
+
+/// 0x0E AuthResponse（client→host，M2-5 / T19）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthResponse {
+    /// 证明 = PBKDF2-HMAC-SHA256(password_utf8, salt, iterations)。
+    pub proof: [u8; AUTH_PROOF_LEN],
+}
+
+/// 一帧音频数据包（用于会话层发送与排空接口）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioFramePacket {
+    /// 音频帧序号。
+    pub seq: u32,
+    /// 采集/播放时间戳（微秒）。
+    pub timestamp_us: u32,
+    /// 采样率（Hz，必须大于 0）。
+    pub sample_rate: u32,
+    /// 声道数（1=单声道，2=立体声）。
+    pub channels: u8,
+    /// 编解码标识（[`AUDIO_CODEC_PCM16`] 或 [`AUDIO_CODEC_IMA_ADPCM`]）。
+    pub codec: u8,
+    /// 音频帧数据，字节数 ≤ [`MAX_AUDIO_FRAME_BYTES`]。
+    pub data: Vec<u8>,
 }
 
 /// 一条控制消息。**通道约定**：除 [`ControlMessage::BwProbeData`] 走
@@ -282,9 +380,95 @@ pub enum ControlMessage {
         /// 关闭原因。
         reason: ByeReason,
     },
+    /// 0x0D host→client：密码挑战（M2-5 / T19）。
+    AuthChallenge(AuthChallenge),
+    /// 0x0E client→host：挑战应答（M2-5 / T19）。
+    AuthResponse(AuthResponse),
+    /// 0x0F ClipboardNotify（双向，M2-8 / T20）。
+    /// 线格式：`[0x0F][len u16 LE][text]`——text 是 UTF-8 原始字节，
+    /// 可含 NUL，长度前缀定界、不做转义；len 按字节计（非字符数）。
+    /// 空文本合法（len=0，语义：对端剪贴板无文本可粘）。
+    /// 走 reliable 控制流（Stream A），绝不走 datagram / urgent。
+    ClipboardNotify {
+        /// UTF-8 文本，字节数 ≤ [`MAX_CLIPBOARD_TEXT_BYTES`]。
+        text: String,
+    },
+    /// 0x10 ToolChannel（双向，工具复用通道）。
+    /// 线格式：`[0x10][channel: u8][len: u32 LE][payload: len bytes]`。
+    /// `channel` 必须为 `1..=5`，`len` ≤ [`MAX_TOOL_PAYLOAD_BYTES`]。
+    /// 走 reliable 控制流（Stream A）。
+    ToolChannel {
+        /// 子通道号（[`TOOL_CHANNEL_FILE`]..=[`TOOL_CHANNEL_DISPLAY_CTRL`]）。
+        channel: u8,
+        /// 子通道载荷，字节数 ≤ [`MAX_TOOL_PAYLOAD_BYTES`]。
+        payload: Vec<u8>,
+    },
+    /// 0x11 AudioFrame（双向，音频帧通道）。
+    /// 线格式：`[0x11][seq: u32 LE][timestamp_us: u32 LE][sample_rate: u32 LE][channels: u8][codec: u8][len: u16 LE][data: len bytes]`。
+    /// 走 reliable 控制流（Stream A）。
+    AudioFrame {
+        /// 音频帧序号。
+        seq: u32,
+        /// 采集/播放时间戳（微秒）。
+        timestamp_us: u32,
+        /// 采样率（Hz，必须大于 0）。
+        sample_rate: u32,
+        /// 声道数（1 或 2）。
+        channels: u8,
+        /// 编解码标识（[`AUDIO_CODEC_PCM16`] 或 [`AUDIO_CODEC_IMA_ADPCM`]）。
+        codec: u8,
+        /// 音频帧数据，字节数 ≤ [`MAX_AUDIO_FRAME_BYTES`]。
+        data: Vec<u8>,
+    },
+    /// 0x12 OwnerAuthResponse（client→host，自控免密挑战签名应答）。
+    /// 线格式：`[0x12][len: u16 LE (1..=128)][signature: len bytes]`。
+    /// 走 reliable 控制流（Stream A）。
+    OwnerAuthResponse {
+        /// 对挑战 `(session_id, salt)` 的 PoP 签名（长度在 `1..=MAX_OWNER_SIGNATURE_LEN`）。
+        signature: Vec<u8>,
+    },
 }
 
 impl ControlMessage {
+    /// 构造一条剪贴板通知（唯一合法构造路径）。
+    /// `text` 字节数 > [`MAX_CLIPBOARD_TEXT_BYTES`] → `Err(InvalidConfig)`：
+    /// 发送侧「宁不传不截断」在构造点就拦住，`encode` 因此可以保持
+    /// T13 契约「不失败、不 panic」（越界值属构造契约违反，
+    /// `debug_assert` 钉开发期；release 下长度字段饱和 `u16::MAX` 仅为
+    /// 防御性处理，按契约不可达）。
+    pub fn clipboard_notify(text: String) -> Result<Self> {
+        if text.len() > MAX_CLIPBOARD_TEXT_BYTES {
+            return Err(Error::InvalidConfig(format!(
+                "clipboard text {} bytes exceeds MAX_CLIPBOARD_TEXT_BYTES {MAX_CLIPBOARD_TEXT_BYTES}",
+                text.len()
+            )));
+        }
+        Ok(ControlMessage::ClipboardNotify { text })
+    }
+
+    /// 校验并构造一条 `ToolChannel` 消息（发送侧入口：`channel` 须在 `1..=5`、
+    /// `payload.len()` ≤ [`MAX_TOOL_PAYLOAD_BYTES`]，否则返回 `Error::InvalidConfig`）。
+    pub fn tool_channel(channel: u8, payload: Vec<u8>) -> Result<Self> {
+        validate_tool_message(channel, payload.len())?;
+        Ok(ControlMessage::ToolChannel { channel, payload })
+    }
+
+    /// 校验并构造一条 `AudioFrame` 消息（发送侧入口：`sample_rate` 须在
+    /// `MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE`、`channels in 1..=2`、
+    /// `codec <= AUDIO_CODEC_IMA_ADPCM`、`data.len() <= MAX_AUDIO_FRAME_BYTES`，
+    /// 且 `AUDIO_CODEC_PCM16` 时 `data.len()` 须按 `2 * channels` 整帧对齐，
+    /// 否则返回 `Error::InvalidConfig`）。
+    pub fn audio_frame(packet: AudioFramePacket) -> Result<Self> {
+        validate_audio_frame(&packet)?;
+        Ok(ControlMessage::AudioFrame {
+            seq: packet.seq,
+            timestamp_us: packet.timestamp_us,
+            sample_rate: packet.sample_rate,
+            channels: packet.channels,
+            codec: packet.codec,
+            data: packet.data,
+        })
+    }
     /// 编码并**追加**到 `out`（风格对齐 rc-input 的 `encode_events`）。
     /// 空载荷变体只写类型字节。不失败、不 panic。
     ///
@@ -300,14 +484,12 @@ impl ControlMessage {
                 out.extend_from_slice(&h.session_id.to_le_bytes());
                 encode_params(&h.requested, out);
                 out.push(h.auth_method as u8);
-                // auth_payload 长度前缀（u16 LE）。T19 前恒空；若调用方
-                // 塞入超过 u16 的载荷（bug），饱和为 u16::MAX——对端
-                // decode 时长度前缀与实际字节数对不上会显式拒绝而非
-                // 静默错乱（最后防线，对齐 rc-input encode_events）。
+                // auth_payload 长度前缀（u16 LE）。若调用方塞入超过上限的载荷，
+                // 饱和为 u16::MAX——对端 decode 时长度前缀或上限校验会显式拒绝。
                 let len = u16::try_from(h.auth_payload.len()).unwrap_or(u16::MAX);
                 debug_assert!(
-                    usize::from(len) == h.auth_payload.len(),
-                    "auth_payload {} 字节超过 u16 长度上限（T19 前恒空，不该发生）",
+                    h.auth_payload.len() <= MAX_OWNER_TICKET_PAYLOAD_LEN,
+                    "auth_payload {} 字节超过 MAX_OWNER_TICKET_PAYLOAD_LEN ({MAX_OWNER_TICKET_PAYLOAD_LEN})",
                     h.auth_payload.len()
                 );
                 out.extend_from_slice(&len.to_le_bytes());
@@ -387,14 +569,80 @@ impl ControlMessage {
                 out.push(TYPE_BYE);
                 out.push(*reason as u8);
             }
+            ControlMessage::AuthChallenge(ch) => {
+                out.push(TYPE_AUTH_CHALLENGE);
+                out.extend_from_slice(&ch.salt);
+                out.extend_from_slice(&ch.iterations.to_le_bytes());
+            }
+            ControlMessage::AuthResponse(resp) => {
+                out.push(TYPE_AUTH_RESPONSE);
+                out.extend_from_slice(&resp.proof);
+            }
+            ControlMessage::ClipboardNotify { text } => {
+                out.push(TYPE_CLIPBOARD_NOTIFY);
+                let len = u16::try_from(text.len()).unwrap_or(u16::MAX);
+                debug_assert!(
+                    text.len() <= MAX_CLIPBOARD_TEXT_BYTES,
+                    "clipboard text {} 字节超过 MAX_CLIPBOARD_TEXT_BYTES ({MAX_CLIPBOARD_TEXT_BYTES})，应经 ControlMessage::clipboard_notify 构造",
+                    text.len()
+                );
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(text.as_bytes());
+            }
+            ControlMessage::ToolChannel { channel, payload } => {
+                out.push(TYPE_TOOL_CHANNEL);
+                out.push(*channel);
+                let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+                debug_assert!(
+                    payload.len() <= MAX_TOOL_PAYLOAD_BYTES,
+                    "tool_channel payload {} bytes exceeds MAX_TOOL_PAYLOAD_BYTES ({MAX_TOOL_PAYLOAD_BYTES})",
+                    payload.len()
+                );
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(payload);
+            }
+            ControlMessage::AudioFrame {
+                seq,
+                timestamp_us,
+                sample_rate,
+                channels,
+                codec,
+                data,
+            } => {
+                out.push(TYPE_AUDIO_FRAME);
+                out.extend_from_slice(&seq.to_le_bytes());
+                out.extend_from_slice(&timestamp_us.to_le_bytes());
+                out.extend_from_slice(&sample_rate.to_le_bytes());
+                out.push(*channels);
+                out.push(*codec);
+                let len = u16::try_from(data.len()).unwrap_or(u16::MAX);
+                debug_assert!(
+                    data.len() <= MAX_AUDIO_FRAME_BYTES,
+                    "audio_frame data {} bytes exceeds MAX_AUDIO_FRAME_BYTES ({MAX_AUDIO_FRAME_BYTES})",
+                    data.len()
+                );
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(data);
+            }
+            ControlMessage::OwnerAuthResponse { signature } => {
+                out.push(TYPE_OWNER_AUTH_RESPONSE);
+                let len = u16::try_from(signature.len()).unwrap_or(u16::MAX);
+                debug_assert!(
+                    (1..=MAX_OWNER_SIGNATURE_LEN).contains(&signature.len()),
+                    "owner_auth_response signature {} bytes must be in 1..={MAX_OWNER_SIGNATURE_LEN}",
+                    signature.len()
+                );
+                out.extend_from_slice(&len.to_le_bytes());
+                out.extend_from_slice(signature);
+            }
         }
     }
 
     /// 解码一条完整消息（[`encode`](ControlMessage::encode) 的逆）。
     ///
-    /// 空缓冲、未知类型字节、预留号（0x0D..=0x0F）、version 不匹配、
-    /// 枚举字段越界、布尔字段非 0/1、host_flags 未知 bit、auth_len 与
-    /// 实际字节数不符、载荷截断、尾部多余字节——一律返回
+    /// 空缓冲、未知类型字节、version 不匹配、枚举字段越界、布尔字段非 0/1、
+    /// host_flags 未知 bit、auth_len 与实际字节数不符、iterations 越界、
+    /// 剪贴板文本非合法 UTF-8、载荷截断、尾部多余字节——一律返回
     /// [`rc_types::Error::Protocol`]（带 offset 与出错值），绝不 panic、
     /// 绝不静默跳过。
     pub fn decode(buf: &[u8]) -> Result<Self> {
@@ -494,12 +742,155 @@ impl ControlMessage {
                 r.done("Bye")?;
                 ControlMessage::Bye { reason }
             }
-            // 预留号显式拒收：占号冻结，变体由 T19/T20 增量添加。
-            TYPE_AUTH_CHALLENGE | TYPE_AUTH_RESPONSE => {
-                return Err(reserved(ty, "auth (T19 / M2-5)"))
+            TYPE_AUTH_CHALLENGE => {
+                let salt_slice = r.take(AUTH_SALT_LEN, "auth_challenge.salt")?;
+                let mut salt = [0u8; AUTH_SALT_LEN];
+                salt.copy_from_slice(salt_slice);
+                let iters_off = r.off;
+                let iterations = r.u32("auth_challenge.iterations")?;
+                if iterations == 0 {
+                    return Err(Error::Protocol {
+                        offset: iters_off,
+                        msg: format!(
+                            "auth_challenge.iterations must be in 1..={MAX_AUTH_ITERATIONS}, got 0"
+                        ),
+                    });
+                }
+                if iterations > MAX_AUTH_ITERATIONS {
+                    return Err(Error::Protocol {
+                        offset: iters_off,
+                        msg: format!(
+                            "auth_challenge.iterations {iterations} exceeds \
+                             MAX_AUTH_ITERATIONS {MAX_AUTH_ITERATIONS}"
+                        ),
+                    });
+                }
+                r.done("AuthChallenge")?;
+                ControlMessage::AuthChallenge(AuthChallenge { salt, iterations })
+            }
+            TYPE_AUTH_RESPONSE => {
+                let proof_slice = r.take(AUTH_PROOF_LEN, "auth_response.proof")?;
+                let mut proof = [0u8; AUTH_PROOF_LEN];
+                proof.copy_from_slice(proof_slice);
+                r.done("AuthResponse")?;
+                ControlMessage::AuthResponse(AuthResponse { proof })
             }
             TYPE_CLIPBOARD_NOTIFY => {
-                return Err(reserved(ty, "clipboard text notify (T20 / M2-8)"))
+                let len = usize::from(r.u16("clipboard_notify.len")?);
+                let text_off = r.off;
+                let raw = r.take(len, "clipboard_notify.text")?;
+                let text = std::str::from_utf8(raw)
+                    .map_err(|e| Error::Protocol {
+                        offset: text_off + e.valid_up_to(),
+                        msg: format!("clipboard_notify.text is not valid UTF-8: {e}"),
+                    })?
+                    .to_owned();
+                r.done("ClipboardNotify")?;
+                ControlMessage::ClipboardNotify { text }
+            }
+            TYPE_TOOL_CHANNEL => {
+                let ch_off = r.off;
+                let channel = r.u8("tool_channel.channel")?;
+                if channel == 0 || channel > TOOL_CHANNEL_DISPLAY_CTRL {
+                    return Err(Error::Protocol {
+                        offset: ch_off,
+                        msg: format!(
+                            "tool_channel.channel must be in {TOOL_CHANNEL_FILE}..={TOOL_CHANNEL_DISPLAY_CTRL}, got {channel}"
+                        ),
+                    });
+                }
+                let len_off = r.off;
+                let len_u32 = r.u32("tool_channel.len")?;
+                let len = usize::try_from(len_u32).unwrap_or(usize::MAX);
+                if len > MAX_TOOL_PAYLOAD_BYTES {
+                    return Err(Error::Protocol {
+                        offset: len_off,
+                        msg: format!(
+                            "tool_channel.len {len_u32} exceeds MAX_TOOL_PAYLOAD_BYTES {MAX_TOOL_PAYLOAD_BYTES}"
+                        ),
+                    });
+                }
+                let payload = r.take(len, "tool_channel.payload")?.to_vec();
+                r.done("ToolChannel")?;
+                ControlMessage::ToolChannel { channel, payload }
+            }
+            TYPE_AUDIO_FRAME => {
+                let seq = r.u32("audio_frame.seq")?;
+                let timestamp_us = r.u32("audio_frame.timestamp_us")?;
+                let sr_off = r.off;
+                let sample_rate = r.u32("audio_frame.sample_rate")?;
+                if !(MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(&sample_rate) {
+                    return Err(Error::Protocol {
+                        offset: sr_off,
+                        msg: format!(
+                            "audio_frame.sample_rate must be in {MIN_AUDIO_SAMPLE_RATE}..={MAX_AUDIO_SAMPLE_RATE}, got {sample_rate}"
+                        ),
+                    });
+                }
+                let ch_off = r.off;
+                let channels = r.u8("audio_frame.channels")?;
+                if channels == 0 || channels > 2 {
+                    return Err(Error::Protocol {
+                        offset: ch_off,
+                        msg: format!("audio_frame.channels must be 1 or 2, got {channels}"),
+                    });
+                }
+                let codec_off = r.off;
+                let codec = r.u8("audio_frame.codec")?;
+                if codec > AUDIO_CODEC_IMA_ADPCM {
+                    return Err(Error::Protocol {
+                        offset: codec_off,
+                        msg: format!(
+                            "audio_frame.codec must be {AUDIO_CODEC_PCM16}(PCM16) or {AUDIO_CODEC_IMA_ADPCM}(IMA_ADPCM), got {codec}"
+                        ),
+                    });
+                }
+                let len_off = r.off;
+                let len = usize::from(r.u16("audio_frame.len")?);
+                if len > MAX_AUDIO_FRAME_BYTES {
+                    return Err(Error::Protocol {
+                        offset: len_off,
+                        msg: format!(
+                            "audio_frame.len {len} exceeds MAX_AUDIO_FRAME_BYTES {MAX_AUDIO_FRAME_BYTES}"
+                        ),
+                    });
+                }
+                if codec == AUDIO_CODEC_PCM16 {
+                    let frame_align = 2 * usize::from(channels);
+                    if len % frame_align != 0 {
+                        return Err(Error::Protocol {
+                            offset: len_off,
+                            msg: format!(
+                                "audio_frame.len {len} for PCM16 ({channels}ch) must be a multiple of {frame_align}"
+                            ),
+                        });
+                    }
+                }
+                let data = r.take(len, "audio_frame.data")?.to_vec();
+                r.done("AudioFrame")?;
+                ControlMessage::AudioFrame {
+                    seq,
+                    timestamp_us,
+                    sample_rate,
+                    channels,
+                    codec,
+                    data,
+                }
+            }
+            TYPE_OWNER_AUTH_RESPONSE => {
+                let len_off = r.off;
+                let len = usize::from(r.u16("owner_auth_response.len")?);
+                if len == 0 || len > MAX_OWNER_SIGNATURE_LEN {
+                    return Err(Error::Protocol {
+                        offset: len_off,
+                        msg: format!(
+                            "owner_auth_response.len must be in 1..={MAX_OWNER_SIGNATURE_LEN}, got {len}"
+                        ),
+                    });
+                }
+                let signature = r.take(len, "owner_auth_response.signature")?.to_vec();
+                r.done("OwnerAuthResponse")?;
+                ControlMessage::OwnerAuthResponse { signature }
             }
             v => {
                 return Err(Error::Protocol {
@@ -515,6 +906,60 @@ impl ControlMessage {
 // ─────────────────────────────────────────────────────────────────
 // 私有编码 / 解码辅助
 // ─────────────────────────────────────────────────────────────────
+
+/// 发送侧校验 `ToolChannel` 参数。
+pub(crate) fn validate_tool_message(channel: u8, payload_len: usize) -> Result<()> {
+    if channel == 0 || channel > TOOL_CHANNEL_DISPLAY_CTRL {
+        return Err(Error::InvalidConfig(format!(
+            "tool_channel.channel must be in {TOOL_CHANNEL_FILE}..={TOOL_CHANNEL_DISPLAY_CTRL}, got {channel}"
+        )));
+    }
+    if payload_len > MAX_TOOL_PAYLOAD_BYTES {
+        return Err(Error::InvalidConfig(format!(
+            "tool_channel payload {payload_len} bytes exceeds MAX_TOOL_PAYLOAD_BYTES {MAX_TOOL_PAYLOAD_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+/// 发送侧校验 `AudioFramePacket` 参数。
+pub(crate) fn validate_audio_frame(packet: &AudioFramePacket) -> Result<()> {
+    if !(MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE).contains(&packet.sample_rate) {
+        return Err(Error::InvalidConfig(format!(
+            "audio_frame.sample_rate must be in {MIN_AUDIO_SAMPLE_RATE}..={MAX_AUDIO_SAMPLE_RATE}, got {}",
+            packet.sample_rate
+        )));
+    }
+    if packet.channels == 0 || packet.channels > 2 {
+        return Err(Error::InvalidConfig(format!(
+            "audio_frame.channels must be 1 or 2, got {}",
+            packet.channels
+        )));
+    }
+    if packet.codec > AUDIO_CODEC_IMA_ADPCM {
+        return Err(Error::InvalidConfig(format!(
+            "audio_frame.codec must be {AUDIO_CODEC_PCM16}(PCM16) or {AUDIO_CODEC_IMA_ADPCM}(IMA_ADPCM), got {}",
+            packet.codec
+        )));
+    }
+    if packet.data.len() > MAX_AUDIO_FRAME_BYTES {
+        return Err(Error::InvalidConfig(format!(
+            "audio_frame data {} bytes exceeds MAX_AUDIO_FRAME_BYTES {MAX_AUDIO_FRAME_BYTES}",
+            packet.data.len()
+        )));
+    }
+    if packet.codec == AUDIO_CODEC_PCM16 {
+        let frame_align = 2 * usize::from(packet.channels);
+        if packet.data.len() % frame_align != 0 {
+            return Err(Error::InvalidConfig(format!(
+                "audio_frame PCM16 data length {} for {}ch must be a multiple of {frame_align}",
+                packet.data.len(),
+                packet.channels
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// 编码 SessionParams（4 × u32 LE，追加式）。
 fn encode_params(p: &SessionParams, out: &mut Vec<u8>) {
@@ -636,17 +1081,24 @@ fn decode_hello(r: &mut Reader) -> Result<Hello> {
     let fps = r.u32("hello.requested.fps")?;
     let bitrate_bps = r.u32("hello.requested.bitrate_bps")?;
     let method_off = r.off;
-    let auth_method = match r.u8("hello.auth_method")? {
-        0 => AuthMethod::None,
-        1 => AuthMethod::Password,
-        v => {
-            return Err(Error::Protocol {
-                offset: method_off,
-                msg: format!("hello.auth_method must be 0(None) or 1(Password), got {v}"),
-            })
-        }
-    };
+    let raw_method = r.u8("hello.auth_method")?;
+    let auth_method = AuthMethod::from_u8(raw_method).ok_or_else(|| Error::Protocol {
+        offset: method_off,
+        msg: format!(
+            "hello.auth_method must be 0(None), 1(Password) or 2(OwnerTicket), got {raw_method}"
+        ),
+    })?;
+    let auth_len_off = r.off;
     let auth_len = usize::from(r.u16("hello.auth_len")?);
+    if auth_len > MAX_OWNER_TICKET_PAYLOAD_LEN {
+        return Err(Error::Protocol {
+            offset: auth_len_off,
+            msg: format!(
+                "hello.auth_len {auth_len} exceeds MAX_OWNER_TICKET_PAYLOAD_LEN \
+                 {MAX_OWNER_TICKET_PAYLOAD_LEN}"
+            ),
+        });
+    }
     let auth_payload = r.take(auth_len, "hello.auth_payload")?.to_vec();
     r.done("Hello")?;
     Ok(Hello {
@@ -764,16 +1216,6 @@ fn decode_bye_reason(v: u8, off: usize) -> Result<ByeReason> {
     }
 }
 
-/// 预留类型号的显式拒收错误（占号冻结，变体由 T19/T20 增量添加）。
-fn reserved(ty: u8, owner: &str) -> Error {
-    Error::Protocol {
-        offset: 0,
-        msg: format!(
-            "reserved control message type 0x{ty:02X}: {owner} will define it, refusing to guess"
-        ),
-    }
-}
-
 // ─────────────────────────────────────────────────────────────────
 // 测试：全部离线确定性，无网络、无时间依赖
 // ─────────────────────────────────────────────────────────────────
@@ -814,7 +1256,7 @@ mod tests {
         }
     }
 
-    /// 12 个变体各一条合法样例。截断 / 尾巴测试用：Hello 的 auth_payload
+    /// 15 个变体各一条合法样例。截断 / 尾巴测试用：Hello 的 auth_payload
     /// 与 BwProbeData 的 padding 都为空（padding 无前缀，非空时短前缀
     /// 仍是合法消息）。
     fn all_samples() -> Vec<ControlMessage> {
@@ -859,6 +1301,32 @@ mod tests {
             ControlMessage::Bye {
                 reason: ByeReason::Refresh,
             },
+            ControlMessage::AuthChallenge(AuthChallenge {
+                salt: [
+                    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                    0x0E, 0x0F, 0x10,
+                ],
+                iterations: 10_000,
+            }),
+            ControlMessage::AuthResponse(AuthResponse { proof: [0xAB; 32] }),
+            ControlMessage::ClipboardNotify {
+                text: String::new(),
+            },
+            ControlMessage::ToolChannel {
+                channel: TOOL_CHANNEL_FILE,
+                payload: vec![],
+            },
+            ControlMessage::AudioFrame {
+                seq: 1,
+                timestamp_us: 20_000,
+                sample_rate: 48_000,
+                channels: 2,
+                codec: AUDIO_CODEC_PCM16,
+                data: vec![],
+            },
+            ControlMessage::OwnerAuthResponse {
+                signature: vec![0xAB],
+            },
         ]
     }
 
@@ -879,7 +1347,7 @@ mod tests {
         buf
     }
 
-    /// 12 个变体（含结构体变体与带非空 padding 的 BwProbeData）逐一
+    /// 18 个变体（含结构体变体与带非空 padding 的 BwProbeData）逐一
     /// encode→decode→assert_eq 相等。
     #[test]
     fn roundtrip_all_variants() {
@@ -890,7 +1358,7 @@ mod tests {
             chunk_idx: 3,
             padding: vec![0x01, 0x09, 0x00, 0xFF],
         });
-        assert_eq!(msgs.len(), 13, "12 个变体 + 非空 padding 的 BwProbeData");
+        assert_eq!(msgs.len(), 19, "18 个变体 + 非空 padding 的 BwProbeData");
         for m in &msgs {
             let mut buf = Vec::new();
             m.encode(&mut buf);
@@ -966,7 +1434,7 @@ mod tests {
         );
         assert_eq!(buf.len(), 21);
 
-        // 全部 12 个变体的总长度逐一对照线格式总表（顺序同 all_samples）。
+        // 全部 18 个变体的总长度逐一对照线格式总表（顺序同 all_samples）。
         let expects: Vec<(&str, usize)> = vec![
             ("Hello", 29),
             ("Welcome", 27),
@@ -980,15 +1448,23 @@ mod tests {
             ("InputAck", 17),
             ("ReconnectRequest", 10),
             ("Bye", 2),
+            ("AuthChallenge", 21),
+            ("AuthResponse", 33),
+            ("ClipboardNotify(空文本)", 3),
+            ("ToolChannel(空载荷)", 6),
+            ("AudioFrame(空数据)", 17),
+            ("OwnerAuthResponse(1B 签名)", 4),
         ];
-        for (m, (_, want)) in all_samples().into_iter().zip(&expects) {
+        let samples = all_samples();
+        assert_eq!(samples.len(), expects.len());
+        for (m, (_, want)) in samples.into_iter().zip(&expects) {
             let mut buf = Vec::new();
             m.encode(&mut buf);
             assert_eq!(buf.len(), *want, "{m:?} 线长度与总表不符");
         }
     }
 
-    /// 空缓冲与未知类型字节（0x00/0x10/0x99）一律 Protocol 拒收，
+    /// 空缓冲与未知类型字节（0x00/0x13/0x99）一律 Protocol 拒收，
     /// 错误文本含出错字节值。
     #[test]
     fn decode_rejects_empty_and_unknown_type() {
@@ -996,7 +1472,7 @@ mod tests {
         assert!(matches!(err, Error::Protocol { .. }));
         assert!(err.to_string().contains("empty"), "{err}");
 
-        for bad in [0x00u8, 0x10, 0x99] {
+        for bad in [0x00u8, 0x13, 0x99] {
             let err = ControlMessage::decode(&[bad]).unwrap_err();
             let msg = err.to_string();
             assert!(
@@ -1007,21 +1483,34 @@ mod tests {
         }
     }
 
-    /// 预留号 0x0D/0x0E/0x0F 拒收：错误文本含 "reserved" 与对应
-    /// M2-5（T19 鉴权）/ M2-8（T20 剪贴板）归属。
+    /// 0x0D/0x0E（T19）、0x0F（T20）与 0x10/0x11/0x12 均已实装，0x01..=0x12 已无预留未实装号；
+    /// 未知类型号（0x13/0x99）照旧以 Protocol 拒收且错误文本含出错字节值。
     #[test]
     fn decode_rejects_reserved_types() {
-        for (ty, owner, milestone) in [
-            (TYPE_AUTH_CHALLENGE, "T19", "M2-5"),
-            (TYPE_AUTH_RESPONSE, "T19", "M2-5"),
-            (TYPE_CLIPBOARD_NOTIFY, "T20", "M2-8"),
+        // 0x0F/0x10/0x11/0x12 已实装，仅给 1 字节类型号应报截断而非 unknown。
+        for ty in [
+            TYPE_CLIPBOARD_NOTIFY,
+            TYPE_TOOL_CHANNEL,
+            TYPE_AUDIO_FRAME,
+            TYPE_OWNER_AUTH_RESPONSE,
         ] {
             let err = ControlMessage::decode(&[ty]).unwrap_err();
+            assert!(matches!(err, Error::Protocol { .. }), "{err}");
+            assert!(
+                err.to_string().contains("truncated"),
+                "0x{ty:02X} 实装后单字节应报截断: {err}"
+            );
+        }
+
+        // 未知类型号 0x13/0x99 照旧拒收且错误文本含出错字节值。
+        for unknown in [0x13u8, 0x99] {
+            let err = ControlMessage::decode(&[unknown]).unwrap_err();
             let msg = err.to_string();
-            assert!(msg.contains("reserved"), "应注明 reserved: {msg}");
-            assert!(msg.contains(owner), "应注明归属卡 {owner}: {msg}");
-            assert!(msg.contains(milestone), "应注明里程碑 {milestone}: {msg}");
-            assert!(matches!(err, Error::Protocol { .. }));
+            assert!(matches!(err, Error::Protocol { .. }), "{msg}");
+            assert!(
+                msg.contains(&format!("0x{unknown:02X}")),
+                "错误文本应含出错字节值 0x{unknown:02X}: {msg}"
+            );
         }
     }
 
@@ -1127,16 +1616,16 @@ mod tests {
         assert!(matches!(err, Error::Protocol { .. }));
     }
 
-    /// 枚举 / 布尔字段的严格值域：auth_method=2、auth_status=3、
+    /// 枚举 / 布尔字段的严格值域：auth_method=3、auth_status=3、
     /// IdrReason=3、BitrateReason=3、ByeReason=2、resume=2 逐个手工
     /// 构包，全部拒收且文本含出错值。
     #[test]
     fn enum_fields_strict_value_domains() {
-        // auth_method=2（合法 Welcome 无关，Hello 的 offset 26）
+        // auth_method=3（Hello 的 offset 26；0/1/2 为合法枚举值）
         let mut wire = hello_wire();
-        wire[26] = 2;
+        wire[26] = 3;
         let err = ControlMessage::decode(&wire).unwrap_err();
-        assert!(err.to_string().contains("got 2"), "{err}");
+        assert!(err.to_string().contains("got 3"), "{err}");
 
         // auth_status=3（Welcome 的 offset 25）
         let mut wire = Vec::new();
@@ -1249,6 +1738,687 @@ mod tests {
                 ControlMessage::decode(&buf).unwrap_or_else(|e| panic!("padding 必须可解: {e}")),
                 m,
                 "padding={padding:02X?} 应逐字节还原"
+            );
+        }
+    }
+
+    /// AuthChallenge：21 字节定长 `[0x0D][salt 16B][iters LE]`；roundtrip 相等。
+    #[test]
+    fn auth_challenge_roundtrip_and_wire_layout() {
+        let salt = [
+            0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xA9, 0xBA, 0xCB, 0xDC, 0xED,
+            0xFE, 0x0F,
+        ];
+        let iterations = 10_000u32; // 0x0000_2710 -> LE [0x10, 0x27, 0x00, 0x00]
+        let msg = ControlMessage::AuthChallenge(AuthChallenge { salt, iterations });
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let mut expected = vec![TYPE_AUTH_CHALLENGE];
+        expected.extend_from_slice(&salt);
+        expected.extend_from_slice(&[0x10, 0x27, 0x00, 0x00]);
+        assert_eq!(buf.len(), 21);
+        assert_eq!(buf, expected, "AuthChallenge 线格式与规范不符");
+        assert_eq!(ControlMessage::decode(&buf).unwrap(), msg);
+    }
+
+    /// AuthResponse：33 字节定长 `[0x0E][proof 32B]`；roundtrip 相等。
+    #[test]
+    fn auth_response_roundtrip_and_wire_layout() {
+        let mut proof = [0u8; AUTH_PROOF_LEN];
+        for (i, b) in proof.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let msg = ControlMessage::AuthResponse(AuthResponse { proof });
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+
+        let mut expected = vec![TYPE_AUTH_RESPONSE];
+        expected.extend_from_slice(&proof);
+        assert_eq!(buf.len(), 33);
+        assert_eq!(buf, expected, "AuthResponse 线格式与规范不符");
+        assert_eq!(ControlMessage::decode(&buf).unwrap(), msg);
+    }
+
+    /// AuthChallenge.iterations == 0 报 Error::Protocol（带 offset=17）。
+    #[test]
+    fn auth_challenge_rejects_zero_iterations() {
+        let mut wire = vec![TYPE_AUTH_CHALLENGE];
+        wire.extend_from_slice(&[0x55u8; AUTH_SALT_LEN]);
+        wire.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(wire.len(), 21);
+
+        let err = ControlMessage::decode(&wire).unwrap_err();
+        match &err {
+            Error::Protocol { offset, msg } => {
+                assert_eq!(*offset, 1 + AUTH_SALT_LEN, "offset 应指向 iterations 字段");
+                assert!(msg.contains('0'), "错误文本应含出错值 0: {msg}");
+            }
+            other => panic!("应报 Error::Protocol，实际: {other}"),
+        }
+    }
+
+    /// AuthChallenge.iterations：恰 MAX_AUTH_ITERATIONS 可解；+1 拒收且错误文本含上限值。
+    #[test]
+    fn auth_challenge_iteration_bounds() {
+        // 下界 1 与上界 MAX_AUTH_ITERATIONS 均可解
+        for iters in [1u32, MAX_AUTH_ITERATIONS] {
+            let msg = ControlMessage::AuthChallenge(AuthChallenge {
+                salt: [0x22; AUTH_SALT_LEN],
+                iterations: iters,
+            });
+            let mut buf = Vec::new();
+            msg.encode(&mut buf);
+            assert_eq!(
+                ControlMessage::decode(&buf).unwrap(),
+                msg,
+                "iterations={iters} 应可解"
+            );
+        }
+
+        // MAX_AUTH_ITERATIONS + 1 拒收且带 offset 与上限值
+        let mut wire = vec![TYPE_AUTH_CHALLENGE];
+        wire.extend_from_slice(&[0x22; AUTH_SALT_LEN]);
+        wire.extend_from_slice(&(MAX_AUTH_ITERATIONS + 1).to_le_bytes());
+        let err = ControlMessage::decode(&wire).unwrap_err();
+        match &err {
+            Error::Protocol { offset, msg } => {
+                assert_eq!(*offset, 1 + AUTH_SALT_LEN, "offset 应指向 iterations 字段");
+                assert!(
+                    msg.contains(&MAX_AUTH_ITERATIONS.to_string()),
+                    "错误文本应含上限值 {MAX_AUTH_ITERATIONS}: {msg}"
+                );
+            }
+            other => panic!("应报 Error::Protocol，实际: {other}"),
+        }
+    }
+
+    /// AuthChallenge（21B）与 AuthResponse（33B）合法编码的每个严格前缀拒收；
+    /// +1 尾字节拒收且带 trailing 与准确 offset。
+    #[test]
+    fn auth_messages_truncation_and_trailing() {
+        let cases = [
+            (
+                ControlMessage::AuthChallenge(AuthChallenge {
+                    salt: [0xA5; AUTH_SALT_LEN],
+                    iterations: 64,
+                }),
+                21usize,
+            ),
+            (
+                ControlMessage::AuthResponse(AuthResponse {
+                    proof: [0x5A; AUTH_PROOF_LEN],
+                }),
+                33usize,
+            ),
+        ];
+
+        for (msg, expected_len) in cases {
+            let mut wire = Vec::new();
+            msg.encode(&mut wire);
+            assert_eq!(wire.len(), expected_len);
+
+            // 穷举每个严格前缀 0..expected_len
+            for cut in 0..expected_len {
+                let err = ControlMessage::decode(&wire[..cut]).unwrap_err();
+                assert!(
+                    matches!(err, Error::Protocol { .. }),
+                    "{msg:?} 截断到 {cut} 字节应报 Protocol: {err}"
+                );
+            }
+
+            // +1 尾字节拒收
+            wire.push(0xEE);
+            let err = ControlMessage::decode(&wire).unwrap_err();
+            match &err {
+                Error::Protocol { offset, msg: text } => {
+                    assert_eq!(*offset, expected_len, "trailing offset 应等于消息定长");
+                    assert!(text.contains("trailing"), "应含 trailing 字样: {text}");
+                }
+                other => panic!("{msg:?} 尾字节应报 Protocol，实际: {other}"),
+            }
+        }
+    }
+
+    /// ClipboardNotify：空文本（`[0x0F, 0x00, 0x00]`）、纯 ASCII、中文+emoji 多字节、
+    /// 含 NUL 字节——encode→decode 相等，且逐字节断言 `[0x0F][len u16 LE][text]` 布局
+    /// （NUL 透明传输、len 按字节计）。
+    #[test]
+    fn clipboard_roundtrip_and_wire_layout() {
+        let cases = ["", "hello world", "你好，兔子🐇", "before\0middle\0after"];
+        for text in cases {
+            let msg = ControlMessage::clipboard_notify(text.to_owned()).unwrap();
+            let mut wire = Vec::new();
+            msg.encode(&mut wire);
+
+            let bytes = text.as_bytes();
+            let mut expected = vec![TYPE_CLIPBOARD_NOTIFY];
+            expected.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            expected.extend_from_slice(bytes);
+
+            assert_eq!(wire, expected, "ClipboardNotify({text:?}) 线布局与规范不符");
+            if text.is_empty() {
+                assert_eq!(wire, vec![0x0F, 0x00, 0x00]);
+            }
+            let decoded = ControlMessage::decode(&wire)
+                .unwrap_or_else(|e| panic!("ClipboardNotify({text:?}) 必须可解: {e}"));
+            assert_eq!(decoded, msg);
+        }
+    }
+
+    /// ClipboardNotify：合法编码的每个严格前缀报 Protocol；合法编码 + 1 尾字节报 Protocol；
+    /// 非法 UTF-8 载荷报 Protocol 且带准确偏移。
+    #[test]
+    fn clipboard_decode_rejects_truncation_and_trailing() {
+        for text in ["", "abc", "你好🐇", "a\0b"] {
+            let msg = ControlMessage::clipboard_notify(text.to_owned()).unwrap();
+            let mut wire = Vec::new();
+            msg.encode(&mut wire);
+            let expected_len = wire.len();
+
+            // 穷举每个严格前缀 0..expected_len
+            for cut in 0..expected_len {
+                let err = ControlMessage::decode(&wire[..cut]).unwrap_err();
+                assert!(
+                    matches!(err, Error::Protocol { .. }),
+                    "ClipboardNotify({text:?}) 截断到 {cut} 字节应报 Protocol: {err}"
+                );
+            }
+
+            // +1 尾字节拒收
+            wire.push(0xCC);
+            let err = ControlMessage::decode(&wire).unwrap_err();
+            match &err {
+                Error::Protocol {
+                    offset,
+                    msg: detail,
+                } => {
+                    assert_eq!(*offset, expected_len, "trailing offset 应等于消息长度");
+                    assert!(detail.contains("trailing"), "应含 trailing 字样: {detail}");
+                }
+                other => panic!("ClipboardNotify({text:?}) 尾字节应报 Protocol，实际: {other}"),
+            }
+        }
+
+        // 非法 UTF-8 载荷：前 2 字节 ASCII 合法，第 3 字节 0xFF 非法 → offset = 3 + 2 = 5
+        let invalid_utf8 = vec![TYPE_CLIPBOARD_NOTIFY, 0x04, 0x00, b'o', b'k', 0xFF, b'!'];
+        let err = ControlMessage::decode(&invalid_utf8).unwrap_err();
+        match &err {
+            Error::Protocol { offset, msg } => {
+                assert_eq!(*offset, 5, "offset 应指向首个非法 UTF-8 字节: {msg}");
+                assert!(msg.contains("UTF-8"), "应注明 UTF-8 错误: {msg}");
+            }
+            other => panic!("非法 UTF-8 应报 Protocol，实际: {other}"),
+        }
+    }
+
+    /// 0x0F 从预留名单移出、可解出 `ClipboardNotify`；0x0D/0x0E 已由 T19 实装可解；
+    /// 未知号 0x10/0x99 照旧拒收且错误文本含出错字节值。
+    #[test]
+    fn clipboard_type_decodes_and_unknowns_still_rejected() {
+        // 0x0F 可解出 ClipboardNotify
+        let wire = vec![TYPE_CLIPBOARD_NOTIFY, 0x02, 0x00, b'h', b'i'];
+        assert_eq!(
+            ControlMessage::decode(&wire).unwrap(),
+            ControlMessage::ClipboardNotify {
+                text: "hi".to_owned(),
+            }
+        );
+
+        // 0x0D/0x0E 已由 T19 实装，按当下实装集合验证可正常解码
+        let mut ch_wire = vec![TYPE_AUTH_CHALLENGE];
+        ch_wire.extend_from_slice(&[0x11; AUTH_SALT_LEN]);
+        ch_wire.extend_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            ControlMessage::decode(&ch_wire).unwrap(),
+            ControlMessage::AuthChallenge(_)
+        ));
+
+        let mut resp_wire = vec![TYPE_AUTH_RESPONSE];
+        resp_wire.extend_from_slice(&[0x22; AUTH_PROOF_LEN]);
+        assert!(matches!(
+            ControlMessage::decode(&resp_wire).unwrap(),
+            ControlMessage::AuthResponse(_)
+        ));
+
+        // 未知类型号 0x13/0x99 照旧拒收且含出错字节值
+        for unknown in [0x13u8, 0x99] {
+            let err = ControlMessage::decode(&[unknown]).unwrap_err();
+            let msg = err.to_string();
+            assert!(matches!(err, Error::Protocol { offset: 0, .. }), "{msg}");
+            assert!(
+                msg.contains(&format!("0x{unknown:02X}")),
+                "错误文本应含出错字节值 0x{unknown:02X}: {msg}"
+            );
+        }
+    }
+
+    /// 65535 字节恰好可构造且 encode 不 panic、可往返；65536 → Err(InvalidConfig)。
+    #[test]
+    fn clipboard_constructor_enforces_cap() {
+        let max_text = "a".repeat(MAX_CLIPBOARD_TEXT_BYTES);
+        assert_eq!(max_text.len(), 65535);
+        let msg = ControlMessage::clipboard_notify(max_text.clone())
+            .expect("恰好 MAX_CLIPBOARD_TEXT_BYTES 字节必须可构造");
+        let mut wire = Vec::new();
+        msg.encode(&mut wire);
+        assert_eq!(wire.len(), 3 + MAX_CLIPBOARD_TEXT_BYTES);
+        assert_eq!(ControlMessage::decode(&wire).unwrap(), msg);
+
+        let over_text = "a".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1);
+        assert_eq!(over_text.len(), 65536);
+        let err = ControlMessage::clipboard_notify(over_text).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidConfig(_)),
+            "65536 字节必须返回 Error::InvalidConfig，实际: {err}"
+        );
+    }
+
+    /// ToolChannel：全 5 个合法通道（含空载荷、二进制载荷、恰好 MAX_TOOL_PAYLOAD_BYTES）
+    /// 往返相等，且逐字节断言 `[0x10][channel: u8][len: u32 LE][payload]` 线布局。
+    #[test]
+    fn tool_channel_roundtrip_and_wire_layout() {
+        for channel in [
+            TOOL_CHANNEL_FILE,
+            TOOL_CHANNEL_TERMINAL,
+            TOOL_CHANNEL_PORTMAP,
+            TOOL_CHANNEL_AUDIO_CTRL,
+            TOOL_CHANNEL_DISPLAY_CTRL,
+        ] {
+            let payload = vec![0x00, channel, 0xAA, 0xFF, 0x42];
+            let msg = ControlMessage::tool_channel(channel, payload.clone()).unwrap();
+            let mut wire = Vec::new();
+            msg.encode(&mut wire);
+
+            let mut expected = vec![TYPE_TOOL_CHANNEL, channel];
+            expected.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            expected.extend_from_slice(&payload);
+            assert_eq!(wire, expected, "ToolChannel(ch={channel}) 线布局不符");
+            assert_eq!(ControlMessage::decode(&wire).unwrap(), msg);
+        }
+
+        // 恰好 MAX_TOOL_PAYLOAD_BYTES 合法往返
+        let max_msg =
+            ControlMessage::tool_channel(TOOL_CHANNEL_FILE, vec![0x5Au8; MAX_TOOL_PAYLOAD_BYTES])
+                .expect("MAX_TOOL_PAYLOAD_BYTES 必须合法");
+        let mut wire = Vec::new();
+        max_msg.encode(&mut wire);
+        assert_eq!(wire.len(), 6 + MAX_TOOL_PAYLOAD_BYTES);
+        assert_eq!(ControlMessage::decode(&wire).unwrap(), max_msg);
+    }
+
+    /// ToolChannel：非法通道（0 / 6 / 255）、超长载荷（MAX+1）、任意偏移截断与尾字节
+    /// 一律报 `Error::Protocol`（构造器报 `Error::InvalidConfig`）。
+    #[test]
+    fn tool_channel_rejects_invalid_channel_oversized_truncated_trailing() {
+        // 非法 channel
+        for bad_ch in [0u8, 6, 255] {
+            assert!(matches!(
+                ControlMessage::tool_channel(bad_ch, vec![1, 2]),
+                Err(Error::InvalidConfig(_))
+            ));
+            let mut wire = vec![TYPE_TOOL_CHANNEL, bad_ch];
+            wire.extend_from_slice(&0u32.to_le_bytes());
+            let err = ControlMessage::decode(&wire).unwrap_err();
+            assert!(
+                matches!(err, Error::Protocol { offset: 1, .. }),
+                "channel={bad_ch} 应报 Protocol(offset=1)，实际: {err}"
+            );
+        }
+
+        // 超长载荷（MAX_TOOL_PAYLOAD_BYTES + 1）
+        assert!(matches!(
+            ControlMessage::tool_channel(TOOL_CHANNEL_FILE, vec![0u8; MAX_TOOL_PAYLOAD_BYTES + 1]),
+            Err(Error::InvalidConfig(_))
+        ));
+        let mut over_wire = vec![TYPE_TOOL_CHANNEL, TOOL_CHANNEL_FILE];
+        over_wire.extend_from_slice(&((MAX_TOOL_PAYLOAD_BYTES + 1) as u32).to_le_bytes());
+        let err = ControlMessage::decode(&over_wire).unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol { offset: 2, .. }),
+            "超长 ToolChannel 应报 Protocol(offset=2)，实际: {err}"
+        );
+
+        // 截断与尾字节
+        let msg = ControlMessage::tool_channel(TOOL_CHANNEL_TERMINAL, b"ls -la".to_vec()).unwrap();
+        let mut wire = Vec::new();
+        msg.encode(&mut wire);
+        let expected_len = wire.len();
+        for cut in 0..expected_len {
+            let err = ControlMessage::decode(&wire[..cut]).unwrap_err();
+            assert!(
+                matches!(err, Error::Protocol { .. }),
+                "ToolChannel 截断到 {cut} 字节应报 Protocol: {err}"
+            );
+        }
+        wire.push(0xEE);
+        let err = ControlMessage::decode(&wire).unwrap_err();
+        match &err {
+            Error::Protocol { offset, msg } => {
+                assert_eq!(*offset, expected_len);
+                assert!(msg.contains("trailing"), "{msg}");
+            }
+            other => panic!("尾字节应报 Protocol，实际: {other}"),
+        }
+    }
+
+    /// AudioFrame：PCM16 / IMA-ADPCM、单声道 / 立体声、空数据与恰好 MAX_AUDIO_FRAME_BYTES
+    /// 往返相等，且逐字节断言 17 字节头 + data 线布局。
+    #[test]
+    fn audio_frame_roundtrip_and_wire_layout() {
+        let packet = AudioFramePacket {
+            seq: 0x0102_0304,
+            timestamp_us: 0x1122_3344,
+            sample_rate: 48_000,
+            channels: 2,
+            codec: AUDIO_CODEC_IMA_ADPCM,
+            data: vec![0x10, 0x20, 0x30, 0x40],
+        };
+        let msg = ControlMessage::audio_frame(packet.clone()).unwrap();
+        let mut wire = Vec::new();
+        msg.encode(&mut wire);
+
+        let mut expected = vec![TYPE_AUDIO_FRAME];
+        expected.extend_from_slice(&packet.seq.to_le_bytes());
+        expected.extend_from_slice(&packet.timestamp_us.to_le_bytes());
+        expected.extend_from_slice(&packet.sample_rate.to_le_bytes());
+        expected.push(packet.channels);
+        expected.push(packet.codec);
+        expected.extend_from_slice(&(packet.data.len() as u16).to_le_bytes());
+        expected.extend_from_slice(&packet.data);
+        assert_eq!(wire.len(), 17 + 4);
+        assert_eq!(wire, expected, "AudioFrame 线布局不符");
+        assert_eq!(ControlMessage::decode(&wire).unwrap(), msg);
+
+        // 单声道 + PCM16 + 恰好 MAX_AUDIO_FRAME_BYTES
+        let max_pkt = AudioFramePacket {
+            seq: 9,
+            timestamp_us: 0,
+            sample_rate: 16_000,
+            channels: 1,
+            codec: AUDIO_CODEC_PCM16,
+            data: vec![0x7Fu8; MAX_AUDIO_FRAME_BYTES],
+        };
+        let max_msg = ControlMessage::audio_frame(max_pkt).unwrap();
+        let mut max_wire = Vec::new();
+        max_msg.encode(&mut max_wire);
+        assert_eq!(max_wire.len(), 17 + MAX_AUDIO_FRAME_BYTES);
+        assert_eq!(ControlMessage::decode(&max_wire).unwrap(), max_msg);
+    }
+
+    /// AudioFrame：sample_rate 越界（0 / 4000 / 7999 / 192001 / u32::MAX）、channels=0/3、
+    /// codec=2/255、len > MAX_AUDIO_FRAME_BYTES、PCM16 帧长未对齐、任意偏移截断与尾字节
+    /// 一律报 `Error::Protocol`（构造器报 `Error::InvalidConfig`）。
+    #[test]
+    fn audio_frame_rejects_invalid_fields_oversized_truncated_trailing() {
+        let valid_wire = || {
+            let mut w = Vec::new();
+            ControlMessage::AudioFrame {
+                seq: 1,
+                timestamp_us: 1000,
+                sample_rate: 48_000,
+                channels: 2,
+                codec: AUDIO_CODEC_PCM16,
+                data: vec![1, 2, 3, 4],
+            }
+            .encode(&mut w);
+            w
+        };
+
+        // sample_rate out of MIN_AUDIO_SAMPLE_RATE..=MAX_AUDIO_SAMPLE_RATE (offset 9..13)
+        for bad_rate in [
+            0u32,
+            4_000,
+            MIN_AUDIO_SAMPLE_RATE - 1,
+            MAX_AUDIO_SAMPLE_RATE + 1,
+            u32::MAX,
+        ] {
+            let mut w = valid_wire();
+            w[9..13].copy_from_slice(&bad_rate.to_le_bytes());
+            let err = ControlMessage::decode(&w).unwrap_err();
+            assert!(
+                matches!(err, Error::Protocol { offset: 9, .. }),
+                "sample_rate={bad_rate} should fail with Protocol at offset 9, got {err}"
+            );
+            assert!(
+                matches!(
+                    ControlMessage::audio_frame(AudioFramePacket {
+                        seq: 1,
+                        timestamp_us: 0,
+                        sample_rate: bad_rate,
+                        channels: 2,
+                        codec: AUDIO_CODEC_PCM16,
+                        data: vec![],
+                    }),
+                    Err(Error::InvalidConfig(_))
+                ),
+                "sample_rate={bad_rate} should fail in audio_frame()"
+            );
+        }
+
+        // Boundary valid sample rates (8_000 and 192_000) succeed.
+        for ok_rate in [MIN_AUDIO_SAMPLE_RATE, MAX_AUDIO_SAMPLE_RATE] {
+            let msg = ControlMessage::audio_frame(AudioFramePacket {
+                seq: 1,
+                timestamp_us: 0,
+                sample_rate: ok_rate,
+                channels: 2,
+                codec: AUDIO_CODEC_PCM16,
+                data: vec![0u8; 4],
+            })
+            .expect("boundary sample_rate must be accepted");
+            let mut wire = Vec::new();
+            msg.encode(&mut wire);
+            assert_eq!(ControlMessage::decode(&wire).unwrap(), msg);
+        }
+
+        // PCM16 unaligned payload lengths rejected on both encode constructor and wire decode.
+        for (ch, bad_len) in [(1u8, 1usize), (1, 3), (2, 1), (2, 2), (2, 3), (2, 6)] {
+            assert!(
+                matches!(
+                    ControlMessage::audio_frame(AudioFramePacket {
+                        seq: 1,
+                        timestamp_us: 0,
+                        sample_rate: 48_000,
+                        channels: ch,
+                        codec: AUDIO_CODEC_PCM16,
+                        data: vec![0u8; bad_len],
+                    }),
+                    Err(Error::InvalidConfig(_))
+                ),
+                "PCM16 ch={ch} len={bad_len} must be rejected in constructor"
+            );
+            let mut w = Vec::new();
+            ControlMessage::AudioFrame {
+                seq: 1,
+                timestamp_us: 0,
+                sample_rate: 48_000,
+                channels: ch,
+                codec: AUDIO_CODEC_PCM16,
+                data: vec![0u8; bad_len],
+            }
+            .encode(&mut w);
+            let err = ControlMessage::decode(&w).unwrap_err();
+            assert!(
+                matches!(err, Error::Protocol { offset: 15, .. }),
+                "PCM16 ch={ch} len={bad_len} must be rejected at len offset 15, got {err}"
+            );
+        }
+
+        // IMA-ADPCM does not require PCM16 2*ch alignment (odd/arbitrary lengths allowed).
+        let adpcm_msg = ControlMessage::audio_frame(AudioFramePacket {
+            seq: 2,
+            timestamp_us: 0,
+            sample_rate: 48_000,
+            channels: 2,
+            codec: AUDIO_CODEC_IMA_ADPCM,
+            data: vec![0u8; 9],
+        })
+        .expect("IMA-ADPCM with odd byte length must succeed");
+        let mut adpcm_wire = Vec::new();
+        adpcm_msg.encode(&mut adpcm_wire);
+        assert_eq!(ControlMessage::decode(&adpcm_wire).unwrap(), adpcm_msg);
+
+        // channels == 0 / 3 (offset 13)
+        for bad_ch in [0u8, 3, 255] {
+            let mut w = valid_wire();
+            w[13] = bad_ch;
+            let err = ControlMessage::decode(&w).unwrap_err();
+            assert!(matches!(err, Error::Protocol { offset: 13, .. }), "{err}");
+            assert!(matches!(
+                ControlMessage::audio_frame(AudioFramePacket {
+                    seq: 1,
+                    timestamp_us: 0,
+                    sample_rate: 48_000,
+                    channels: bad_ch,
+                    codec: AUDIO_CODEC_PCM16,
+                    data: vec![],
+                }),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+
+        // codec > AUDIO_CODEC_IMA_ADPCM (offset 14)
+        for bad_codec in [2u8, 255] {
+            let mut w = valid_wire();
+            w[14] = bad_codec;
+            let err = ControlMessage::decode(&w).unwrap_err();
+            assert!(matches!(err, Error::Protocol { offset: 14, .. }), "{err}");
+            assert!(matches!(
+                ControlMessage::audio_frame(AudioFramePacket {
+                    seq: 1,
+                    timestamp_us: 0,
+                    sample_rate: 48_000,
+                    channels: 2,
+                    codec: bad_codec,
+                    data: vec![],
+                }),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+
+        // len > MAX_AUDIO_FRAME_BYTES (offset 15..17)
+        let mut w = valid_wire();
+        let over_len = (MAX_AUDIO_FRAME_BYTES + 1) as u16;
+        w[15..17].copy_from_slice(&over_len.to_le_bytes());
+        let err = ControlMessage::decode(&w).unwrap_err();
+        assert!(matches!(err, Error::Protocol { offset: 15, .. }), "{err}");
+        assert!(matches!(
+            ControlMessage::audio_frame(AudioFramePacket {
+                seq: 1,
+                timestamp_us: 0,
+                sample_rate: 48_000,
+                channels: 2,
+                codec: AUDIO_CODEC_PCM16,
+                data: vec![0u8; MAX_AUDIO_FRAME_BYTES + 1],
+            }),
+            Err(Error::InvalidConfig(_))
+        ));
+
+        // 截断与尾字节
+        let mut wire = valid_wire();
+        let expected_len = wire.len();
+        for cut in 0..expected_len {
+            let err = ControlMessage::decode(&wire[..cut]).unwrap_err();
+            assert!(
+                matches!(err, Error::Protocol { .. }),
+                "AudioFrame 截断到 {cut} 字节应报 Protocol: {err}"
+            );
+        }
+        wire.push(0xBB);
+        let err = ControlMessage::decode(&wire).unwrap_err();
+        match &err {
+            Error::Protocol { offset, msg } => {
+                assert_eq!(*offset, expected_len);
+                assert!(msg.contains("trailing"), "{msg}");
+            }
+            other => panic!("尾字节应报 Protocol，实际: {other}"),
+        }
+    }
+
+    /// AuthMethod::OwnerTicket 往返编解码、from_u8 校验与 Hello.auth_payload 上限校验（<= 4096）。
+    #[test]
+    fn owner_ticket_hello_roundtrip_and_payload_bounds() {
+        assert_eq!(AuthMethod::from_u8(0), Some(AuthMethod::None));
+        assert_eq!(AuthMethod::from_u8(1), Some(AuthMethod::Password));
+        assert_eq!(AuthMethod::from_u8(2), Some(AuthMethod::OwnerTicket));
+        assert_eq!(AuthMethod::from_u8(3), None);
+        assert_eq!(AuthMethod::from_u8(255), None);
+
+        for payload_len in [0usize, 1, 64, MAX_OWNER_TICKET_PAYLOAD_LEN] {
+            let mut h = sample_hello();
+            h.auth_method = AuthMethod::OwnerTicket;
+            h.auth_payload = vec![0x5C; payload_len];
+            let msg = ControlMessage::Hello(h);
+            let mut wire = Vec::new();
+            msg.encode(&mut wire);
+            assert_eq!(wire.len(), 29 + payload_len);
+            assert_eq!(wire[26], 2);
+            assert_eq!(ControlMessage::decode(&wire).unwrap(), msg);
+        }
+
+        // 超过 MAX_OWNER_TICKET_PAYLOAD_LEN (4096) 的 auth_len 必须拒收
+        let mut wire = hello_wire();
+        wire[26] = AuthMethod::OwnerTicket as u8;
+        let over_len = (MAX_OWNER_TICKET_PAYLOAD_LEN + 1) as u16;
+        wire[27..29].copy_from_slice(&over_len.to_le_bytes());
+        wire.extend(std::iter::repeat_n(
+            0x5Cu8,
+            MAX_OWNER_TICKET_PAYLOAD_LEN + 1,
+        ));
+        let err = ControlMessage::decode(&wire).unwrap_err();
+        assert!(
+            matches!(err, Error::Protocol { offset: 27, .. }),
+            "超长 auth_payload 应报 Protocol(offset=27)，实际: {err}"
+        );
+    }
+
+    /// OwnerAuthResponse（0x12）：[0x12][len: u16 LE (1..=128)][signature] 往返与错包校验。
+    #[test]
+    fn owner_auth_response_roundtrip_and_validation() {
+        for sig_len in [1usize, 64, MAX_OWNER_SIGNATURE_LEN] {
+            let sig: Vec<u8> = (0..sig_len).map(|i| (i as u8).wrapping_mul(3)).collect();
+            let msg = ControlMessage::OwnerAuthResponse {
+                signature: sig.clone(),
+            };
+            let mut wire = Vec::new();
+            msg.encode(&mut wire);
+
+            let mut expected = vec![TYPE_OWNER_AUTH_RESPONSE];
+            expected.extend_from_slice(&(sig_len as u16).to_le_bytes());
+            expected.extend_from_slice(&sig);
+            assert_eq!(wire, expected);
+            assert_eq!(ControlMessage::decode(&wire).unwrap(), msg);
+
+            // 严格前缀截断拒收
+            for cut in 0..wire.len() {
+                assert!(
+                    matches!(
+                        ControlMessage::decode(&wire[..cut]),
+                        Err(Error::Protocol { .. })
+                    ),
+                    "OwnerAuthResponse(len={sig_len}) 截断到 {cut} 字节应报 Protocol"
+                );
+            }
+            // +1 尾字节拒收
+            let expected_len = wire.len();
+            wire.push(0x99);
+            let err = ControlMessage::decode(&wire).unwrap_err();
+            assert!(
+                matches!(err, Error::Protocol { offset, ref msg } if offset == expected_len && msg.contains("trailing")),
+                "尾字节应报 Protocol(offset={expected_len})，实际: {err}"
+            );
+        }
+
+        // 长度 0 或 > 128 必须拒收
+        for bad_len in [0u16, (MAX_OWNER_SIGNATURE_LEN + 1) as u16, u16::MAX] {
+            let mut wire = vec![TYPE_OWNER_AUTH_RESPONSE];
+            wire.extend_from_slice(&bad_len.to_le_bytes());
+            wire.extend(std::iter::repeat_n(0xAAu8, usize::from(bad_len)));
+            let err = ControlMessage::decode(&wire).unwrap_err();
+            assert!(
+                matches!(err, Error::Protocol { offset: 1, .. }),
+                "len={bad_len} 应报 Protocol(offset=1)，实际: {err}"
             );
         }
     }

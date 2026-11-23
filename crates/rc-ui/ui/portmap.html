@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>端口映射 — RabbitControl</title>
+  <link rel="stylesheet" href="assets/css/tokens.css" />
+  <link rel="stylesheet" href="assets/css/base.css" />
+  <link rel="stylesheet" href="assets/css/pages/portmap.css" />
+</head>
+<body>
+  <!-- Tauri 真窗口：给 body 打 .is-tauri，隐藏自绘交通灯（原生灯已由窗口提供） -->
+  <script src="assets/js/tauri-detect.js"></script>
+  <header class="titlebar" data-tauri-drag-region>
+    <div class="traffic" aria-hidden="true" data-tauri-drag-region>
+      <span class="traffic__light traffic__light--close" data-tauri-drag-region></span>
+      <span class="traffic__light traffic__light--min" data-tauri-drag-region></span>
+      <span class="traffic__light traffic__light--zoom" data-tauri-drag-region></span>
+    </div>
+    <h1 class="titlebar__title" data-tauri-drag-region>端口映射</h1>
+  </header>
+
+  <main class="pm-main">
+    <section class="pm-header" aria-label="连接设备">
+      <h2 class="pm-header__name" id="pm-device-name">yii's MacBook Pro</h2>
+      <span class="status-dot status-dot--online" id="pm-status-dot" aria-hidden="true"></span>
+      <span class="pm-header__state" id="pm-status-text">已连接</span>
+    </section>
+
+    <section class="pm-card" aria-label="映射列表">
+      <div class="pm-card__head">
+        <h2 class="pm-card__title">映射列表</h2>
+        <button type="button" class="btn btn--secondary" id="open-add">
+          <svg class="ico" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M8 12h8"/><path d="M12 8v8"/></svg>
+          添加
+        </button>
+      </div>
+
+      <div class="pm-table">
+        <div class="pm-thead" role="row">
+          <span role="columnheader" class="pm-th pm-th--sortable">名称
+            <span class="pm-th__sort" id="sort-name" role="button" tabindex="0" aria-label="按名称排序">
+              <svg class="ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+            </span>
+          </span>
+          <span role="columnheader" class="pm-th">本地端口</span>
+          <span role="columnheader" class="pm-th">目标地址</span>
+          <span role="columnheader" class="pm-th">目标端口</span>
+          <span role="columnheader" class="pm-th">映射状态</span>
+          <span role="columnheader" class="pm-th pm-th--op">操作</span>
+        </div>
+        <div class="pm-tbody" id="map-body" role="rowgroup"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- 添加 Modal（宽 400，§6 W4） -->
+  <div class="modal" id="add-modal" aria-hidden="true">
+    <div class="modal__mask"></div>
+    <div class="modal__card" role="dialog" aria-modal="true" aria-labelledby="add-modal-title">
+      <h2 class="modal__title" id="add-modal-title">添加映射</h2>
+      <form class="pm-form" id="add-form" novalidate>
+        <div class="field">
+          <label class="field__label" for="f-name">名称</label>
+          <input class="input" id="f-name" name="name" type="text" autocomplete="off" spellcheck="false" placeholder="请输入名称" />
+          <p class="field__error" id="e-name" role="alert"></p>
+        </div>
+        <div class="field">
+          <label class="field__label" for="f-local-port">本地端口</label>
+          <input class="input" id="f-local-port" name="localPort" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="1–65535" />
+          <p class="field__error" id="e-local-port" role="alert"></p>
+        </div>
+        <div class="field">
+          <label class="field__label" for="f-target-addr">目标地址</label>
+          <input class="input" id="f-target-addr" name="targetAddr" type="text" autocomplete="off" spellcheck="false" placeholder="IP 或域名" />
+          <p class="field__error" id="e-target-addr" role="alert"></p>
+        </div>
+        <div class="field">
+          <label class="field__label" for="f-target-port">目标端口</label>
+          <input class="input" id="f-target-port" name="targetPort" type="text" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="1–65535" />
+          <p class="field__error" id="e-target-port" role="alert"></p>
+        </div>
+        <div class="modal__foot">
+          <button type="button" class="btn btn--secondary" id="cancel-add">取消</button>
+          <button type="submit" class="btn btn--primary" id="save-add">保存</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 删除确认 Modal（Tauri 真映射删除） -->
+  <div class="modal" id="delete-modal" aria-hidden="true">
+    <div class="modal__mask"></div>
+    <div class="modal__card" role="dialog" aria-modal="true" aria-labelledby="delete-modal-title">
+      <h2 class="modal__title" id="delete-modal-title">删除映射</h2>
+      <p id="delete-modal-desc" style="margin:0 0 16px;color:var(--text-secondary);font-size:var(--size-body);line-height:20px;"></p>
+      <div class="modal__foot">
+        <button type="button" class="btn btn--secondary" id="cancel-delete">取消</button>
+        <button type="button" class="btn btn--danger" id="confirm-delete">删除映射</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="assets/js/validate.js"></script>
+  <script src="assets/js/bridge.js"></script>
+  <script src="assets/js/portmap.js"></script>
+</body>
+</html>
