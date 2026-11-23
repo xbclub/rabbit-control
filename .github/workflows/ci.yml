@@ -4,42 +4,122 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # CI 使用独立 target 目录，不污染工作区，也不计入缓存体积
-  CARGO_TARGET_DIR: /tmp/rc-target
-  RUSTFLAGS: "-D warnings"
 
 jobs:
-  # 快检：格式 + lint。每次 push 都跑，目标 <6 分钟。
-  lint:
+  fmt-and-ui-js:
+    name: Format & Client UI JS
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: fmt
+          components: rustfmt
+      - name: Check client workspace formatting
         run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check server backend formatting
+        run: cargo fmt --manifest-path server/backend/Cargo.toml -- --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check client UI JS syntax, validation, and zero innerHTML
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in crates/rc-ui/ui/assets/js/*.js; do
+            node --check "$f"
+          done
+          node -e "
+            const v = require('./crates/rc-ui/ui/assets/js/validate.js');
+            if (v.validateTargetAddr('127.0.0.1') !== '') process.exit(1);
+            if (v.validateTargetAddr('127.0.0.1 bad') === '') process.exit(1);
+          "
+          if grep -nE '\.innerHTML\b' crates/rc-ui/ui/assets/js/terminal.js; then
+            echo "terminal.js must not use .innerHTML" >&2
+            exit 1
+          fi
 
-  # 三平台编译 + 测试
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  server-backend:
+    name: Server Backend (Linux)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ${{ matrix.os }}
-      - name: check
-        run: cargo check --workspace --all-targets
-      - name: test
-        run: cargo test --workspace
+          workspaces: server/backend
+          shared-key: server-backend
+      - name: Clippy
+        working-directory: server/backend
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        working-directory: server/backend
+        run: cargo test
+
+  server-web:
+    name: Server Admin Web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/web/package-lock.json
+      - name: Install dependencies
+        working-directory: server/web
+        run: npm ci
+      - name: TypeScript typecheck
+        working-directory: server/web
+        run: npx tsc --noEmit
+      - name: Build production bundle
+        working-directory: server/web
+        run: npm run build
+
+  client-workspace:
+    name: Client Workspace (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri Linux system libraries
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            pkg-config \
+            patchelf
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: client-${{ matrix.os }}
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace -- --test-threads=1
